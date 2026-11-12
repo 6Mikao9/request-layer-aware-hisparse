@@ -1,29 +1,36 @@
 # Request- and Layer-Aware HiSparse Hot Buffers
 
-This research proposal asks whether allocating GPU hot-buffer capacity jointly by request type and physical KV source reduces decode transfer or latency under a fixed memory budget. The model and its exact sparse Top-K selections stay fixed. Only the residency of selected KV entries changes.
+本仓库发布 HiSparse 驻留容量与换入路径的实验报告和匿名汇总图。原型代码及原始实验数据未随报告公开。 [完整实验报告](REPORT_20261112.md)
 
 ## 研究问题
 
-相同输入长度的聊天、工具调用型 agent 和长文档任务，是否有可重复的跨步 KV 复用差异？在同类请求内，各层或共享 KV 源是否也有不同的容量收益曲线？若两种差异能在独立测试集上复现，就在相同的物理 GPU 显存预算下，比较联合分配与统一定额。
+在输入长度和运行条件相近时，聊天、工具调用型 agent 与长文档请求是否有可重复的跨步 KV 复用差异？同一请求中，不同层或物理 KV 源增加一页 GPU hot buffer 的边际收益是否不同？实验固定模型和稀疏 Top-K 选择规则，分别考察驻留容量对 miss 的影响，以及换入路径对真实服务延迟和吞吐的影响。
 
 ## 分配策略
 
-- 以请求到达时的类型作为容量先验，优先接收调用方提供的可选 API 字段 `request_type`。缺失或未知时使用统一定额。后续评估轻量分类器，特征限于分配时已经可用的信息。对阶段变化明显的请求，可进一步测试基于近期 miss 的容量反馈，并计入调整成本。
-- 每类请求按层或真实物理 KV 源分配容量。共享索引的层可能仍有独立 KV payload。多个消费者若共享同一份物理 KV，只计一次。容量按真实页和字节核算，计入页对齐，并确保 TP 各 rank 对应的分配与映射一致。
-- 根据增减一页能避免的 miss 字节、传输量及关键路径上暴露的延迟调整容量。高 miss 率本身无法说明扩容有收益。纳入预取重叠、重映射及暖机成本，保留执行当前 Top-K 所需的最小容量。
+- `request_type` 是拟议的可选 API 字段。调用方已知类型时可将其作为容量先验，缺失或未知时回退到统一定额。是否值得使用类型信息，以训练后冻结的同预算留出对照检验，并与只使用输入长度的策略比较。
+- 容量按层或实际物理 KV 源设定。共享索引的层仍可能存储独立 KV payload。多个层读取同一份物理 KV 时只计一次，按真实页和字节核算，并核对 TP 各 rank 的映射。
+- 分配价值取决于增减一页能避免多少换入字节及关键路径延迟，也需考虑查找、重映射和暖机成本，并保留当前 Top-K 所需的最小容量。当前的静态容量表以训练来源的模拟 miss 为拟合目标，选定后冻结。
 
-## 实验计划
+## 已完成结果
 
-1. 目标规模为约 200 个独立聊天来源、200 个独立 agent 来源和约 100 个 LongBench-v2 样本。使用完整输入，记录自然 EOS 结束的生成。按独立会话或任务来源分组划分训练和测试，同一来源的前缀、续写或中间 checkpoint 不跨集合。先冻结分类器、容量曲线拟合和策略选择，再运行测试。
-2. 在类型间做长度匹配或分桶，对齐负载与并发条件，同时保留仅使用长度和负载的基线。固定模型、Top-K、物理 KV 表示与替换策略，扫描容量并按独立来源报告置信区间。
-3. 在同一物理显存预算下比较统一容量、仅按类型、仅按层或物理源、类型与源联合分配，以及离线 oracle。对同一轨迹回放，估算容量对 miss 和潜在换入字节的影响，并与原生实测计数分开报告。单独跑无轨迹插桩的端到端实验，测 TPOT、TTFT、吞吐与分类型尾延迟，核查真实物理页占用，并检查实现是否保留基线的 Top-K 算法、预算和选择语义。
+截至 2026-11-12，SGLang、MiniMax M3.1 Flash 与 A100 上已采集 150 条真实轨迹，三类各 50 条。144 条自然 EOS，6 条到达配置容量边界后停止。原生 miss 的类型差异受输入、生成长度及实际上下文分布影响。
 
-## 相关工作
+在相同的六层逻辑槽预算下，共用逐层表在冻结留出中将模拟 miss 次数减少 **9.41%**。该结果来自六个采样层、两个采样 rank 的同轨迹 LRU 回放。按类型分别拟合的额外改善为 0.0188 个百分点，点态配对 95% 区间为 [−0.0447, 0.0809] 个百分点，跨过零。
 
-- SPIN 的调度器根据运行请求的序列长度和资源需求调节每请求缓冲空间。本提案测试请求类型是否提供额外预测信息，并据此对物理 KV 源分别定额。 [SPIN §5.3](https://arxiv.org/html/2604.26837v1#S5.SS3)
-- Adaptive DHiSparse 保留固定宽度的 hot cache，并弹性管理可回收的历史驻留页。本提案的控制量是按请求类型与物理源设定的 hot buffer 宽度。 [Adaptive DHiSparse](https://arxiv.org/html/2610.13708v1)
-- SGLang 和 vLLM 提供统一的 hot buffer 容量配置。SGLang 的短请求路径可按长度少分配，vLLM 的历史驻留也可随显存压力变化。实验将区分这些机制和请求类型与物理源联合定额的效果。 [SGLang 协调器](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/hisparse_coordinator.py) · [vLLM HiSparse 设计](https://docs.vllm.ai/en/latest/design/hisparse/)
+报告分别列出固定统一活跃容量下的融合与拆分换入、真实缓存语义检查，以及留出集 C1/C2 的无插桩结果，并给出各自的分母和执行配置。
 
-## 当前状态
+## 实现框架
 
-这是独立研究提案，尚未发布控制器实现。六条试跑仅用于检查采集与分析管线。扩大样本验证正在进行。请求类型和层间差异、联合分配的效果以及端到端收益均待验证。
+本轮实测采用 SGLang。后续可选择 SGLang 或 vLLM，依据目标模型与硬件适配、容量和 KV 映射的修改成本、CUDA Graph 支持及同框架内的实测结果。项目独立于 VMM 显存管理。跨框架比较需要分别建立匹配基线。
+
+## 后续工作
+
+- 将容量曲线对应的 miss 减少换算为实测时间收益，进一步验证逐层分配能否改善延迟，并通过真实物理页分配检查显存和可接纳并发的变化。
+- 扩展代码、文档处理与 rollout 等场景，比较调用方类型标签、轻量分类器与长度或近期 miss 基线。在线调整还需验证迁移成本、最小驻留容量和迟滞机制，目前未实现。
+
+## 相关研究与实现
+
+- SPIN 动态调整每个请求的 GPU KV 容量，并以支持局部性的替换策略减少跨设备换入。 [SPIN §5.3](https://arxiv.org/html/2604.26837v1#S5.SS3)
+- Adaptive DHiSparse 保留固定宽度的 hot cache，并用池中可回收的页保存额外历史。 [Adaptive DHiSparse §3.1](https://arxiv.org/html/2610.13708v1#S3.SS1)
+- SGLang 协调器包含 HiSparse 请求缓冲区的分配和换入路径。vLLM 提供本地 KV offload 的架构说明。以下是上游参考。 [SGLang HiSparse 协调器](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/hisparse_coordinator.py) · [vLLM HiSparse 设计](https://docs.vllm.ai/en/latest/design/hisparse/)
