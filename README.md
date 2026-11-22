@@ -4,7 +4,7 @@
 
 ## 11 月 23 日实测更新
 
-8 × A100 上，MiniMax 原生 HiSparse 在 B32、16–32 Ki token 输入下完成了 CUDA Graph 的逐层 Nsight 采集。事前分组的高 miss 层与低 miss 层，在每步取八卡最慢换入核、再跨八步取中位数的口径下，分别为 **1,065.88** 和 **278.26 µs/层**。固定层策略的 TPOT 与吞吐仍待配对实测。 [实测口径与逐层图](NATIVE_GRAPH_20261123.md)
+8 × A100 上，MiniMax 原生 HiSparse 在 B32、16–32 Ki token 输入下完成了 CUDA Graph 的逐层 Nsight 采集。事前分组的高 miss 层与低 miss 层，按每步取八卡最慢换入核、再跨八步取中位数的口径，分别为 **1,065.88** 和 **278.26 µs/层**。同 rank 计时显示，换入耗时差到 attention merge 结束仍保留 **99.65%**。固定层策略的 TPOT 与吞吐仍待配对实测。 [实测口径与逐层图](NATIVE_GRAPH_20261123.md)
 
 ## 11 月 22 日实验更新
 

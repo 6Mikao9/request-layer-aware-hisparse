@@ -1,6 +1,6 @@
 # A100 上原生 HiSparse 的逐层 Graph 换入耗时
 
-MiniMax 在 8 × A100、TP8 和实际 B32 下，事前选出的高 miss 层组比低 miss 层组的换入核平均多用 **787.62 µs/层**。测量对象为启用原生 HiSparse 的 CUDA Graph 回放。该结果用于核查层间换入开销的差异。
+MiniMax 在 8 × A100、TP8 和实际 B32 下，事前选出的高 miss 层组比低 miss 层组的换入核平均多用 **787.62 µs/层**。同一段原生 HiSparse CUDA Graph 回放中，对齐 rank 后，换入耗时差到 attention merge 结束仍保留 **99.65%**。
 
 ## 实验条件
 
@@ -23,4 +23,19 @@ MiniMax 在 8 × A100、TP8 和实际 B32 下，事前选出的高 miss 层组�
 
 ![A100 上原生 HiSparse 在 B32 的逐 rank、逐层换入核实测](assets/a100-native-graph-swap-20261123.png)
 
-这次结果来自一个校准输入批次。相邻 attention 内核配对未通过自动验收，完整 decoder 层和已暴露的换入等待还需单独核对。固定低 miss 层与随机层的策略收益需要在同显存、同并发、同输入下测量无插桩 TPOT 和吞吐。独立 eager 窗口见 [11 月 22 日实验报告](REPORT_20261122.md)。
+## 从换入到 attention merge
+
+复核了全部 3,840 组同流相邻的换入、稀疏 attention 和 merge 内核。每一步、每一层先选出从换入开始到 merge 结束跨度最长的 rank，表中三个分段都取自该 rank。八步、每组十层的高组减低组平均差如下。
+
+| 同一 rank 的区间 | 高组减低组（µs/层） |
+|---|---:|
+| 融合换入核 | +784.25 |
+| 换入结束到稀疏 attention 开始的有符号间隔 | +0.006 |
+| 稀疏 attention 开始到 merge 结束 | −2.74 |
+| 换入开始到 merge 结束 | **+781.51** |
+
+八步里，最后一行对应的每步差值均为正，范围为 738.54–817.22 µs/层。部分 Nsight 时间戳有亚微秒重叠，计算保留原始带符号时间差。该时间窗截止到 attention merge，完整 decoder 层及跨卡关键路径需独立测量。
+
+![A100 B32 八个 Graph 解码步里高低 miss 组在各区间的耗时差](assets/a100-native-graph-attention-gap-20261123.png)
+
+这次测量覆盖一个校准输入批次。固定低 miss 层与随机层的收益仍需用同显存、同并发、同输入的无插桩 TPOT 和吞吐验证。独立 eager 窗口见 [11 月 22 日实验报告](REPORT_20261122.md)。
