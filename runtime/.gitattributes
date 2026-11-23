@@ -1,0 +1,4 @@
+# Generated artifacts and the pinned license are hash-guarded byte-for-byte.
+generated/* -text
+LICENSE -text
+generated_grouped/* -text

@@ -1,0 +1,17 @@
+This prototype derives isolated functions and CUDA source from SGLang source
+captured read-only from image
+sha256:614b1509bcb729c653528d448bff9850f8977fcad9d12ba56bd6dbe3d7985e87.
+Source project: https://github.com/sgl-project/sglang
+Exact input SHA256 and generated-output SHA256 are in PROVENANCE.json.
+The exact image Apache-2.0 LICENSE is retained in LICENSE, SHA256
+1495e1e757ef4d0925a2350563cf5754bb23c51701a8ec4fb3c5cdcbedae6747.
+Selected original source files contain no license preamble; none was removed.
+Changes: active long-path LRU capacity separated from physical Hmax; standalone
+MHA dispatch; explicit frozen-policy startup hook. Unrelated upstream methods
+are not replaced.
+
+The optional split-copy adapter reuses the existing RecordMissPlan/SkipIO
+planner specialization and copy_cache_planned MHA kernel. It adds fixed plan
+storage and process-local same-stream routing for validated batch shapes.
+The plan/copy kernel mechanism is attributed to SGLang, not claimed as a new
+algorithm. The adapter does not enable the upstream side-stream overlap path.

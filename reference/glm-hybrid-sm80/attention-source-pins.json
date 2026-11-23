@@ -1,0 +1,9 @@
+{
+  "vllm/v1/attention/backends/registry.py": "89134611e7422940052499ea9ff3563d6ea2c28ad79fa0d282f7e2a0d99b5126",
+  "vllm/v1/attention/backends/mla/flashmla_sparse.py": "7ecdfef953fdb2d0867b6e958c2b2d287d70f5b390ce18156dd54cdd84485a38",
+  "vllm/v1/attention/backends/mla/index_group.py": "5caf428e7357d46a620de55f2461f65ca57b947a9bfd0d9d98d834f66bdf9aed",
+  "vllm/model_executor/layers/attention/sparse_mla_attention.py": "97804c8a4f30745419a68f3f992855fa7692efecc600b1925ca61b83908598eb",
+  "vllm/model_executor/layers/attention/mla_attention.py": "f5c73c6e845ab3b475cba4e570e4e30581a12def93a5dc689e528fc3b114adae",
+  "vllm/v1/hisparse/runtime.py": "25914537a0532fa36b69d712bd3304a5704aa2c84f077f552d7163e745b7aae4",
+  "vllm/models/deepseek_v32/attention.py": "924143560a4ec942e9e44c1ad201c639672b015398ed3d0880db11bdf37d1465"
+}

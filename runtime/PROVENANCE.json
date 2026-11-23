@@ -1,0 +1,44 @@
+{
+  "image": "sha256:614b1509bcb729c653528d448bff9850f8977fcad9d12ba56bd6dbe3d7985e87",
+  "source": "Pinned image SGLang source; local read-only snapshot container-transfer-20261109/pinned-source",
+  "upstream": "https://github.com/sgl-project/sglang",
+  "license_status": "Apache-2.0; exact pinned image LICENSE retained in runtime/LICENSE",
+  "source_sha256": {
+    "kernels/jit/csrc/kvcacheio/hisparse.cuh": "9daae4e368a8561b08f358193be270e512d659936bf13a812219be04e846cf0a",
+    "kernels/ops/kvcache/hisparse.py": "f922d4a52f7d24d252d21e4b7f9a70f9264bb751710626c8610eb2fc662f7e99",
+    "srt/managers/hisparse_coordinator.py": "cfe012ce100ee86dcc5080ca5168d51fd4abd83e8c62ee72d3606b5feafc282e"
+  },
+  "generated_sha256": {
+    "coordinator_method.py": "42ec6925122936e2979eaa61112e04d8e60f277f999b8e931eca7fcdde2107ac",
+    "hisparse_active.cuh": "32260b39c35170357d8155ebc76860557bb56da7646852330ee1d3d5efa823e9",
+    "ops.py": "fa1101c645a74d163c31518fef519a846e7be48dcb8f584f45c1d67948d56b13",
+    "__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "license_sha256": "1495e1e757ef4d0925a2350563cf5754bb23c51701a8ec4fb3c5cdcbedae6747",
+  "jit_contract": "Pinned loader accepts absolute cuda_files; compile/spec.py resolve_sources resolves absolute files directly.",
+  "runtime_dependency_sha256": {
+    "srt/mem_cache/memory_pool.py": "e3d57e41beb4d5f77c2c91e6bf9bb392ef1b5ad9e853c4521b3dfcf1e12a20e1",
+    "srt/mem_cache/allocator/hisparse.py": "f3f15a599bcb09131606bd5bf93511a4bf39f4acec5835e73975967b5697f732",
+    "srt/mem_cache/hisparse_memory_pool.py": "74b46cc95e8336407348e7251ad08c730f1ab6a676f9a44632007d9ae3b72480",
+    "srt/mem_cache/pool_host/mha.py": "a4420c250dd89880327dfe87e12e7a501b96763ccb50edfd07ff773141742991",
+    "srt/mem_cache/allocator/base.py": "17c07a9ab32c62932048d3579e620eaa2e2558b03b828df152b2ee953c4bfe32",
+    "srt/mem_cache/kv_cache_configurator.py": "f3d0a4fc7f432b1ab5d2ea5c7b38261667e33c45edf08cc0ae825141cc61bd84",
+    "srt/model_executor/cuda_graph_config.py": "0f6774dd498548e2220606c5e60eeb6c5a768ab50d7d978384ed0eab677ef8d0",
+    "srt/model_executor/cuda_graph_buffer_registry.py": "b33966823abf1f720dee2629495e9bd257b8aa598589d981b9771f3f0bb2fc8d",
+    "srt/model_executor/model_runner_components/cuda_graph_setup.py": "24fd6ba038edced86eb20df7d4c01e2ebf1ab055a155fd328a82f3fba48aada9",
+    "srt/model_executor/runner/__init__.py": "127a2ef6dbef37f51fb29a78b6d3ee1eeee0503bb17684fc7f6f1fb3f748a52a",
+    "srt/model_executor/runner/base_cuda_graph_runner.py": "e0deafbfe804b82c69e28636831c5aacc7a37d33e56860e19663e737708901df",
+    "srt/model_executor/runner/decode_cuda_graph_runner.py": "82652e80a5b1e9d4fa6e49e8ec6daf707afc18a7fe0a8d7b7008358f824ae0f2",
+    "srt/model_executor/runner/prefill_cuda_graph_runner.py": "3ed23f4bd88c4bcc319de6fd4c391f083ed092cb77d4b1c94923aad2d9a12cb6",
+    "srt/model_executor/runner/shape_key.py": "f52324e74d2b9e7d11b494f273d8a841de33c56f68ba7a57d7e5f631b82a2984",
+    "srt/model_executor/runner_backend/breakable_cuda_graph_backend.py": "2c598110d6c8d3556fbce50c0f57b9afe98fd85b4ff3012c15e6714aa4d519d8",
+    "srt/model_executor/runner_backend/full_cuda_graph_backend.py": "4cdf861b6dbf61d2875598602c77855df06910784fcec43c89fc132cc99bf217",
+    "srt/runtime_context.py": "17c498293ca672c39fea298fa104d5b5603323581cb18d695e5d8fc4f06d1bc6",
+    "srt/server_args.py": "cab82bd114b470d9165fefc2002d0870bc6f018eaff0d41ba451aaab725ed35e",
+    "kernels/jit/utils/__init__.py": "115c0388c11eb179750afa9c17843cf657c35b1478b0a967476d562f66d79b91",
+    "kernels/jit/utils/compile/loader.py": "f4437c88aae8ae55a315bef9f52e19b2dabd3ad8a2cf0ffaab2a6786dbb52993",
+    "kernels/jit/utils/compile/spec.py": "f762d7d90adb2770988ab0d17b444496d9d611531ab136eb37b8c8707dd42b2f",
+    "kernels/jit/utils/compile/paths.py": "bfa8a912174607c74237f1b5f45b0a87dc8da8b5f1f5be39868966787fae76e2"
+  },
+  "dependency_manifest_sha256": "c69ba6187d3d10a66059ae03184f77fffa7aa0439302a95c4c2f6a24f36c7226"
+}
