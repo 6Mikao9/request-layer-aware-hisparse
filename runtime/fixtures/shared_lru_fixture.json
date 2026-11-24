@@ -1,0 +1,22 @@
+{
+  "schema": "shared-lru-fixture-v1",
+  "seed": 20261124,
+  "layers": [0, 1, 2, 3],
+  "hot_rows": 32,
+  "page": 4,
+  "block_size": 4,
+  "blocks": 4,
+  "item_bytes": 8,
+  "ranks": [0, 1],
+  "steps": 24,
+  "working_set_blocks": [2, 3, 12, 14],
+  "requests": [
+    {"slot": 0, "generation": 1, "prompt": 120, "profile": "cycle"},
+    {"slot": 1, "generation": 2, "prompt": 20, "profile": "uniform"},
+    {"slot": 2, "generation": 3, "prompt": 200, "profile": "skewed"},
+    {"slot": 3, "generation": 4, "prompt": 90, "profile": "cycle"}
+  ],
+  "reuse": [
+    {"after_step": 12, "slot": 1, "generation": 7, "prompt": 64, "profile": "cycle"}
+  ]
+}

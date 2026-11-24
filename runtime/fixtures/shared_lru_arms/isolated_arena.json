@@ -1,0 +1,7 @@
+{
+  "schema": "hisparse-study-config-v1",
+  "placement": {"mode": "native"},
+  "hot_pool": {"mode": "isolated", "scope": "request_rank", "layout": "arena", "eviction": "lru",
+               "admission": "all", "quota": "none"},
+  "diagnostics": {"mode": "none"}
+}
