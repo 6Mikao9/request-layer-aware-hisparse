@@ -2,6 +2,8 @@
 
 北京时间 2026-11-25 01:00–09:00。本页记录待执行的实验和验收条件。合并后固定最终 SHA、SGLang 源码、镜像摘要、CUDA/NVCC、驱动、模型版本及输入清单摘要。复核八张 A100 的 UUID、空闲显存、利用率及进程归属，容器创建前再核对一次，运行中遇外部占用即释放自有容器。旧夜间 worker 的日期和阶段均需更新；本页没有安装或启动 worker。
 
+2026-11-24 已在独立 A100 容器完成 NVCC 真编译、生产几何全部 60 层 eager/Graph 正确性检查和无模型扫描微基准，详见[结果与 Nsight 分析](shared-lru-scan-microbenchmark.md)。固定镜像中的 33 个文件 pin 和 17 个符号通过核验。完整模型、TP8 与三臂 worker 接线仍待验证；当前 shared 的全池扫描明显慢于 isolated，应据此规划优化与消融。固定镜像实际已含 Nsys/NCU 2026.3.0，NCU 需自有容器添加 `SYS_ADMIN` 才可访问计数器，本次没有改共享宿主机驱动。
+
 ## 正确性和准入
 
 在仓库根目录运行。输出位置须为本轮独占的新路径。
@@ -18,7 +20,7 @@ python -m runtime.cuda_shared_lru_production_correctness --allow-cuda-test --all
 
 ## 三臂配对
 
-打包检查另发现 launcher 已引用、但公开仓库未包含 `runtime/compat/minimax_sm80.py`。现补入旧实验所用的原字节版本（SHA256 `207df72e8294982f5153a236043871f38a26b37338c543d9c8322fd56d0c2bf0`），没有改动投影算法；新增安装路径检查后，相关 launch/contracts 的 21 项 CPU 测试全部通过。创建 Linux 源码包时关闭 Git 的 CRLF 转换，保证包内文件与已提交 blob 字节一致，避免固定 SHA 校验在加载前失败。
+打包检查另发现 launcher 引用的 `runtime/compat/minimax_sm80.py` 必须保持旧实验所用的原字节（SHA256 `207df72e8294982f5153a236043871f38a26b37338c543d9c8322fd56d0c2bf0`），其中包括 CRLF。补入文件后，Git 的自动换行转换曾把已提交 blob 改为 LF；现在用 `.gitattributes` 的 `-text` 保护该文件并重新入库，没有改动投影算法。部署包须同时检查 Git blob 和 launcher 预期摘要；仅关闭打包时的换行转换并不足以修复已经改变的 blob。此前源包保留但停用。
 
 复制 runtime/fixtures/shared_lru_plan_spec.example.json 到独立运行目录，将零值摘要换成实际训练及留出清单摘要，解析模型路径并据八 rank 实测容量选择共同可行 B。以下命令使用准备好的私有 spec 和新输出目录。
 

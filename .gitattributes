@@ -1,0 +1,2 @@
+# The launcher pins this legacy adapter's exact bytes, including CRLF.
+runtime/compat/minimax_sm80.py -text

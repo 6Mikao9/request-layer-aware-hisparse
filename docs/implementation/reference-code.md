@@ -40,6 +40,8 @@ python -B -m benchmarks.paired_service_plan --help
 
 [PR #4 的基础验证与夜间实验安排](shared-lru-pr4-validation.md)记录 CPU 检查结果及待验证的 GPU 条件；[元数据账本与优化顺序](shared-lru-metadata.md)列出按卡计算的显存占用、压缩候选和逐项消融要求。
 
+[A100 全池扫描单核实测](shared-lru-scan-microbenchmark.md)包含真实 CUDA Graph 三臂计时、生产几何正确性收据和 Nsight Systems / Compute 数据。L60、B32 全命中时，共享 resolver 约 886 µs，隔离约 65 µs；这是当前扫描实现的性能问题，尚不是完整模型结果。
+
 CPU 命令在新 clone 的仓库根目录运行。无 Torch 时张量测试跳过；装有带 CUDA 前端的 clang++ 时会额外对 `shared_lru_kernel.cuh` 的全部模板做 host/sm_80 语法检查。
 
 ```bash

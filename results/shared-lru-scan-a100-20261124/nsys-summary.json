@@ -1,0 +1,209 @@
+{
+  "scope": "separate diagnostic; 3 warmup+10 timed graph kernels per case; one resolver per graph; no other kernel nodes",
+  "cases": [
+    {
+      "case": "scan arm=stock B=32 L=60 misses=0",
+      "name": "load_cache_to_device_buffer_kernel",
+      "eager_count": 1,
+      "graph_count": 13,
+      "graph_median_us": 17.152,
+      "grid": [
+        32,
+        1,
+        1
+      ],
+      "block": [
+        960,
+        1,
+        1
+      ],
+      "registers_per_thread": 56,
+      "dynamic_shared_bytes": 42000,
+      "graph_times_us": [
+        19.84,
+        19.328,
+        17.152,
+        17.216,
+        19.392,
+        17.056,
+        17.184,
+        17.088,
+        17.056,
+        17.184,
+        17.088,
+        17.088,
+        17.056
+      ]
+    },
+    {
+      "case": "scan arm=isolated B=32 L=60 misses=0",
+      "name": "resolve_kernel",
+      "eager_count": 1,
+      "graph_count": 13,
+      "graph_median_us": 61.44,
+      "grid": [
+        32,
+        1,
+        1
+      ],
+      "block": [
+        1024,
+        1,
+        1
+      ],
+      "registers_per_thread": 58,
+      "dynamic_shared_bytes": 100904,
+      "graph_times_us": [
+        64.448,
+        62.624,
+        61.088,
+        61.44,
+        61.984,
+        61.504,
+        61.312,
+        62.016,
+        61.824,
+        61.44,
+        61.183,
+        61.056,
+        61.088
+      ]
+    },
+    {
+      "case": "scan arm=shared B=32 L=60 misses=0",
+      "name": "resolve_kernel",
+      "eager_count": 1,
+      "graph_count": 13,
+      "graph_median_us": 891.166,
+      "grid": [
+        32,
+        1,
+        1
+      ],
+      "block": [
+        1024,
+        1,
+        1
+      ],
+      "registers_per_thread": 58,
+      "dynamic_shared_bytes": 100904,
+      "graph_times_us": [
+        896.958,
+        892.126,
+        893.631,
+        889.279,
+        891.166,
+        891.807,
+        889.439,
+        890.302,
+        893.407,
+        888.127,
+        893.246,
+        891.134,
+        889.055
+      ]
+    },
+    {
+      "case": "scan arm=stock B=32 L=60 misses=4",
+      "name": "load_cache_to_device_buffer_kernel",
+      "eager_count": 1,
+      "graph_count": 13,
+      "graph_median_us": 355.455,
+      "grid": [
+        32,
+        1,
+        1
+      ],
+      "block": [
+        960,
+        1,
+        1
+      ],
+      "registers_per_thread": 56,
+      "dynamic_shared_bytes": 42000,
+      "graph_times_us": [
+        357.823,
+        359.551,
+        355.776,
+        354.144,
+        359.584,
+        354.336,
+        355.455,
+        354.047,
+        355.455,
+        353.696,
+        355.232,
+        355.775,
+        353.887
+      ]
+    },
+    {
+      "case": "scan arm=isolated B=32 L=60 misses=4",
+      "name": "resolve_kernel",
+      "eager_count": 1,
+      "graph_count": 13,
+      "graph_median_us": 399.615,
+      "grid": [
+        32,
+        1,
+        1
+      ],
+      "block": [
+        1024,
+        1,
+        1
+      ],
+      "registers_per_thread": 58,
+      "dynamic_shared_bytes": 100904,
+      "graph_times_us": [
+        403.04,
+        401.759,
+        398.879,
+        399.999,
+        399.808,
+        398.944,
+        398.624,
+        399.68,
+        399.456,
+        398.816,
+        400.48,
+        399.615,
+        398.847
+      ]
+    },
+    {
+      "case": "scan arm=shared B=32 L=60 misses=4",
+      "name": "resolve_kernel",
+      "eager_count": 1,
+      "graph_count": 13,
+      "graph_median_us": 1109.854,
+      "grid": [
+        32,
+        1,
+        1
+      ],
+      "block": [
+        1024,
+        1,
+        1
+      ],
+      "registers_per_thread": 58,
+      "dynamic_shared_bytes": 100904,
+      "graph_times_us": [
+        1113.246,
+        1110.399,
+        1108.191,
+        1109.726,
+        1109.854,
+        1111.806,
+        1107.454,
+        1106.591,
+        1111.358,
+        1109.854,
+        1107.55,
+        1111.454,
+        1108.831
+      ]
+    }
+  ]
+}

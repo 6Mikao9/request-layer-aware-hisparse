@@ -1,0 +1,34 @@
+{
+  "utc": "2026-11-24T12:29:58.421747+00:00",
+  "model_loaded": false,
+  "source_base": "2e298a502ee5d0ae0a400360c85a1d51b0bb73f3",
+  "image": "sha256:614b1509bcb729c653528d448bff9850f8977fcad9d12ba56bd6dbe3d7985e87",
+  "source_overlays": {
+    "runtime/benchmark_shared_lru_scan.py": "0bdfda71d49853b7d690de478db1887aec86bb854e94dbea3e9c416cdf3e9bb5",
+    "runtime/compat/minimax_sm80.py": "207df72e8294982f5153a236043871f38a26b37338c543d9c8322fd56d0c2bf0"
+  },
+  "profiler_versions": {
+    "nsys": "2026.3.0.0",
+    "ncu": "2026.3.0.0"
+  },
+  "ncu_permission": "initial container failed ERR_NVGPUCTRPERM; dedicated own container with SYS_ADMIN passed; host driver unchanged",
+  "raw_reports": {
+    "scan-ncu-shared-hit-02.ncu-repz": {
+      "bytes": 58892,
+      "sha256": "b30fa8971390f82ab1259714afbaaa8ab51013a40a7e72251b768ae0bf1ae0bd"
+    },
+    "scan-ncu-stock-hit-02.ncu-repz": {
+      "bytes": 43556,
+      "sha256": "301dcfe722a7d255f88969dba597f6b43cd4f8ba48fa05751854a9504228839c"
+    },
+    "scan-ncu-isolated-hit-02.ncu-repz": {
+      "bytes": 57770,
+      "sha256": "5aa6545d878be6f1bb94fcbce546beabe831775ffa0275828de46ecd55ced317"
+    },
+    "scan-nsys-01.nsys-rep": {
+      "bytes": 240764,
+      "sha256": "7ddf944dccc190883c7c7be7e213af22969cc9c8f35448016445526a2d67077e"
+    }
+  },
+  "gpu_release": "0 MiB, 0 %"
+}
