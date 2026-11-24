@@ -26,6 +26,20 @@
 
 固定实验镜像在 A100 上用内容 ID `sha256:614b1509bcb729c653528d448bff9850f8977fcad9d12ba56bd6dbe3d7985e87` 记录。这个 ID 用于身份验收。贡献者用公开的固定源码和自己的 CPU 环境。维护者把已经存在的实机镜像、校验过的只读权重和输入清单挂进运行容器，测试命令用 `$MODEL_DIR`、`$DATA_MANIFEST`、`$OUTPUT_DIR`、`$SGLANG_SRC`、`$VLLM_SRC` 等参数。代码和示例不得假定有能登陆的主机、云账号、访问密钥或固定宿主路径。
 
+## GPU 热路径与编译环境
+
+新增的逐层 decode 热路径使用 **CUDA C++ 或 TileLang**。优先复用框架现有的原生 CUDA 换入、写回和 attention 核。新写的槽位解析、命中与 LRU 更新、缺失压紧、主 KV 回填及消费前的处理优先走原生 CUDA。TileLang 适合能在 SM80 上明确控制向量化、分块和访存的部分。已有 Triton attention、索引器或参考实现沿用其原有角色，作为同后端对照的一部分。Python 负责初始化、配置和 CPU oracle，decode 热路径在初始化或捕图时完成分派。
+
+| 目标 | 已核验环境与构建方式 |
+| --- | --- |
+| MiniMax / SGLang | Linux x86-64，Python 3.12，`lmsysorg/sglang:dev-minimax-m31-flash` 的上述镜像 ID，`sgl-project/sglang@e7399a46f420d5903c3f2eddee74f0f9cfe68e11`，PyTorch `2.15.0.dev20261005+cu134`，CUDA Toolkit 13.4，`nvcc V13.4.59`。已记录的实验室驱动为 `580.178.04`。使用该镜像已有的 Python、Torch 和 CUDA 开发头编译，运行时保留同一环境。 |
+| GLM / Hybrid vLLM | Linux x86-64，`neuralmagic/vllm@e8ef1e07bd2f174bebfe34c3a3e35e952931efb1`，实验室镜像 ID `sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1` 与 SM80 稀疏后端适配。现有 GLM 整模型诊断使用 BF16 KV、`HYBRID_TRITON_SM80`、TP8 eager。新扩展用这个镜像的 Torch/CUDA ABI 构建，实机验收时从镜像读回版本。Graph 支持需单独实测。 |
+| GPU 架构 | A100 主目标为 Ampere `sm_80`。直接调用 `nvcc` 时使用 `-gencode arch=compute_80,code=sm_80`，PyTorch 扩展用 `TORCH_CUDA_ARCH_LIST=8.0`，CMake 对应 `CMAKE_CUDA_ARCHITECTURES=80`。TileLang 显式选择 CUDA `sm_80` 目标。L20 扩展到 `sm_89` 时单独构建和测量。 |
+
+TileLang 方案在 PR 固定 TileLang 版本或 commit，以及实际使用的编译后端和工具链版本。交付可复跑的构建命令、目标架构、生成的 CUDA 或设备二进制摘要，以及对接现有 stream 和 CUDA Graph 的入口。A100 路径使用 Ampere 支持的指令和同步。能在当前环境离线编译时，检查实际产物包含 SM80 设备代码，例如用 `cuobjdump --list-elf`。CPU 贡献者可先提交源码、测试和编译命令，实机项标记 `pending_hardware`。[TileLang 官方源码与安装入口](https://github.com/tile-ai/tilelang)
+
+构建收据保存镜像和框架源码摘要、`python --version`、`nvcc --version`、宿主 C/C++ 编译器版本、`torch.__version__`、`torch.version.cuda`、Torch C++ ABI 和 NCCL 版本。为正式测量记录实际选中的 kernel 和后端、是否真实 replay、每步 kernel 次数、暴露等待和稳态 TPOT/吞吐。编译、调优和图捕获放在稳态窗口之前。完整性能验收用同模型、同输入、同实际 B、同显存/主机预算和同 Graph 档，计时与 Nsight 诊断分开。[性能与消融合同](ablation-contract.md)
+
 ### 先搞清几个名词
 
 - **Prefill** 处理已有上下文并为每层写出 KV。**Decode** 每步生成一个 token，通常需要每层读取一部分历史。压力实验统计预热后的解码窗口。
