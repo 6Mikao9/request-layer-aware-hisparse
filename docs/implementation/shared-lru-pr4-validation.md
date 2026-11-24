@@ -9,9 +9,12 @@
 ```sh
 python -B -m unittest runtime.test_shared_lru runtime.test_shared_lru_config runtime.test_shared_lru_device runtime.test_shared_lru_gate runtime.test_shared_lru_kernel runtime.test_shared_lru_launch runtime.test_shared_lru_plan runtime.test_shared_lru_replay
 python -m runtime.cuda_shared_lru_correctness --allow-cuda-test --output /tmp/pr4-gate.json
+python -m runtime.cuda_shared_lru_production_correctness --allow-cuda-test --all-planes --output /tmp/pr4-production-gate.json
 ```
 
-第一项是专项 CPU 检查。本机完整主套件运行 236 项、跳过 1 项（Windows 缺 Clang CUDA backend）；独立 GLM 参考套件运行 5 项、跳过 1 项（缺固定 vLLM 源），两套均通过。已有 dry-run 通过 33 个 pin 和 17 个符号检查。另在固定源码与镜像上逐项核验 33 个 pin 和 17 个符号，保留实际内容摘要、符号解析和失败项。第二项须在准入后执行并保留真实 NVCC 编译、sm_80 加载、eager 和 CUDA Graph replay 的收据。另行实现生产几何验证入口，在 60 层、H=4096、TopK=2048、page=128 下核对共享与隔离分配、每层每个请求的 K/V 行及有效位、padding、槽位回收与跨 generation 复用。逐步读取 sticky status，注入错误后核对其跨步骤保留及拒绝交付，完成一轮有效重置后再准入。小型 fixture 和合成 metadata 命中只验证状态转移。缺生产几何、真实 kernel 或 Graph 任一收据时，保留失败证据并暂停候选性能测量。
+第一项是专项 CPU 检查。补充生产几何夹具后，本机完整主套件运行 238 项、跳过 1 项（Windows 缺 Clang CUDA backend），237 项通过；独立 GLM 参考套件运行 5 项、跳过 1 项（缺固定 vLLM 源），其余通过。dry-run 通过 33 个 pin 和 17 个符号检查。实际镜像安装目录需再次核验并保留哈希及失败项。
+
+后两项须在 GPU 准入后执行。小型 fixture 覆盖共享、隔离、FIFO、软保底及旁路等策略。新增生产几何入口完整分配 60 层、H4096、TopK2048、page128、head dim128，使用两个槽（一实一 padding），以当前共享策略核对全部选中 K/V、owner/order/occupancy、返回索引、计数和状态；`--all-planes` 在 eager 与 Graph 各追加全 60 层一遍校验，否则只发射首尾层。第二代请求改变 host KV 内容，使用原 Graph 回放，检查旧 payload 隔离。它不覆盖真实高 batch、完整模型或全 TP rank；这些仍需随后真实模型小批检查。保留 NVCC 编译、sm_80 加载和 Graph replay 收据。状态检查放在计时外，负面错误注入另做。缺生产几何、真实 kernel 或 Graph 任一收据时，保留失败证据并暂停候选性能测量。所有合成 fixture 仅验证正确性。
 
 ## 三臂配对
 

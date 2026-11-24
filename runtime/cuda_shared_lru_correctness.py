@@ -11,6 +11,7 @@ rows) are both covered. This is a correctness check, not a benchmark.
     python -m runtime.cuda_shared_lru_correctness --allow-cuda-test --output /tmp/gate.json
 """
 import argparse
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import random
@@ -33,78 +34,96 @@ L, H, PAGE, SLOTS, BLOCKS, BLOCK, DIM, BUCKET = 3, 64, 16, 4, 4, 8, 8, 4
 CONTEXT = 4096
 
 
+@dataclass(frozen=True)
+class Geometry:
+    layers: int = L
+    hot: int = H
+    page: int = PAGE
+    slots: int = SLOTS
+    blocks: int = BLOCKS
+    block: int = BLOCK
+    dim: int = DIM
+    context: int = CONTEXT
+
+
 class Bench:
     """Synthetic coordinator, contiguous planes and pinned host history on one A100."""
 
-    def __init__(self, torch, config, seed, device="cuda"):
+    def __init__(self, torch, config, seed, device="cuda", geometry=Geometry()):
         from runtime.shared_lru_device import ArenaRuntime
         self.torch, self.rng, self.device = torch, random.Random(seed), device
+        self.geometry = geometry
         cuda, bf16 = torch.device(device), torch.bfloat16
         pin = device == "cuda"
-        plane_rows = PAGE + SLOTS * (H + PAGE)
-        k_all = torch.full((L, plane_rows, 1, DIM), -999.0, dtype=bf16, device=cuda)
+        plane_rows = geometry.page + geometry.slots * (geometry.hot + geometry.page)
+        k_all = torch.full((geometry.layers, plane_rows, 1, geometry.dim), -999.0, dtype=bf16, device=cuda)
         v_all = torch.full_like(k_all, -999.0)
-        pool = types.SimpleNamespace(start_layer=0, layer_num=L, page_size=PAGE, k_buffer=list(k_all.unbind(0)),
+        pool = types.SimpleNamespace(start_layer=0, layer_num=geometry.layers, page_size=geometry.page, k_buffer=list(k_all.unbind(0)),
                                      v_buffer=list(v_all.unbind(0)), _rlh_contiguous_kv=(k_all, v_all))
-        rows = SLOTS * CONTEXT
+        rows = geometry.slots * geometry.context
         # Exact BF16 integers: elements 0/1 encode the host row, the rest mix plane and K/V salt.
         row = torch.arange(rows, dtype=torch.int64).unsqueeze(1)
-        element = torch.arange(DIM, dtype=torch.int64).unsqueeze(0)
+        element = torch.arange(geometry.dim, dtype=torch.int64).unsqueeze(0)
 
         def history(plane, salt):
             mix = (row * 7 + element * 13 + 31 * plane + salt) % 251
             values = torch.where(element == 0, row % 251, torch.where(element == 1, (row // 251) % 251, mix))
-            values = (values - 125).reshape(rows, 1, DIM).to(bf16)
+            values = (values - 125).reshape(rows, 1, geometry.dim).to(bf16)
             return values.pin_memory() if pin else values
 
-        self.host_k = [history(p, 0) for p in range(L)]
-        self.host_v = [history(p, 101) for p in range(L)]
-        locs = list(range(PAGE, plane_rows))
+        self.host_k = [history(p, 0) for p in range(geometry.layers)]
+        self.host_v = [history(p, 101) for p in range(geometry.layers)]
+        locs = list(range(geometry.page, plane_rows))
         self.rng.shuffle(locs)
-        self.locs = [locs[s * (H + PAGE):(s + 1) * (H + PAGE)] for s in range(SLOTS)]
+        self.locs = [locs[s * (geometry.hot + geometry.page):(s + 1) * (geometry.hot + geometry.page)] for s in range(geometry.slots)]
         i32 = torch.int32
         self.coordinator = types.SimpleNamespace(
-            mem_pool_device=pool, device_buffer_size=H, top_k=BLOCKS * BLOCK, item_size_bytes=DIM * 2,
-            req_device_buffer_tokens=torch.full((L, SLOTS, H + PAGE), -1, dtype=i32, device=cuda),
-            req_device_buffer_token_locs=torch.tensor([self.locs] * L, dtype=i32, device=cuda),
-            lru_slots=torch.zeros((L, SLOTS, H), dtype=torch.int16, device=cuda),
-            top_k_device_locs_buffer=torch.full((SLOTS, H), -7, dtype=i32, device=cuda),
+            mem_pool_device=pool, device_buffer_size=geometry.hot, top_k=geometry.blocks * geometry.block, item_size_bytes=geometry.dim * 2,
+            req_device_buffer_tokens=torch.full((geometry.layers, geometry.slots, geometry.hot + geometry.page), -1, dtype=i32, device=cuda),
+            req_device_buffer_token_locs=torch.tensor([self.locs] * geometry.layers, dtype=i32, device=cuda),
+            lru_slots=torch.zeros((geometry.layers, geometry.slots, geometry.hot), dtype=torch.int16, device=cuda),
+            top_k_device_locs_buffer=torch.full((geometry.slots, geometry.hot), -7, dtype=i32, device=cuda),
             num_real_reqs=torch.zeros(1, dtype=i32, device=cuda),
-            req_to_host_pool=(torch.arange(SLOTS * CONTEXT, dtype=torch.int64, device=cuda).reshape(SLOTS, CONTEXT)),
+            req_to_host_pool=(torch.arange(geometry.slots * geometry.context, dtype=torch.int64, device=cuda).reshape(geometry.slots, geometry.context)),
             mem_pool_host=types.SimpleNamespace(k_buffer=self.host_k, v_buffer=self.host_v))
         self.runtime = ArenaRuntime(self.coordinator, config, "0" * 64, torch=torch)
         self.mirror = reference.KernelMirror(self.runtime.plan, plane_rows=plane_rows)
         self.k_all, self.v_all, self.plane_rows = k_all, v_all, plane_rows
         self.seq = {}
-        self.counters = {p: dict.fromkeys(reference.COUNTER_FIELDS, 0) for p in range(L)}
+        self.counters = {p: dict.fromkeys(reference.COUNTER_FIELDS, 0) for p in range(geometry.layers)}
     def _write(self, slot, index, token):
         """Stock KV write of one token into every plane's slot ``index`` (position or tail)."""
-        host_row = slot * CONTEXT + token
+        host_row = slot * self.geometry.context + token
         loc = self.locs[slot][index]
-        for p in range(L):
+        for p in range(self.geometry.layers):
             self.k_all[p, loc].copy_(self.host_k[p][host_row])
             self.v_all[p, loc].copy_(self.host_v[p][host_row])
 
     def admit(self, slot, prompt):
         """Staged prompt (native alloc_device_buffer tables) plus the first decode token."""
         torch = self.torch
-        self.coordinator.req_device_buffer_tokens[:, slot, :H] = torch.arange(H, dtype=torch.int32)
+        self.coordinator.req_device_buffer_tokens[:, slot, :self.geometry.hot] = torch.arange(self.geometry.hot, dtype=torch.int32)
         allocation = self.runtime._allocations[slot]
         self.runtime.init_slot(slot)
         self.mirror.init_slot(slot, allocation, self.locs[slot])
-        for token in range(min(prompt, H)):
-            self._write(slot, token, token)
+        count = min(prompt, self.geometry.hot)
+        indices = torch.tensor(self.locs[slot][:count], dtype=torch.long, device=self.device)
+        start = slot * self.geometry.context
+        for plane in range(self.geometry.layers):
+            for buffer, history in ((self.k_all, self.host_k), (self.v_all, self.host_v)):
+                rows = history[plane][start:start + count].to(self.device)
+                buffer[plane].index_copy_(0, indices, rows)
         self.seq[slot] = prompt
         self.advance(slot)
 
     def advance(self, slot):
         token = self.seq[slot]
-        self._write(slot, min(token, H), token)
+        self._write(slot, min(token, self.geometry.hot), token)
         self.seq[slot] = token + 1
 
     def selection(self, slot):
-        top = (self.seq[slot] + BLOCK - 1) // BLOCK
-        blocks = [self.rng.randrange(top) for _ in range(BLOCKS)]
+        top = (self.seq[slot] + self.geometry.block - 1) // self.geometry.block
+        blocks = [self.rng.randrange(top) for _ in range(self.geometry.blocks)]
         if self.rng.random() < 0.5:
             blocks[-1] = top - 1
         if self.rng.random() < 0.2:
@@ -114,13 +133,13 @@ class Bench:
         return blocks
 
     def expect(self, slot, plane, blocks):
-        flat, _, counters = self.mirror.resolve_row(slot, plane, blocks, BLOCK, self.seq[slot])
-        if self.seq[slot] > H:  # the kernel counts only on the long path
-            tokens = reference.selected_tokens(blocks, BLOCK, self.seq[slot])
+        flat, _, counters = self.mirror.resolve_row(slot, plane, blocks, self.geometry.block, self.seq[slot])
+        if self.seq[slot] > self.geometry.hot:  # the kernel counts only on the long path
+            tokens = reference.selected_tokens(blocks, self.geometry.block, self.seq[slot])
             totals = self.counters[plane]
             for name in ("unique", "hits", "misses", "bypassed", "breaches"):
                 totals[name] += counters[name]
-            totals["bytes"] += 2 * DIM * 2 * counters["misses"]
+            totals["bytes"] += 2 * self.geometry.dim * 2 * counters["misses"]
             totals["latest"] += tokens.count(self.seq[slot] - 1)
             totals["invalid"] += tokens.count(-1)
         return flat
@@ -130,7 +149,7 @@ class Bench:
         if self.device == "cuda":
             torch.cuda.synchronize()
         out = self.coordinator.top_k_device_locs_buffer
-        width = BLOCKS * BLOCK
+        width = self.geometry.blocks * self.geometry.block
         flat_k, flat_v = self.runtime.flat_k, self.runtime.flat_v
         for b, (slot, blocks) in enumerate(rows):
             got = out[b, :width].tolist()
@@ -139,24 +158,26 @@ class Bench:
             assert self.runtime.row_owner[slot].tolist() == state["owner"], "owner tags diverged"
             assert self.runtime.order[slot].tolist() == state["order"], "recency list diverged"
             assert self.runtime.occupancy[slot].tolist() == state["occ"], "occupancy diverged"
-            tokens = self.coordinator.req_device_buffer_tokens[:, slot, :H].reshape(-1).tolist()
+            tokens = self.coordinator.req_device_buffer_tokens[:, slot, :self.geometry.hot].reshape(-1).tolist()
             assert tokens == state["token"], "reverse token table diverged"
-            for position, token in enumerate(reference.selected_tokens(blocks, BLOCK, self.seq[slot])):
-                if token < 0:
-                    continue
-                host_row = slot * CONTEXT + token
-                index = got[position]
-                assert torch.equal(flat_k[index].cpu(), self.host_k[plane][host_row]), "K bytes differ"
-                assert torch.equal(flat_v[index].cpu(), self.host_v[plane][host_row]), "V bytes differ"
+            selected = reference.selected_tokens(blocks, self.geometry.block, self.seq[slot])
+            valid = [(got[i], slot * self.geometry.context + t) for i, t in enumerate(selected) if t >= 0]
+            if valid:
+                locations, host_rows = zip(*valid)
+                locations = torch.tensor(locations, dtype=torch.long, device=self.device)
+                host_rows = torch.tensor(host_rows, dtype=torch.long)
+                for label, flat, history in (("K", flat_k, self.host_k), ("V", flat_v, self.host_v)):
+                    actual = flat.index_select(0, locations).cpu()
+                    assert torch.equal(actual, history[plane].index_select(0, host_rows)), f"{label} bytes differ"
         for b in range(len(rows), padded):
             assert out[b, :width].tolist() == [-1] * width, "padded graph row must stay invalid"
         assert int(self.runtime.status.item()) == 0, f"status bits {int(self.runtime.status.item())}"
 
     def tensors(self, rows, seq_dtype, rpi_dtype, bucket):
         torch = self.torch
-        slots = [slot for slot, _ in rows] + [SLOTS - 1] * (bucket - len(rows))
+        slots = [slot for slot, _ in rows] + [self.geometry.slots - 1] * (bucket - len(rows))
         seqs = [self.seq[slot] for slot, _ in rows] + [1] * (bucket - len(rows))
-        blocks = [list(b) for _, b in rows] + [[0] * BLOCKS] * (bucket - len(rows))
+        blocks = [list(b) for _, b in rows] + [[0] * self.geometry.blocks] * (bucket - len(rows))
         return (torch.tensor(slots, dtype=rpi_dtype, device=self.device),
                 torch.tensor(seqs, dtype=seq_dtype, device=self.device),
                 torch.tensor(blocks, dtype=torch.int32, device=self.device))
@@ -164,7 +185,7 @@ class Bench:
     def check_counters(self):
         if self.runtime.counters.numel():
             got = self.runtime.counter_snapshot()["layers"]
-            for plane in range(L):
+            for plane in range(self.geometry.layers):
                 assert got[str(plane)] == self.counters[plane], f"counters plane {plane}: {got[str(plane)]}"
 def run_case(torch, pool, *, counters, seq_dtype, rpi_dtype, graph, seed, steps, device="cuda"):
     config = sc.parse({"schema": sc.SCHEMA, "hot_pool": pool,
