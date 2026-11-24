@@ -51,5 +51,13 @@
     "kernels/jit/utils/arch.py": "5679722e62ed99f2008f04e7239f003d7a2a772ba535f9a912e318573c2b9eea",
     "kernels/jit/include/sgl_kernel/runtime.cuh": "1f989a2dee7a32ab519eeb49adf407c5e4054195faa77aa92ce4211343973213",
     "kernels/jit/include/sgl_kernel/utils.cuh": "18b0bb2e27dccc20d7509e8b6b6c16e2b57a5ce98be648865fb75059be8a13db"
+  },
+  "layer_placement_dependency_source": "Public sgl-project/sglang@e7399a46f420d5903c3f2eddee74f0f9cfe68e11 (python/sglang); hashed from that tree for the fixed offload set. The adapter also re-checks every entry above before patching.",
+  "layer_placement_dependency_sha256": {
+    "srt/model_executor/pool_configurator.py": "82491f3441e44bbf6471aa7f7eb4540d687f898b370b675b6f19b15cd0c6e6d5",
+    "kernels/ops/attention/minimax_sparse/prefill/topk_sparse.py": "d6730231f772578308b6b7179ed5a44df181e7390224c5ac76d1a9aee2edc9e5",
+    "srt/configs/model_config.py": "9606b3b4f63f332df734c116d0840dd7149fd856549e8eddfaf2906a816b3959",
+    "srt/mem_cache/sparsity/factory.py": "be8068d45f9422e5a6c7a6a122980011e67a08adb36753269dbe0ec87ee89bf3",
+    "srt/models/minimax_m3.py": "a60deed8241d8dcf45148af331d61ccdcbf3c1aa1676a2cd4ce9b9d8b9d342fd"
   }
 }

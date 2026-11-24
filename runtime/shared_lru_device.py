@@ -66,10 +66,10 @@ def pinned_digests():
             **manifest["shared_lru_dependency_sha256"]}
 
 
-def verify_digests(root):
+def verify_digests(root, digests=None):
     """Map every pinned SGLang input to ok, mismatch or missing."""
     status = {}
-    for rel, expected in sorted(pinned_digests().items()):
+    for rel, expected in sorted((pinned_digests() if digests is None else digests).items()):
         path = Path(root) / rel
         if not path.is_file():
             status[rel] = "missing"
@@ -224,30 +224,17 @@ def verify_planes(pool):
     return pair
 
 
-def check_coordinator(coordinator, *, torch, context):
-    """Bind-time compatibility gate; runs before any experimental allocation."""
-    pool, errors = coordinator.mem_pool_device, []
-    if not coordinator.is_m3_hisparse or getattr(coordinator, "is_dsv4_hisparse", False):
-        errors.append("the shared arena supports the MiniMax M3 MHA HiSparse path only")
-    if coordinator.skip_io or coordinator.spec_swap.enabled or coordinator.enable_prefetch:
-        errors.append("skip-IO probes, speculative decoding and shared-index prefetch are unsupported")
-    if (pool.head_num != 1 or pool.is_quantized_kv_cache or pool.dtype != torch.bfloat16
-            or pool.store_dtype != pool.dtype or pool.post_capture_active):
-        errors.append("main KV must be one BF16 head per rank, unquantized, without post-capture backing")
-    layers = tuple(range(pool.start_layer, pool.start_layer + pool.layer_num))
-    if tuple(pool.model_layer_ids) != layers or pool.end_layer - pool.start_layer != pool.layer_num:
-        errors.append("host-backed layers must be one contiguous physical range")
-    H, page = coordinator.device_buffer_size, pool.page_size
-    tokens, locs = coordinator.req_device_buffer_tokens, coordinator.req_device_buffer_token_locs
-    if (coordinator.padded_buffer_size != H + page or tuple(tokens.shape) != tuple(locs.shape)
-            or tuple(tokens.shape[::2]) != (pool.layer_num, H + page) or tokens.dtype != torch.int32
-            or locs.dtype != torch.int32 or coordinator.top_k > H
-            or coordinator.top_k_device_locs_buffer.dtype != torch.int32):
-        errors.append("coordinator tables differ from the pinned MiniMax layout")
-    try:
-        validate_device_geometry(len(layers), coordinator.top_k)
-    except ValueError as error:
-        errors.append(str(error))
+def plane_layers(pool):
+    """Absolute layer of every main-KV plane: a contiguous range, or the bound offload set S."""
+    offload = getattr(pool, "_rlh_offload_layers", None)
+    if offload is not None:
+        return tuple(offload)
+    return tuple(range(pool.start_layer, pool.start_layer + pool.layer_num))
+
+
+def context_errors(context, *, torch):
+    """Execution modes the arena and the fixed offload set both reject before allocating."""
+    errors = []
     schedule, execution, memory = context.get_schedule(), context.get_exec(), context.get_memory()
     if (not schedule.disable_overlap_schedule or execution.overlap.enable_two_batch_overlap
             or execution.overlap.enable_single_batch_overlap or not memory.disable_radix_cache
@@ -260,6 +247,36 @@ def check_coordinator(coordinator, *, torch, context):
         errors.append("decode must be eager or full CUDA Graph")
     if torch.cuda.get_device_capability() != (8, 0):
         errors.append("the resolver is built and validated for sm_80 (A100) only")
+    return errors
+
+
+def check_coordinator(coordinator, *, torch, context):
+    """Bind-time compatibility gate; runs before any experimental allocation."""
+    pool, errors = coordinator.mem_pool_device, []
+    if not coordinator.is_m3_hisparse or getattr(coordinator, "is_dsv4_hisparse", False):
+        errors.append("the shared arena supports the MiniMax M3 MHA HiSparse path only")
+    if coordinator.skip_io or coordinator.spec_swap.enabled or coordinator.enable_prefetch:
+        errors.append("skip-IO probes, speculative decoding and shared-index prefetch are unsupported")
+    if (pool.head_num != 1 or pool.is_quantized_kv_cache or pool.dtype != torch.bfloat16
+            or pool.store_dtype != pool.dtype or pool.post_capture_active):
+        errors.append("main KV must be one BF16 head per rank, unquantized, without post-capture backing")
+    layers = plane_layers(pool)
+    split = getattr(pool, "_rlh_offload_layers", None) is not None
+    if (tuple(pool.model_layer_ids) != layers or pool.end_layer - pool.start_layer != pool.layer_num
+            or len(layers) != pool.layer_num or (split and pool.start_layer != 0)):
+        errors.append("host-backed planes must be one contiguous physical range or the bound offload set")
+    H, page = coordinator.device_buffer_size, pool.page_size
+    tokens, locs = coordinator.req_device_buffer_tokens, coordinator.req_device_buffer_token_locs
+    if (coordinator.padded_buffer_size != H + page or tuple(tokens.shape) != tuple(locs.shape)
+            or tuple(tokens.shape[::2]) != (pool.layer_num, H + page) or tokens.dtype != torch.int32
+            or locs.dtype != torch.int32 or coordinator.top_k > H
+            or coordinator.top_k_device_locs_buffer.dtype != torch.int32):
+        errors.append("coordinator tables differ from the pinned MiniMax layout")
+    try:
+        validate_device_geometry(len(layers), coordinator.top_k)
+    except ValueError as error:
+        errors.append(str(error))
+    errors += context_errors(context, torch=torch)
     if errors:
         raise RuntimeError("Shared arena incompatible: " + "; ".join(errors))
     return layers
@@ -280,8 +297,9 @@ class ArenaRuntime:
         pool = coordinator.mem_pool_device
         self.torch, self.config, self.config_sha256 = torch, config, config_sha256
         self.k_all, self.v_all = verify_planes(pool)
-        self.layers = tuple(range(pool.start_layer, pool.start_layer + pool.layer_num))
-        self.start_layer, self.hot_rows, self.page = pool.start_layer, coordinator.device_buffer_size, pool.page_size
+        self.layers = plane_layers(pool)
+        self.plane_of = {layer: plane for plane, layer in enumerate(self.layers)}
+        self.hot_rows, self.page = coordinator.device_buffer_size, pool.page_size
         self.plane_rows, self.item_size_bytes = self.k_all.shape[1], coordinator.item_size_bytes
         self.plan = reference.plan_arena(config, self.layers, self.hot_rows, coordinator.top_k)
         planes, rows = len(self.layers), self.plan.rows
@@ -341,8 +359,8 @@ class ArenaRuntime:
         num_blocks = top_k_blocks.size(1)
         if num_blocks * sparse_block_size != plan.selected or top_k_blocks.dtype != torch.int32:
             raise ValueError("Selection width/dtype differs from the bound arena plan")
-        plane = layer_id - self.start_layer
-        if not 0 <= plane < len(self.layers):
+        plane = self.plane_of.get(layer_id)
+        if plane is None:
             raise ValueError(f"Layer {layer_id} is not a host-backed plane of this rank")
         out = coordinator.top_k_device_locs_buffer[:req_pool_indices.size(0), :plan.selected]
         offset, size = plan.domain(plane)
@@ -458,17 +476,28 @@ def install(config, config_sha256):
         originals["__init__"](self, *args, **kwargs)
         if state["runtime"] is not None:
             raise RuntimeError("One HiSparse coordinator per worker process")
+        placement = None
+        if config.uses_fixed_layers:   # the arena spans the offload set S only
+            from . import layer_placement_device
+            placement = layer_placement_device.bind(self, torch=torch, context=context)
         check_coordinator(self, torch=torch, context=context)
         state["bound"] = True
         runtime = ArenaRuntime(self, config, config_sha256, torch=torch)
-        identity = hashlib.sha256(json.dumps(runtime.signature(), sort_keys=True).encode()
+        signature = runtime.signature()
+        if placement is not None:
+            signature["placement"] = placement.signature()
+        identity = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()
                                   + config.digest.encode()).hexdigest()
         hashes = [None] * self.tp_world_size
         dist.all_gather_object(hashes, identity, group=self.tp_group)
         if hashes != [identity] * self.tp_world_size:
             raise RuntimeError("TP ranks disagree on the arena configuration or geometry")
         self._request_layer_hisparse_arena = state["runtime"] = runtime
-        print(json.dumps(runtime.receipt(self, dist.get_rank(), self.tp_world_size), sort_keys=True), flush=True)
+        receipt = runtime.receipt(self, dist.get_rank(), self.tp_world_size)
+        if placement is not None:
+            self._request_layer_hisparse_placement = placement
+            receipt["placement"] = placement.receipt(self)
+        print(json.dumps(receipt, sort_keys=True), flush=True)
         if config.diagnostics == "counters":
             import atexit
             atexit.register(lambda: print(json.dumps(runtime.counter_snapshot(), sort_keys=True), flush=True))

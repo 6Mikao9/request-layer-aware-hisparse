@@ -173,6 +173,11 @@ class StudyConfig:
     def uses_arena(self):
         return self.hot_pool.layout == "arena"
 
+    @property
+    def uses_fixed_layers(self):
+        """Frozen S: listed layers are host-backed with a hot pool, the rest keep full GPU main KV."""
+        return self.placement.mode == "fixed_layers"
+
 
 def parse(data):
     if type(data) is not dict:
@@ -187,8 +192,11 @@ def parse(data):
     mode = _choice(raw, "mode", PLACEMENT_MODES, "placement")
     selection = _choice(raw, "selection", SELECTIONS, "placement")
     offload = _layers(raw.get("offload_layers", []), "placement.offload_layers")
-    if (mode == "fixed_layers") != bool(offload):
-        raise ValueError("placement.offload_layers is required for fixed_layers and forbidden otherwise")
+    if mode == "fixed_layers" and "offload_layers" not in raw:
+        raise ValueError("placement.offload_layers is required for fixed_layers "
+                         "(an empty list keeps every layer resident)")
+    if mode != "fixed_layers" and offload:
+        raise ValueError("placement.offload_layers applies only to placement.mode=fixed_layers")
     if mode != "fixed_layers" and selection != "fixed":
         raise ValueError("placement.selection applies only to placement.mode=fixed_layers")
     seed = raw.get("seed")
@@ -261,9 +269,13 @@ def read(path, expected_sha256=None):
 def unsupported_reasons(config):
     """Arms this build cannot execute. The launcher refuses them before workers start."""
     reasons = []
-    if config.placement.mode != "native":
-        reasons.append(f"placement.mode={config.placement.mode} is owned by the layer-eviction/combined "
-                       "efforts and is not implemented in this build")
+    placement = config.placement
+    if placement.mode == "full_resident":
+        reasons.append("placement.mode=full_resident is the all-resident control; the pinned SGLang serves it "
+                       "without --enable-hisparse and this build does not route it")
+    if placement.mode == "fixed_layers" and not placement.offload_layers:
+        reasons.append("placement.offload_layers=[] keeps every layer resident; the SGLang HiSparse runtime needs "
+                       "at least one host-backed layer (run the all-resident control without --enable-hisparse)")
     enabled = [name for name, on in config.features if on]
     if enabled:
         reasons.append(f"feature switch(es) {enabled} have no implementation in this build")
@@ -274,13 +286,23 @@ def unsupported_reasons(config):
 
 def capabilities(config):
     """Effective implementation selected for a parsed configuration (startup receipt)."""
-    pool = config.hot_pool
+    pool, fixed = config.hot_pool, config.uses_fixed_layers
+    runtime = "stock_hisparse" if not config.uses_arena else "shared_lru_arena"
     return dict(
-        runtime="stock_hisparse" if not config.uses_arena else "shared_lru_arena",
-        experimental_gpu_state=config.uses_arena,
+        runtime=f"fixed_layers+{runtime}" if fixed else runtime,
+        experimental_gpu_state=config.uses_arena or fixed,
+        placement=config.placement.mode,
+        offload_layers=list(config.placement.offload_layers) if fixed else None,
+        host_backing="offloaded layers only" if fixed else "every host-backed sparse layer",
+        resident_path=("native sparse attention over full GPU main KV through req_to_token "
+                       "(no HiSparse slots or location mapping)") if fixed else None,
         resolver=None if not config.uses_arena else "rlh_shared_lru::resolve (CUDA C++, sm_80)",
-        consumer_base="per-layer main KV plane" if not config.uses_arena else "contiguous all-layer main KV view",
+        consumer_base="per-layer main KV plane" if not config.uses_arena else (
+            "contiguous main KV view of the offloaded layers" if fixed else "contiguous all-layer main KV view"),
         borrowing=pool.mode == "shared",
+        borrowing_domain=None if pool.mode != "shared" else (
+            "offloaded layers of one request on one TP rank" if fixed
+            else "host-backed layers of one request on one TP rank"),
         eviction=pool.eviction,
         quota=pool.quota,
         admission=pool.admission,

@@ -4,7 +4,9 @@
         --config runtime/fixtures/shared_lru_arms/shared_arena.json --output /tmp/shared.json
 
 Stock layout replays ``NativeLayerLRU``; arena layouts replay ``SharedLRUReference``
-with ``KernelMirror`` in lockstep. ``DirectReader`` checks every resolved
+with ``KernelMirror`` in lockstep. A fixed offload set (``placement.mode=fixed_layers``)
+runs the same engines over S only through ``CombinedReference``; the other layers
+read their resident rows directly. ``CombinedReader`` checks every resolved
 position against synthesized bytes. Selections depend only on the fixture, so
 every arm sees identical inputs (``selection_sha256``). Exit status is nonzero
 for invalid or unsupported configs and for any correctness mismatch. Results
@@ -17,6 +19,7 @@ from pathlib import Path
 import random
 import sys
 
+from . import layer_placement as lp
 from . import shared_lru as s
 from . import study_config as sc
 
@@ -90,28 +93,24 @@ class _Arm:
         layers, H, page = tuple(fixture["layers"]), fixture["hot_rows"], fixture["page"]
         slots = len(fixture["requests"]) + 1
         self.total_locs = -(-((H + page) * slots + page) // page) * page
+        logical = sum(-(-(r["prompt"] + fixture["steps"] + 2) // page)
+                      for r in fixture["requests"] + fixture["reuse"])
         self.fixture, self.rank, self.H, self.mirror = fixture, rank, H, None
-        self.plan = None
-        if config.uses_arena:
-            self.plan = s.plan_arena(config, layers, H, fixture["blocks"] * fixture["block_size"])
-            self.engine = s.SharedLRUReference(self.plan, page=page, item_bytes=fixture["item_bytes"],
-                                               rank=rank, total_locs=self.total_locs)
+        self.engine = lp.CombinedReference(config, layers, hot_rows=H,
+                                           selected=fixture["blocks"] * fixture["block_size"],
+                                           page=page, item_bytes=fixture["item_bytes"], rank=rank,
+                                           logical_locs=(logical + 1) * page, device_locs=self.total_locs)
+        self.plan = self.engine.plan
+        if self.plan is not None:
             self.mirror = s.KernelMirror(self.plan, plane_rows=self.total_locs)
-        else:
-            self.engine = s.NativeLayerLRU(layers, H, page=page, item_bytes=fixture["item_bytes"], rank=rank,
-                                           total_locs=self.total_locs)
-        self.reader = s.DirectReader(self.engine.device, rank=rank, item_bytes=fixture["item_bytes"],
-                                     hot_rows=H, planes=len(layers))
+        self.reader = lp.CombinedReader(self.engine)
         self.seq = {}
-        self.peak_allocated = self.peak_logical = 0
+        self.peak_allocated = self.peak_logical = self.peak_resident = 0
 
     def admit(self, request, generation, epoch):
-        slot, prompt, layers = request["slot"], request["prompt"], tuple(self.fixture["layers"])
-        if self.plan is None:
-            locs = self.engine.admit(slot, generation, seq_len=prompt)
-        else:
-            locs = self.engine.admit(slot, generation, self.rank, layers, min(prompt, self.H), self.plan.rows,
-                                     seq_len=prompt, epoch=epoch)
+        slot, prompt = request["slot"], request["prompt"]
+        locs = self.engine.admit(slot, generation, seq_len=prompt, epoch=epoch)["device"]
+        if self.mirror is not None:
             self.mirror.init_slot(slot, generation, locs)
         self.seq[slot] = (generation, prompt)
         self.advance(slot)                             # first decode token, as at the first decode step
@@ -129,27 +128,29 @@ class _Arm:
             raise AssertionError("Live request did not finish")
         if self.mirror:
             self.mirror.reset_slot(slot)
-    def resolve(self, layer, plane, rows, epoch):
+    def resolve(self, layer, rows, epoch):
         block_size = self.fixture["block_size"]
-        batch = s.Batch(layer, block_size, tuple(rows))
-        results = self.engine.resolve(batch, epoch)
+        results = self.engine.resolve(s.Batch(layer, block_size, tuple(rows)), epoch)
+        pool, plane = self.engine.placement.route(layer)
         checked = 0
         for sel, res in zip(rows, results):
             if not sel.real:
                 if res.classes != [s.PAD] * len(res.classes) or res.unique:
                     raise AssertionError("Padded graph row produced state or counters")
                 continue
-            tokens = s.selected_tokens(sel.blocks, block_size, sel.seq_len)
-            locs = self.engine.locs(sel.slot, sel.generation)
-            if self.mirror is not None:
+            if self.mirror is not None and pool == lp.HOT:
                 flat, _, counters = self.mirror.resolve_row(sel.slot, plane, sel.blocks, block_size, sel.seq_len)
-                if [self.mirror.address(x) for x in flat] != res.addresses or counters["misses"] != res.misses:
+                if ([self.mirror.address(x) for x in flat] != [None if a is None else a[1:] for a in res.addresses]
+                        or counters["misses"] != res.misses):
                     raise AssertionError(f"Kernel mirror diverged at layer {layer} slot {sel.slot}")
-            checked += self.reader.check(res, generation=sel.generation, layer=layer, plane=plane,
-                                         tokens=tokens, seq_len=sel.seq_len, locs=locs)
+            checked += self.reader.check(res, slot=sel.slot, generation=sel.generation, layer=layer,
+                                         tokens=s.selected_tokens(sel.blocks, block_size, sel.seq_len),
+                                         seq_len=sel.seq_len)
             if res.lease is not None:
                 self.engine.complete(res.lease, "attention")
-        self.peak_allocated = max(self.peak_allocated, self.engine.allocator.allocated_rows)
+        hot = self.engine.hot
+        self.peak_allocated = max(self.peak_allocated, 0 if hot is None else hot.allocator.allocated_rows)
+        self.peak_resident = max(self.peak_resident, self.engine.device_rows()["resident"])
         if self.plan is not None:
             logical = sum(sum(self.engine.occupancy(slot, gen).values()) for slot, (gen, _) in self.seq.items())
             self.peak_logical = max(self.peak_logical, logical)
@@ -166,10 +167,16 @@ def _accumulate(total, res):
     total["latest"] += res.classes.count(s.LATEST)
     total["invalid"] += res.classes.count(s.PAD)
     total["direct"] += res.classes.count(s.DIRECT)
+    total["resident"] += res.classes.count(lp.RESIDENT)
+
+
+def _bare(addresses):
+    """Hot addresses hash as (plane, loc), unchanged from the all-layer replay; resident ones stay tagged."""
+    return [a[1:] if a is not None and a[0] == lp.HOT else a for a in addresses]
 
 
 def replay(fixture, config):
-    fields = s.COUNTER_FIELDS + ("direct",)
+    fields = s.COUNTER_FIELDS + ("direct", "resident")
     selections, outputs, device = hashlib.sha256(), hashlib.sha256(), hashlib.sha256()
     per_rank, checked, ledgers = {}, 0, {}
     for rank in fixture["ranks"]:
@@ -194,24 +201,32 @@ def replay(fixture, config):
                     blocks = selection(fixture, rank, live[slot], generation, plane, step, seq_len)
                     rows.append(s.Selection(slot, generation, tuple(blocks), seq_len))
                 rows.append(s.Selection(rows[0].slot, rows[0].generation, rows[0].blocks, rows[0].seq_len, False))
-                results, count = arm.resolve(layer, plane, rows, epoch)
+                results, count = arm.resolve(layer, rows, epoch)
                 checked += count
                 selections.update(json.dumps([rank, layer, [list(r.blocks) + [r.seq_len] for r in rows]]).encode())
-                outputs.update(json.dumps([[r.addresses, r.classes] for r in results]).encode())
+                outputs.update(json.dumps([[_bare(r.addresses), r.classes] for r in results]).encode())
                 for res in results:
                     _accumulate(layers[layer], res)
             for slot in sorted(live):
                 arm.advance(slot)
-        for key, value in sorted(arm.engine.device.items()):
+        hot = {} if arm.engine.hot is None else arm.engine.hot.device
+        for key, value in sorted(hot.items()):
             device.update(json.dumps([rank, list(key), value[0].hex(), value[1].hex()]).encode())
+        for key, value in sorted(arm.engine.resident.items()):
+            device.update(json.dumps([rank, lp.RESIDENT, list(key), value[0].hex(), value[1].hex()]).encode())
         if arm.mirror is not None and arm.mirror.status:
             raise AssertionError(f"Kernel mirror status {arm.mirror.status}")
         per_rank[str(rank)] = {str(layer): counts for layer, counts in layers.items()}
-        ledger = s.byte_ledger(layers=fixture["layers"], hot_rows=fixture["hot_rows"], page=fixture["page"],
-                               item_bytes=fixture["item_bytes"], slots=len(fixture["requests"]) + 1,
-                               pool_rows=arm.total_locs, plan=arm.plan, counters=config.diagnostics == "counters")
+        common = dict(hot_rows=fixture["hot_rows"], page=fixture["page"], item_bytes=fixture["item_bytes"],
+                      slots=len(fixture["requests"]) + 1, plan=arm.plan, counters=config.diagnostics == "counters")
+        if config.uses_fixed_layers:
+            ledger = lp.placement_ledger(placement=arm.engine.placement, device_rows=arm.total_locs,
+                                         logical_rows=arm.engine.logical.total_locs, **common)
+        else:
+            ledger = s.byte_ledger(layers=fixture["layers"], pool_rows=arm.total_locs, **common)
         ledger["fake_allocator"] = dict(peak_physical_rows_allocated=arm.peak_allocated,
-                                        peak_logical_rows_valid=arm.peak_logical if arm.plan is not None else None)
+                                        peak_logical_rows_valid=arm.peak_logical if arm.plan is not None else None,
+                                        peak_resident_rows_allocated=arm.peak_resident)
         ledgers[str(rank)] = ledger
     total = dict.fromkeys(fields, 0)
     for layers in per_rank.values():
@@ -223,6 +238,8 @@ def replay(fixture, config):
                 history_hit_rate=total["hits"] / total["unique"] if total["unique"] else None,
                 checks=dict(direct_reader_positions=checked,
                             kernel_mirror="lockstep" if config.uses_arena else "not applicable"),
+                placement=dict(offload=list(arm.engine.placement.offload),
+                               resident=list(arm.engine.placement.resident)),
                 ledger=ledgers)
 def main(argv=None):
     parser = argparse.ArgumentParser(description="CPU replay of a tracked fixture through one study arm.")
@@ -245,10 +262,12 @@ def main(argv=None):
     except (AssertionError, ValueError, s.Deferred, s.StaleCompletion, s.RequestFailed) as error:
         print(json.dumps(dict(status="fail", error=str(error))), file=sys.stderr)
         return 1
+    engine = "SharedLRUReference+KernelMirror" if config.uses_arena else "NativeLayerLRU"
+    if config.uses_fixed_layers:
+        engine = f"CombinedReference({engine} on S, resident direct)"
     result = dict(schema=RESULT_SCHEMA, status="pass", fixture_sha256=fixture_digest,
                   config_file_sha256=config_digest, config_sha256=config.digest,
-                  resolved_config=config.as_dict(), capabilities=sc.capabilities(config),
-                  engine="SharedLRUReference+KernelMirror" if config.uses_arena else "NativeLayerLRU",
+                  resolved_config=config.as_dict(), capabilities=sc.capabilities(config), engine=engine,
                   pending_hardware=list(PENDING_HARDWARE), **result)
     with args.output.open("x") as handle:
         json.dump(result, handle, indent=2, sort_keys=True)

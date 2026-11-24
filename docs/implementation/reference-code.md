@@ -16,6 +16,8 @@
 | [runtime/shared_lru.py](../../runtime/shared_lru.py)、[runtime/shared_lru_replay.py](../../runtime/shared_lru_replay.py) | 全层共享热池的 CPU 参考（代次、租约、LRU/FIFO、静态配额、软保底、旁路）、原生逐层 LRU 对照、与 CUDA 核逐步一致的 `KernelMirror` 和固定夹具回放。 |
 | [runtime/shared_lru_kernel.cuh](../../runtime/shared_lru_kernel.cuh)、[runtime/shared_lru_device.py](../../runtime/shared_lru_device.py) | 共享热池的 SM80 解析/回填核与 SGLang 接线：连续主 KV 平面、协调器生命周期、消费者视图、启动收据和不加载模型的 dry-run。 |
 | [runtime/shared_lru_plan.py](../../runtime/shared_lru_plan.py)、[runtime/cuda_shared_lru_correctness.py](../../runtime/cuda_shared_lru_correctness.py) | 每臂配置与 AB/BA 配对计划；需显式开启的 A100 正确性门（逐次对照 `KernelMirror`，覆盖 eager 与 Graph）。 |
+| [runtime/layer_placement.py](../../runtime/layer_placement.py)、[runtime/layer_placement_device.py](../../runtime/layer_placement_device.py) | 固定卸载层 S 与热池联用：CPU 参考（常驻层按逻辑位置直读，S 内复用共享/隔离 arena 或原生逐层 LRU）、SGLang 拆池接线（S 热平面 + 常驻完整平面、按层路由、容量计费、常驻层直达解码/预填充）和 dry-run。 |
+| [runtime/combined_plan.py](../../runtime/combined_plan.py)、[runtime/cuda_combined_correctness.py](../../runtime/cuda_combined_correctness.py) | A–E 臂与放置×借页交互的配对计划；需显式开启的 A100 门，同时检查 S 上的 arena 和常驻层的固定 Triton consumer 读数。 |
 
 下列 scoped 命令在只包含公开白名单的目录里运行通过。参考套件用 Python 3.12 + CPU PyTorch。命令不下载权重、不需要真实服务、CUDA 设备或任何服务器地址。Windows 如不支持 Linux 特定能力，精确说明跳过项。贡献者把新 CPU 测试加到自己的验收入口。
 
@@ -71,6 +73,37 @@ python -m runtime.launch --hisparse-study-config runtime/fixtures/shared_lru_arm
 ```
 
 每个 worker 在绑定协调器时打印一行 `hisparse_shared_lru_bound` 收据（解析后配置、能力、几何、实际分配字节）；`diagnostics.mode=counters` 在进程退出时打印逐层计数。
+
+### 联用整层卸载和跨层热池（[combined](combined.md)）
+
+CPU 命令同样在新 clone 的仓库根目录运行。设置 `SGLANG_SRC` 后，`runtime.test_layer_placement_device` 还会在 CPU 上执行固定版本的 `MiniMaxSparseKVPool`、`HiSparseMHAMainPool`、换入、备份和后端方法源码，并对 checkout 跑 dry-run。
+
+```bash
+python -B -m unittest runtime.test_layer_placement runtime.test_layer_placement_device \
+  runtime.test_combined_plan runtime.test_combined_gate
+for arm in fixed_stock_layout fixed_isolated_arena fixed_shared_arena; do
+  python -B -m runtime.shared_lru_replay --fixture runtime/fixtures/shared_lru_fixture.json \
+    --config runtime/fixtures/combined_arms/$arm.json --output /tmp/combined-$arm.json
+done
+python -B -m runtime.layer_placement_device dry-run --sglang-src "$SGLANG_SRC" \
+  --config runtime/fixtures/combined_arms/combined_example.json
+python -B -m runtime.combined_plan --spec runtime/fixtures/combined_plan_spec.example.json \
+  --output-dir /tmp/combined-plan
+```
+
+回放夹具的 S={1,3}，层 0、2 常驻；`combined_example.json` 即 combined.md 的 [5,15] 示例。dry-run 和计划中的容量都是按 stock 同一 KV 预算的估计：常驻层按逻辑行（`size × host_to_device_ratio`）计费，热池可用的设备 token 由剩余空间反推；未提供 `--index-bytes-per-token` 时估计不含索引 KV。示例计划只含三组随机 T40 名单，校准名单和静态配额需用训练来源冻结后补入。
+
+实机入口：
+
+```bash
+python -m runtime.cuda_combined_correctness --allow-cuda-test --output "$OUTPUT_DIR/combined-gate.json"
+python -m runtime.launch --hisparse-study-config runtime/fixtures/combined_arms/combined_example.json \
+  --sm80-bf16-projections -- --model-path "$MODEL_DIR" --tp-size 8 --enable-hisparse \
+  --hisparse-config '{"top_k":2048,"device_buffer_size":4096}' --page-size 128 --attention-backend triton \
+  --disable-overlap-schedule --disable-radix-cache
+```
+
+固定卸载臂拒绝 `--max-total-tokens`，由 SGLang 自动定容。每个 worker 绑定协调器时打印收据：原生热池布局为 `hisparse_layer_placement_bound`，arena 布局为带 `placement` 段的 `hisparse_shared_lru_bound`。收据记录 S、常驻层、两类平面的实际字节、host pinned 字节和容量计费。
 
 ## 后续实机可复用的最小 CUDA 测试
 
