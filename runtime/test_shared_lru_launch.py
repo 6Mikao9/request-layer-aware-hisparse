@@ -22,6 +22,21 @@ def resolve(*argv):
 
 
 class StudyConfigLauncher(unittest.TestCase):
+    def test_sm80_adapter_is_packaged_and_installed(self):
+        import os
+        from hashlib import sha256
+        source = Path(launch.__file__).with_name("compat") / "minimax_sm80.py"
+        self.assertEqual(sha256(source.read_bytes()).hexdigest(), launch.SM80_SHA256)
+        plan, _, _ = resolve("--hisparse-study-config", str(ARMS / "shared_arena.json"),
+                             "--sm80-bf16-projections", "--", *BASE, *SINGLE_STREAM)
+        calls = []
+        adapter = types.ModuleType("runtime.compat.minimax_sm80")
+        adapter.install = lambda: calls.append(("sm80", os.environ.get(launch.SM80_ENV)))
+        with patch("runtime.shared_lru_device.install", lambda config, digest: calls.append(("arena", digest))), \
+                patch.dict(sys.modules, {"runtime.compat.minimax_sm80": adapter}), patch.dict(os.environ):
+            launch.install_for_process(plan)
+        self.assertEqual(calls, [("arena", plan.study_config_sha256), ("sm80", "1")])
+
     def test_arena_arm_resolves_and_prints_receipt(self):
         plan, upstream, dry = resolve("--hisparse-study-config", str(ARMS / "shared_arena.json"), "--dry-run",
                                       "--", *BASE, *SINGLE_STREAM)

@@ -18,6 +18,8 @@ python -m runtime.cuda_shared_lru_production_correctness --allow-cuda-test --all
 
 ## 三臂配对
 
+打包检查另发现 launcher 已引用、但公开仓库未包含 `runtime/compat/minimax_sm80.py`。现补入旧实验所用的原字节版本（SHA256 `207df72e8294982f5153a236043871f38a26b37338c543d9c8322fd56d0c2bf0`），没有改动投影算法；新增安装路径检查后，相关 launch/contracts 的 21 项 CPU 测试全部通过。创建 Linux 源码包时关闭 Git 的 CRLF 转换，保证包内文件与已提交 blob 字节一致，避免固定 SHA 校验在加载前失败。
+
 复制 runtime/fixtures/shared_lru_plan_spec.example.json 到独立运行目录，将零值摘要换成实际训练及留出清单摘要，解析模型路径并据八 rank 实测容量选择共同可行 B。以下命令使用准备好的私有 spec 和新输出目录。
 
 ```sh

@@ -24,3 +24,9 @@ re-creates the stock MHATokenToKVPool._create_buffers_normal allocation context
 (memory-saver region, optional custom pool, identical plane shapes) for one
 contiguous allocation. Arena tables, cross-layer victim selection and the
 consumer view are new; their pinned inputs are in shared_lru_dependency_sha256.
+
+The optional runtime/compat/minimax_sm80.py is the unchanged experimental BF16
+projection adapter used by the existing SM80 launcher, SHA256
+207df72e8294982f5153a236043871f38a26b37338c543d9c8322fd56d0c2bf0.
+It uses the pinned SGLang MXFP8 dequantization and linear-method interfaces.
+It is enabled explicitly and identically for native and arena comparisons.
