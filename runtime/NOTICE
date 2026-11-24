@@ -15,3 +15,12 @@ planner specialization and copy_cache_planned MHA kernel. It adds fixed plan
 storage and process-local same-stream routing for validated batch shapes.
 The plan/copy kernel mechanism is attributed to SGLang, not claimed as a new
 algorithm. The adapter does not enable the upstream side-stream overlap path.
+
+The optional shared-arena resolver (shared_lru_kernel.cuh, shared_lru_device.py)
+includes the pinned kvcacheio/hisparse.cuh unmodified for hash_slot and
+transfer_item_warp, follows the structure of its block-selection kernel
+(short-path and newest-token rules, -1 sentinel, num_real_reqs early exit) and
+re-creates the stock MHATokenToKVPool._create_buffers_normal allocation context
+(memory-saver region, optional custom pool, identical plane shapes) for one
+contiguous allocation. Arena tables, cross-layer victim selection and the
+consumer view are new; their pinned inputs are in shared_lru_dependency_sha256.

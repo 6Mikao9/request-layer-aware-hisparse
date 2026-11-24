@@ -40,5 +40,16 @@
     "kernels/jit/utils/compile/spec.py": "f762d7d90adb2770988ab0d17b444496d9d611531ab136eb37b8c8707dd42b2f",
     "kernels/jit/utils/compile/paths.py": "bfa8a912174607c74237f1b5f45b0a87dc8da8b5f1f5be39868966787fae76e2"
   },
-  "dependency_manifest_sha256": "c69ba6187d3d10a66059ae03184f77fffa7aa0439302a95c4c2f6a24f36c7226"
+  "dependency_manifest_sha256": "c69ba6187d3d10a66059ae03184f77fffa7aa0439302a95c4c2f6a24f36c7226",
+  "shared_lru_dependency_source": "Public sgl-project/sglang@e7399a46f420d5903c3f2eddee74f0f9cfe68e11; every source_sha256 and runtime_dependency_sha256 entry above matched that tree. Confirm these on the pinned image before the first GPU run.",
+  "shared_lru_dependency_sha256": {
+    "srt/layers/attention/minimax_sparse_backend.py": "7f8e954d3dea6aa4a76c549a7854f3743b67be49289d578e83524b762623f042",
+    "srt/layers/attention/minimax_sparse_ops/minimax_sparse.py": "ed3386669a46a6a3a9478c37a8ff73841f60540fb970540f491a63347419a65f",
+    "kernels/ops/attention/minimax_sparse/decode/topk_sparse.py": "a82e36df76bd6cf6128fa8e6f4ead4cd0bb7b6f177cbcd56eabc52e1c257d577",
+    "srt/model_executor/model_runner.py": "c3e8e4cab00b8d6a4303c8332ff5e2fea4618c57000aa2c9b4b78b42eeaab6a7",
+    "srt/constants.py": "628038505a2e4e9bd4f0f335695d08b207719b7d22a7beeea614a8163eda96e2",
+    "kernels/jit/utils/arch.py": "5679722e62ed99f2008f04e7239f003d7a2a772ba535f9a912e318573c2b9eea",
+    "kernels/jit/include/sgl_kernel/runtime.cuh": "1f989a2dee7a32ab519eeb49adf407c5e4054195faa77aa92ce4211343973213",
+    "kernels/jit/include/sgl_kernel/utils.cuh": "18b0bb2e27dccc20d7509e8b6b6c16e2b57a5ce98be648865fb75059be8a13db"
+  }
 }

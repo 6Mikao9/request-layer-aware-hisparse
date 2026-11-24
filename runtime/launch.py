@@ -34,6 +34,8 @@ class LaunchPlan:
     six_layer_state: bool = False
     request_config_path: str | None = None
     request_config_sha256: str | None = None
+    study_config_path: str | None = None
+    study_config_sha256: str | None = None
 
 
 def strict_object(pairs):
@@ -130,12 +132,49 @@ def check_request_execution(argv):
         raise ValueError('Request-type routing requires pinned Triton/page128 without disaggregation/spec')
 
 
-def check_plan(plan, policy, request_config=None):
+def check_study_execution(argv):
+    """Arena arms decode on one stream: no overlap, Radix, speculation or disaggregation.
+
+    Eager or full decode CUDA Graph are both allowed; the worker re-checks the
+    resolved runtime context before allocating anything.
+    """
+    flags = {arg.partition("=")[0] for arg in argv}
+    forbidden = {"--config", "--enable-two-batch-overlap", "--enable-single-batch-overlap", "--enable-pdmux"}
+    if not {"--disable-overlap-schedule", "--disable-radix-cache"}.issubset(argv) or flags & forbidden:
+        raise ValueError("Shared-arena arms require --disable-overlap-schedule, --disable-radix-cache "
+                         "and no config/overlap overrides")
+    if (flag_value(argv, "--disaggregation-mode") not in (None, "null")
+            or flag_value(argv, "--speculative-algorithm") not in (None, "NONE")):
+        raise ValueError("Shared-arena arms require non-speculative, non-disaggregated decode")
+    raw_graph = flag_value(argv, "--cuda-graph-config")
+    if raw_graph is not None:
+        decode = parse_object(raw_graph).get("decode", {})
+        if type(decode) is not dict or decode.get("backend", "full") not in ("full", "disabled"):
+            raise ValueError("Shared-arena decode must be eager or full CUDA Graph")
+
+
+def check_plan(plan, policy, request_config=None, study_config=None):
     if type(plan.tp_size) is not int or plan.tp_size not in (4, 8):
         raise ValueError("The launcher requires explicit TP4 or TP8")
     if type(plan.sm80_bf16_projections) is not bool:
         raise ValueError("Invalid SM80 projection selection")
     validate_capacity(plan.hmax, plan.hmax, plan.top_k, 1)
+    if (plan.study_config_path is None) != (plan.study_config_sha256 is None):
+        raise ValueError("Incomplete frozen study configuration identity")
+    if plan.study_config_path is not None:
+        from .study_config import StudyConfig, unsupported_reasons
+        if (not isinstance(study_config, StudyConfig) or policy is not None or request_config is not None
+                or any(value is not None for value in (plan.policy_path, plan.request_config_path,
+                    plan.shadow_identity_directory, plan.selection_oracle_directory, plan.split_copy_config))
+                or plan.six_layer_timing or plan.six_layer_state):
+            raise ValueError("--hisparse-study-config is separate from static policies, request routing "
+                             "and the existing diagnostics")
+        reasons = unsupported_reasons(study_config)
+        if reasons:
+            raise ValueError("; ".join(reasons))
+        return None
+    if study_config is not None:
+        raise ValueError("Unexpected study configuration without a frozen file")
     if (plan.request_config_path is None) != (plan.request_config_sha256 is None):
         raise ValueError('Incomplete frozen request configuration identity')
     if plan.request_config_path is not None:
@@ -195,6 +234,8 @@ def resolve(argv):
     policy_options = parser.add_mutually_exclusive_group()
     policy_options.add_argument("--policy", type=Path)
     policy_options.add_argument("--request-type-config", type=Path)
+    policy_options.add_argument("--hisparse-study-config", type=Path, metavar="PATH",
+                                help="hisparse-study-config-v1 arm (all-default selects stock HiSparse)")
     parser.add_argument("--sm80-bf16-projections", action="store_true")
     diagnostics = parser.add_mutually_exclusive_group()
     diagnostics.add_argument("--shadow-identity", type=Path, metavar="DIRECTORY")
@@ -231,6 +272,14 @@ def resolve(argv):
             from .request_config import read_request_config
             request_config, request_digest = read_request_config(request_path)
             check_request_execution(sglang_argv)
+        study_path = (str(options.hisparse_study_config.expanduser().resolve(strict=True))
+                      if options.hisparse_study_config else None)
+        study_config, study_digest = None, None
+        if study_path is not None:
+            from .study_config import read as read_study_config
+            study_config, study_digest = read_study_config(study_path)
+            if study_config.uses_arena:
+                check_study_execution(sglang_argv)
         if options.six_layer_timing:
             required = {"--disable-cuda-graph", "--disable-prefill-cuda-graph",
                         "--disable-overlap-schedule", "--disable-radix-cache"}
@@ -259,8 +308,8 @@ def resolve(argv):
                           str(diagnostic) if options.shadow_identity is not None else None,
                           str(diagnostic) if options.selection_oracle is not None else None,
                           split_config, options.six_layer_timing, options.six_layer_state,
-                          request_path, request_digest)
-        check_plan(plan, policy, request_config)
+                          request_path, request_digest, study_path, study_digest)
+        check_plan(plan, policy, request_config, study_config)
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     return plan, sglang_argv, options.dry_run
@@ -274,7 +323,11 @@ def install_for_process(plan):
     if plan.request_config_path is not None:
         from .request_config import read_request_config
         request_config = read_request_config(plan.request_config_path, plan.request_config_sha256)[0]
-    split_config = check_plan(plan, policy, request_config)
+    study_config = None
+    if plan.study_config_path is not None:
+        from .study_config import read as read_study_config
+        study_config = read_study_config(plan.study_config_path, plan.study_config_sha256)[0]
+    split_config = check_plan(plan, policy, request_config, study_config)
     if plan.sm80_bf16_projections:
         source = Path(__file__).with_name("compat") / "minimax_sm80.py"
         if sha256(source.read_bytes()).hexdigest() != SM80_SHA256:
@@ -283,6 +336,9 @@ def install_for_process(plan):
     if request_config is not None:
         from .request_hook import install
         install(**request_config.install_kwargs())
+    elif study_config is not None and study_config.uses_arena:
+        from .shared_lru_device import install
+        install(study_config, plan.study_config_sha256)
     elif plan.shadow_identity_directory is not None:
         from .shadow import install
         install(policy, Path(plan.shadow_identity_directory))
@@ -319,6 +375,8 @@ def main(argv=None):
     mode = "static_layer_overlay" if plan.policy_path else "stock_hisparse"
     if plan.request_config_path is not None:
         mode = 'request_type_layer_overlay'
+    elif plan.study_config_path is not None:
+        mode = "hisparse_study_config"
     elif plan.shadow_identity_directory is not None:
         mode = "shadow_identity"
     elif plan.selection_oracle_directory is not None:
@@ -326,6 +384,11 @@ def main(argv=None):
     elif plan.split_copy_config is not None:
         mode = SPLIT_COPY_MODE
     summary = asdict(plan) | {"mode": mode}
+    if plan.study_config_path is not None:
+        from .study_config import capabilities, read as read_study_config
+        study = read_study_config(plan.study_config_path, plan.study_config_sha256)[0]
+        summary |= {"study_config_canonical_sha256": study.digest, "study_resolved_config": study.as_dict(),
+                    "study_capabilities": capabilities(study)}
     print(json.dumps(summary, sort_keys=True), flush=True)
     if dry_run:
         return 0

@@ -1,0 +1,25 @@
+{
+  "schema": "shared-lru-plan-spec-v1",
+  "seed": 20261124,
+  "split": {
+    "training_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "heldout_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "geometry": {"tp_size": 8, "first_layer": 0, "layers": 60, "hot_rows": 4096, "page": 128,
+               "top_k_blocks": 16, "block_size": 128, "head_dim": 128, "dtype_bytes": 2,
+               "kv_heads_per_rank": 1, "slots": 128, "plane_rows": 396672},
+  "static_quota_rows": null,
+  "floor_rows": null,
+  "bypass_layers": null,
+  "pressure_points": [
+    {"name": "8-16Ki", "input_tokens": [8192, 16384], "real_batch": 86},
+    {"name": "16-32Ki", "input_tokens": [16384, 32768], "real_batch": 48},
+    {"name": "32-64Ki", "input_tokens": [32768, 65536], "real_batch": 44}
+  ],
+  "repeats": 3,
+  "upstream_args": ["--model-path", "$MODEL_DIR", "--tp-size", "8", "--enable-hisparse",
+                    "--hisparse-config", "{\"top_k\":2048,\"device_buffer_size\":4096}",
+                    "--page-size", "128", "--attention-backend", "triton",
+                    "--disable-overlap-schedule", "--disable-radix-cache"],
+  "sm80_bf16_projections": true
+}
