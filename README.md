@@ -6,6 +6,10 @@
 
 编码助手可在普通 CPU 环境完成 PR，从[开发和实机环境](docs/implementation/agent-environment.md)、[配置与逐项消融](docs/implementation/ablation-contract.md)、[参考代码和测试](docs/implementation/reference-code.md)开始。三个实现规格为[逐层驱逐](docs/implementation/layer-eviction.md)、[全层共享 LRU](docs/implementation/shared-lru.md)和[两者联用](docs/implementation/combined.md)。[主 KV 重叠与模型适配](docs/implementation/model-adapters.md)给出各模型的路径和独立开关。
 
+## 11 月 24 日实测更新
+
+MiniMax 原生 HiSparse 在 A100 TP8 上完成 8–16K/B86、16–32K/B48、32–64K/B44 三档 CUDA Graph 诊断，三档均观察到高 miss 层的换入和完整 decoder 层用时更长。DeepSeek‑V4‑Flash 用较短请求冻结层组后，在 32 条独立长请求上复现了层间 miss 差异。附整步耗时拟合对照、误差和 SLO 反解条件。[实测汇总与模型](A100_HISPARSE_GRAPH_AND_SLO_20261124.md)
+
 ## 11 月 23 日实测更新
 
 8 × A100 上，MiniMax 原生 HiSparse 在 B32、16–32 Ki token 输入下完成了 CUDA Graph 的逐层 Nsight 采集。事前分组的高 miss 层与低 miss 层，按每步取八卡最慢换入核、再跨八步取中位数的口径，分别为 **1,065.88** 和 **278.26 µs/层**。同 rank 计时显示，换入耗时差到 attention merge 结束仍保留 **99.65%**。固定层策略的 TPOT 与吞吐仍待配对实测。 [实测口径与逐层图](NATIVE_GRAPH_20261123.md)
