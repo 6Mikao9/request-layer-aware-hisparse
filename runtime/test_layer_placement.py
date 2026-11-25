@@ -180,6 +180,19 @@ class EqualBytesHPlusHVersusTwoH(unittest.TestCase):
         self.assertEqual(last["isolated"].classes, [s.HIT])
         self.assertEqual(last["shared"].classes, [s.MISS])
 
+    def test_two_h_follows_working_sets_that_swap_during_generation(self):
+        models, hits = self.models(12), {name: [] for name, _ in self.ARMS}
+        for step in range(18):
+            swapped = step >= 9                             # layer 0 shrinks to one token, layer 1 grows to three
+            picks = ((3, 7 + step % 3) if swapped else (3 + step % 3, 6))
+            for name, model in models.items():
+                hits[name].append(sum(model.step(layer, {0: [token]})[0].hits for layer, token in enumerate(picks)))
+                model.step(2, {0: [picks[0]]})
+        self.assertEqual(hits["shared"][3:9] + hits["shared"][12:], [2] * 12, "both phases fit the pooled 2H")
+        self.assertEqual(models["shared"].ref.occupancy(0, 1), {0: 1, 1: 3})
+        for name in ("isolated", "stock_layout"):
+            self.assertEqual(hits[name][3:9] + hits[name][12:], [1] * 12, f"{name}: the three-token layer misses")
+
 
 class QuotasSingleLayerAndBoundaries(unittest.TestCase):
     def test_soft_floor_keeps_a_layer_under_the_same_total_residency(self):
@@ -408,6 +421,66 @@ class UserSwitchesAndRejections(unittest.TestCase):
                 sc.parse({"schema": sc.SCHEMA, "placement": raw})
         with self.assertRaisesRegex(ValueError, "requires hot_pool.layout=arena"):
             config((1,), mode="shared")
+
+    def test_resident_direct_is_a_fixed_layers_switch_whose_off_value_is_the_default(self):
+        def fixed(**extra):
+            return sc.parse(dict({"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers",
+                                                                       "offload_layers": [1, 3]}}, **extra))
+        direct, default = fixed(features={"resident_direct": True}), fixed()
+        self.assertEqual(fixed(features={"resident_direct": False}).digest, default.digest)
+        self.assertEqual(plan.changed_fields(default, direct), ("features.resident_direct",))
+        self.assertEqual((direct.uses_resident_direct, default.uses_resident_direct), (True, False))
+        self.assertEqual(sc.capabilities(direct)["features"], {"resident_direct": True})
+        self.assertTrue(sc.capabilities(direct)["resident_path"].startswith("direct"))
+        self.assertTrue(sc.capabilities(default)["resident_path"].startswith("resolver"))
+        self.assertEqual(sc.unsupported_reasons(direct), [])
+        for raw in ({"schema": sc.SCHEMA, "features": {"resident_direct": True}},
+                    {"schema": sc.SCHEMA, "hot_pool": SHARED, "features": {"resident_direct": False}},
+                    {"schema": sc.SCHEMA, "placement": {"mode": "full_resident"},
+                     "features": {"resident_direct": True}}):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, "applies only to placement.mode"):
+                sc.parse(raw)
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            fixed(features={"resident_direct": 1})
+
+
+class ResidentDirectAblation(unittest.TestCase):
+    """features.resident_direct on/off: same rows, bytes and hot-pool state; only the resolver launches differ."""
+    LAYERS = (0, 1, 2, 3)
+
+    def arm(self, direct, **pool):
+        cfg = sc.parse(dict({"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": [1, 3]},
+                             "features": {"resident_direct": direct}}, **({"hot_pool": pool} if pool else {})))
+        model = Model(cfg, self.LAYERS, 4, 4, page=2)
+        model.admit(0, 1, 24)
+        return model
+
+    def test_resolver_and_direct_read_identical_rows_and_leave_identical_state(self):
+        items = trace(8, self.LAYERS, 10)
+        for pool in ({}, SHARED):
+            with self.subTest(pool=pool):
+                on, off = self.arm(True, **pool), self.arm(False, **pool)
+                self.assertEqual(replay(on, items), replay(off, items))
+                self.assertEqual((on.ref.hot.device, on.ref.resident), (off.ref.hot.device, off.ref.resident))
+                self.assertEqual((on.ref.resolver_launches, off.ref.resolver_launches), (0, 2 * 10),
+                                 "one resolver launch per resident layer invocation")
+
+    def test_slot_table_follows_the_native_swap_output_conventions(self):
+        r2t = {5: [40 + i for i in range(10)], 6: [80, 81, 82]}
+        table = lp.resident_slot_table([[0, 4, -1], [1, 1, 0], [2, 2, 2]], [5, 6, 5], [9, 3, 9], r2t,
+                                       num_real=2, block_size=2)
+        self.assertEqual(table, [[40, 41, 48, -1, -1, -1],      # block 4 reaches seq_len; -1 is an invalid block
+                                 [82, -1, 82, -1, 80, 81],      # duplicates keep their rows, original order
+                                 [-1] * 6])                     # padded graph row
+        self.assertEqual(lp.resident_slot_table([[1, 2]], [6], [6], r2t, num_real=1, block_size=2),
+                         [[82, -1, -1, -1]], "positions past the req_to_token width stay invalid")
+        model = self.arm(False)
+        pad = s.Selection(0, 1, (3, 4), model.seq[0][1], False)
+        real = s.Selection(0, 1, (3, 4), model.seq[0][1])
+        with self.assertRaisesRegex(ValueError, "Padded graph rows must follow"):
+            model.ref.resolve(s.Batch(0, 1, (pad, real)), 99)
+        self.assertEqual([r.classes for r in model.ref.resolve(s.Batch(0, 1, (real, pad)), 99)],
+                         [[lp.RESIDENT] * 2, [s.PAD] * 2])
 
 
 class ByteBudget(unittest.TestCase):

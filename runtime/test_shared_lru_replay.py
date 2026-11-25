@@ -112,6 +112,14 @@ class ReplayCli(unittest.TestCase):
             code, again = run(combined / "fixed_shared_arena.json", Path(tmp) / "again.json")
             self.assertEqual((Path(tmp) / "again.json").read_bytes(),
                              (Path(tmp) / "fixed_shared_arena.json").read_bytes())
+            code, resolver = run(combined / "fixed_shared_resident_resolver.json", Path(tmp) / "resolver.json")
+            self.assertEqual(code, 0)
+            direct = results["fixed_shared_arena"]
+            for key in ("selection_sha256", "output_sha256", "device_bytes_sha256", "counters", "history_hit_rate"):
+                self.assertEqual(resolver[key], direct[key], f"{key}: resident_direct changes no row or byte")
+            self.assertEqual(direct["checks"]["resident_resolver_launches"], 0)
+            self.assertGreater(resolver["checks"]["resident_resolver_launches"], 0)
+            self.assertIn("resident resolver", resolver["engine"])
 
 
 if __name__ == "__main__":

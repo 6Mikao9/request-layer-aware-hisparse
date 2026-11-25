@@ -41,3 +41,13 @@ through the stock sparse decode/prefill consumers without HiSparse slots or
 location mapping. Its pinned inputs are in layer_placement_dependency_sha256.
 The CPU tests execute pinned class and method sources from a local checkout
 only when SGLANG_SRC is set; no SGLang source is vendored.
+
+The resident resolver of the same adapter (layer_placement_kernel.cuh, used
+only without features.resident_direct) includes the pinned kvcacheio/hisparse.cuh
+unmodified for resolve_selected_token and keeps the swap kernel's output
+conventions (-1 sentinel, num_real_reqs early exit). Writing req_to_token rows
+of resident layers as HiSparse slots is new.
+
+The lab runner (combined_run.py) drives the existing benchmarks clients
+(sglang_stream_client.generate, sglang_correctness_client.submit) unchanged and
+parses SGLang's decode log line in the format of the pinned metrics_reporter.

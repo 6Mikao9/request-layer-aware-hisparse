@@ -178,7 +178,7 @@ def _bare(addresses):
 def replay(fixture, config):
     fields = s.COUNTER_FIELDS + ("direct", "resident")
     selections, outputs, device = hashlib.sha256(), hashlib.sha256(), hashlib.sha256()
-    per_rank, checked, ledgers = {}, 0, {}
+    per_rank, checked, ledgers, launches = {}, 0, {}, 0
     for rank in fixture["ranks"]:
         arm, epoch, live = _Arm(config, fixture, rank), 0, {}
         layers = {layer: dict.fromkeys(fields, 0) for layer in fixture["layers"]}
@@ -216,6 +216,7 @@ def replay(fixture, config):
             device.update(json.dumps([rank, lp.RESIDENT, list(key), value[0].hex(), value[1].hex()]).encode())
         if arm.mirror is not None and arm.mirror.status:
             raise AssertionError(f"Kernel mirror status {arm.mirror.status}")
+        launches += arm.engine.resolver_launches
         per_rank[str(rank)] = {str(layer): counts for layer, counts in layers.items()}
         common = dict(hot_rows=fixture["hot_rows"], page=fixture["page"], item_bytes=fixture["item_bytes"],
                       slots=len(fixture["requests"]) + 1, plan=arm.plan, counters=config.diagnostics == "counters")
@@ -237,7 +238,8 @@ def replay(fixture, config):
                 device_bytes_sha256=device.hexdigest(), counters=dict(total=total, per_rank=per_rank),
                 history_hit_rate=total["hits"] / total["unique"] if total["unique"] else None,
                 checks=dict(direct_reader_positions=checked,
-                            kernel_mirror="lockstep" if config.uses_arena else "not applicable"),
+                            kernel_mirror="lockstep" if config.uses_arena else "not applicable",
+                            **(dict(resident_resolver_launches=launches) if config.uses_fixed_layers else {})),
                 placement=dict(offload=list(arm.engine.placement.offload),
                                resident=list(arm.engine.placement.resident)),
                 ledger=ledgers)
@@ -264,7 +266,8 @@ def main(argv=None):
         return 1
     engine = "SharedLRUReference+KernelMirror" if config.uses_arena else "NativeLayerLRU"
     if config.uses_fixed_layers:
-        engine = f"CombinedReference({engine} on S, resident direct)"
+        path = "direct" if config.uses_resident_direct else "resolver"
+        engine = f"CombinedReference({engine} on S, resident {path})"
     result = dict(schema=RESULT_SCHEMA, status="pass", fixture_sha256=fixture_digest,
                   config_file_sha256=config_digest, config_sha256=config.digest,
                   resolved_config=config.as_dict(), capabilities=sc.capabilities(config), engine=engine,

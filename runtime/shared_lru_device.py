@@ -23,6 +23,7 @@ import functools
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -35,6 +36,7 @@ JIT_NAME = "request_layer_hisparse_shared_lru_v1"
 BLOCK_SIZE = 1024
 MAX_DEVICE_PLANES = 64
 MAX_DEVICE_SELECTION = 2048
+RECEIPT_DIR_ENV = "REQUEST_LAYER_HISPARSE_RECEIPT_DIR"
 COORDINATOR = "srt/managers/hisparse_coordinator.py"
 # (pinned file, qualified symbol, required leading parameters or None)
 SYMBOLS = (
@@ -60,6 +62,22 @@ SYMBOLS = (
 CONSUMER_MODULE = "sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse"
 CONSUMER = "flash_decode_with_gqa_share_sparse"
 _CREATED_POOLS = 0  # contiguous pools built in this process (blocks uninstall)
+
+
+def emit(record, rank):
+    """Print one worker receipt line; with ``RECEIPT_DIR_ENV`` set, also keep it as one file per rank.
+
+    Long lines from concurrent ranks can interleave on a shared stdout pipe, so the
+    lab runner reads the files.
+    """
+    text = json.dumps(dict(record, rank=rank), sort_keys=True)
+    print(text, flush=True)
+    directory = os.environ.get(RECEIPT_DIR_ENV)
+    if directory:
+        with open(os.path.join(directory, f"{record['event']}.rank{rank}.json"), "x") as handle:
+            handle.write(text + "\n")
+
+
 def pinned_digests():
     manifest = json.loads(PROVENANCE.read_text())
     return {**manifest["source_sha256"], **manifest["runtime_dependency_sha256"],
@@ -493,14 +511,15 @@ def install(config, config_sha256):
         if hashes != [identity] * self.tp_world_size:
             raise RuntimeError("TP ranks disagree on the arena configuration or geometry")
         self._request_layer_hisparse_arena = state["runtime"] = runtime
-        receipt = runtime.receipt(self, dist.get_rank(), self.tp_world_size)
+        rank = dist.get_rank()
+        receipt = runtime.receipt(self, rank, self.tp_world_size)
         if placement is not None:
             self._request_layer_hisparse_placement = placement
             receipt["placement"] = placement.receipt(self)
-        print(json.dumps(receipt, sort_keys=True), flush=True)
+        emit(receipt, rank)
         if config.diagnostics == "counters":
             import atexit
-            atexit.register(lambda: print(json.dumps(runtime.counter_snapshot(), sort_keys=True), flush=True))
+            atexit.register(lambda: emit(runtime.counter_snapshot(), rank))
 
     def alloc_device_buffer(self, req):
         originals["alloc_device_buffer"](self, req)

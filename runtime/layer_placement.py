@@ -14,12 +14,35 @@ one TP rank. S equal to every eligible layer is the all-layer arena of
 
 Addresses are ``(pool, plane, loc)``: ``("resident", r, logical loc)`` in the
 r-th resident plane or ``("hot", p, device loc)`` in the p-th offloaded plane.
+``features.resident_direct`` picks how a resident layer reaches the consumer:
+directly through ``req_to_token`` or through the resident resolver, whose
+output table ``resident_slot_table`` mirrors the CUDA kernel. Both read the
+same rows; only the extra resolver launch differs.
 """
 from dataclasses import dataclass, replace
 
 from . import shared_lru as s
 
 RESIDENT, HOT = "resident", "hot"
+
+
+def resident_slot_table(top_k, req_pool_indices, seq_lens, req_to_token, *, num_real, block_size):
+    """CPU mirror of ``rlh_layer_placement::resolve_resident`` (``features.resident_direct=false``).
+
+    Row b lists, per flattened selected position, the ``req_to_token`` location the
+    stock consumer reads, or -1 for invalid blocks, positions at or past ``seq_len``
+    (or past the table width) and padded graph rows ``b >= num_real``: the output
+    conventions of the native swap kernel.
+    """
+    out = []
+    for b, blocks in enumerate(top_k):
+        if b >= num_real:
+            out.append([-1] * (len(blocks) * block_size))
+            continue
+        locs = req_to_token[req_pool_indices[b]]
+        out.append([locs[t] if 0 <= t < len(locs) else -1
+                    for t in s.selected_tokens(blocks, block_size, seq_lens[b])])
+    return out
 
 
 @dataclass(frozen=True)
@@ -120,6 +143,8 @@ class CombinedReference:
         self.logical = LogicalAllocator(logical_locs or page * 4096, page)
         self.resident = {}      # (resident plane, logical loc) -> (K bytes, V bytes)
         self._requests = {}     # slot -> [generation, seq_len]
+        self.resident_direct = config.uses_resident_direct
+        self.resolver_launches = 0   # resident resolver invocations (zero on the direct path)
 
     def _live(self, slot, generation):
         req = self._requests.get(slot)
@@ -201,7 +226,18 @@ class CombinedReference:
         real = [sel.slot for sel in batch.rows if sel.real]
         if len(set(real)) != len(real):
             raise ValueError("A request appears twice in one layer invocation")
-        return [self._resolve_resident(batch, plane, sel) for sel in batch.rows]
+        resolved = [self._resolve_resident(batch, plane, sel) for sel in batch.rows]
+        if self.resident_direct:
+            return resolved
+        self.resolver_launches += 1        # one kernel per resident layer invocation; padded rows stay -1
+        rows = [sel for sel in batch.rows if sel.real] + [sel for sel in batch.rows if not sel.real]
+        if rows != list(batch.rows):
+            raise ValueError("Padded graph rows must follow the real rows")
+        table = resident_slot_table([sel.blocks for sel in rows], [sel.slot for sel in rows],
+                                    [sel.seq_len for sel in rows], self.logical.req_to_token,
+                                    num_real=len(real), block_size=batch.block_size)
+        return [replace(r, addresses=[None if loc < 0 else (RESIDENT, plane, loc) for loc in row])
+                for r, row in zip(resolved, table)]
 
     def _resolve_resident(self, batch, plane, sel):
         width = len(sel.blocks) * batch.block_size

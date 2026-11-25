@@ -16,7 +16,10 @@ and all-default configurations install nothing.
   ``host_to_device_ratio`` rows per device token, so automatic sizing keeps one HBM
   budget and the hot budget follows from what remains.
 * ``MiniMaxSparseAttnBackend._hisparse_swap_in_blocks``: resident layers return no
-  HiSparse slots, so the stock consumer reads their ``req_to_token`` rows directly.
+  HiSparse slots with ``features.resident_direct``, so the stock consumer reads their
+  ``req_to_token`` rows directly; without it ``rlh_layer_placement::resolve_resident``
+  (``layer_placement_kernel.cuh``) writes the same rows as slots into the native
+  output buffer, the correct resident resolver the direct path is measured against.
 * ``minimax_sparse_ops.minimax_sparse.minimax_sparse_prefill``: resident planes are
   read without the HiSparse location mapping.
 * Stock hot-pool layout only: ``HiSparseCoordinator.__init__`` (gate, TP agreement,
@@ -75,6 +78,23 @@ SYMBOLS = (
 )
 PENDING_HARDWARE = ("sm80_build", "cuda_graph_capture_replay", "tp8_split_pool_receipt", "physical_memory_receipt",
                     "serving_tpot_throughput")
+KERNEL_SOURCE = Path(__file__).with_name("layer_placement_kernel.cuh")
+JIT_NAME = "rlh_layer_placement_resident"
+RESIDENT_BLOCK_SIZE = 256      # threads per graph row; one CTA writes K * block slots
+
+
+@functools.cache
+def _resident_module(num_top_k, sparse_block_size):
+    from sglang.kernels.jit.utils import load_jit, make_cpp_args
+    from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+    args = make_cpp_args(RESIDENT_BLOCK_SIZE, num_top_k, sparse_block_size)
+    return load_jit(JIT_NAME, *args, cuda_files=[str(KERNEL_SOURCE)],
+                    cuda_wrappers=[("resolve_resident", f"rlh_layer_placement::resolve_resident<{args}>")],
+                    extra_include_paths=[str(KERNEL_PATH / "csrc")])
+
+
+def kernel_sha256():
+    return hashlib.sha256(KERNEL_SOURCE.read_bytes()).hexdigest()
 
 
 def pinned_digests():
@@ -223,6 +243,7 @@ class PlacementBinding:
         self.plane_of = {layer: plane for plane, layer in enumerate(self.offload)}
         self.hot_rows, self.page = coordinator.device_buffer_size, self.main.page_size
         self.logical_tokens = coordinator.token_to_kv_pool_allocator.size_full
+        self.resident_direct = config.uses_resident_direct
 
     def plane(self, layer_id):
         plane = self.plane_of.get(layer_id)
@@ -230,13 +251,27 @@ class PlacementBinding:
             raise RuntimeError(f"Layer {layer_id} keeps complete GPU main KV; it never reaches the HiSparse swap")
         return plane
 
+    def resolve_resident(self, coordinator, req_pool_indices, seq_lens, top_k_blocks, req_to_token, block_size):
+        """Resident resolver (``resident_direct=false``): one launch into the native output buffer, no sync."""
+        torch, width = self.torch, top_k_blocks.size(1) * block_size
+        buffer = coordinator.top_k_device_locs_buffer
+        if (self.resident_direct or top_k_blocks.dtype != torch.int32 or req_to_token.dtype != torch.int32
+                or width > buffer.shape[1] or req_pool_indices.size(0) > buffer.shape[0]):
+            raise ValueError("Selection, req_to_token or batch differs from the bound resident resolver contract")
+        out = buffer[:req_pool_indices.size(0), :width]
+        _resident_module(top_k_blocks.size(1), block_size).resolve_resident(
+            top_k_blocks, req_pool_indices, seq_lens, coordinator.num_real_reqs, req_to_token, out)
+        return out
+
     def signature(self):
         resident = self.resident_pool
         return dict(offload_layers=list(self.offload), resident_layers=list(self.resident), hot_rows=self.hot_rows,
                     page=self.page, hot_plane_rows=int(self.main.k_buffer[0].shape[0]),
                     resident_plane_rows=None if resident is None else int(resident.k_buffer[0].shape[0]),
                     row_shape=[int(x) for x in self.main.k_buffer[0].shape[1:]], dtype=str(self.main.dtype),
-                    logical_tokens=int(self.logical_tokens))
+                    logical_tokens=int(self.logical_tokens),
+                    resident_path="direct" if self.resident_direct else "resolver",
+                    resident_kernel_sha256=None if self.resident_direct else kernel_sha256())
 
     def receipt(self, coordinator):
         torch, resident, host = self.torch, self.resident_pool, coordinator.mem_pool_host
@@ -250,6 +285,9 @@ class PlacementBinding:
         return dict(event="hisparse_layer_placement_bound", config_file_sha256=self.config_sha256,
                     config_sha256=self.config.digest, resolved_config=self.config.as_dict(),
                     capabilities=sc.capabilities(self.config), signature=self.signature(), cell_size=self.charge,
+                    resident_resolver=None if self.resident_direct else dict(
+                        kernel="rlh_layer_placement::resolve_resident", kernel_sha256=kernel_sha256(),
+                        block_size=RESIDENT_BLOCK_SIZE, output="coordinator.top_k_device_locs_buffer"),
                     bytes=dict(hot_main_kv=_nbytes(self.main.k_buffer) + _nbytes(self.main.v_buffer),
                                resident_main_kv=0 if resident is None else _nbytes(resident.k_buffer)
                                + _nbytes(resident.v_buffer),
@@ -418,9 +456,16 @@ def install(config, config_sha256):
         hit = route(self.kv_pool, layer_id)
         if hit is None:
             raise RuntimeError(f"Layer {layer_id} is not a sparse layer of the split pool")
-        if hit[0] is not self.kv_pool.main_pool:
-            return None             # resident: the stock consumer reads req_to_token rows of the resident plane
-        return originals["swap_blocks"](self, forward_batch, topk_idx, layer_id)
+        if hit[0] is self.kv_pool.main_pool:
+            return originals["swap_blocks"](self, forward_batch, topk_idx, layer_id)
+        if config.uses_resident_direct:
+            return None             # direct: the stock consumer reads req_to_token rows of the resident plane
+        binding = state["binding"]  # resolver: the same rows as HiSparse slots, consumed through hisparse_slots
+        if binding is None or topk_idx.size(0) != 1:
+            raise RuntimeError("Resident resolver needs a bound coordinator and one KV head per rank")
+        slots = binding.resolve_resident(self.hisparse_coordinator, forward_batch.req_pool_indices,
+                                         forward_batch.seq_lens, topk_idx[0], self.req_to_token, self.block_size_k)
+        return slots.unsqueeze(0)
 
     @functools.wraps(originals["prefill"])
     def prefill_hook(*args, **kwargs):
@@ -445,8 +490,7 @@ def install(config, config_sha256):
         if hashes != [identity] * self.tp_world_size:
             raise RuntimeError("TP ranks disagree on the offload set or the split pool geometry")
         self._request_layer_hisparse_placement = binding
-        print(json.dumps(dict(binding.receipt(self), rank=dist.get_rank(), tp_size=self.tp_world_size),
-                         sort_keys=True), flush=True)
+        arena.emit(dict(binding.receipt(self), tp_size=self.tp_world_size), dist.get_rank())
 
     def swap_in_selected_blocks(self, req_pool_indices, seq_lens, top_k_blocks, layer_id, sparse_block_size):
         binding = getattr(self, "_request_layer_hisparse_placement", None)
@@ -532,8 +576,10 @@ def tensor_contracts(geo, placement, cap):
         "coordinator tables": f"req_device_buffer_tokens/locs [{S}, slots, {H + page}] int32; "
                               f"lru_slots [{S}, slots, {H}]",
         "host history": f"HiSparseMHATokenToKVPoolHost x{S} planes of the logical capacity; resident layers none",
-        "decode": "offloaded: selector blocks -> swap on the S plane -> hisparse_slots; resident: hisparse_slots None, "
-                  "the stock consumer reads req_to_token rows",
+        "decode": "offloaded: selector blocks -> swap on the S plane -> hisparse_slots; resident with "
+                  "resident_direct: hisparse_slots None, the stock consumer reads req_to_token rows; resident "
+                  "without it: resolve_resident writes those rows to top_k_device_locs_buffer [B, K] int32 (-1 "
+                  "invalid) as hisparse_slots",
         "prefill": "offloaded: loc_mapping = full_to_hisparse_device_index_mapping; resident: loc_mapping None",
         "writes": "set_kv_buffer(..., layer_id_override=plane): offloaded rows translated, resident rows logical",
     }
@@ -557,19 +603,57 @@ def dry_run(root, config, geo, *, dense_layers=0, ratio=2, index_bytes=0):
     ok = (all(v == "ok" for v in digests.values()) and all(s["status"] == "ok" for s in symbols)
           and (arena_report is None or arena_report["status"] == "pass"))
     hot_pool = "native load_blocks_to_device_buffer_mha on S planes" if plan is None else arena_report["implementation"]
+    resident = ("stock flash_decode_with_gqa_share_sparse / flash_prefill_with_gqa_share_sparse over req_to_token rows"
+                + ("" if config.uses_resident_direct else
+                   f"; decode slots from rlh_layer_placement::resolve_resident (kernel sha256 {kernel_sha256()})"))
     return dict(status="pass" if ok else "fail", config_sha256=config.digest, resolved_config=config.as_dict(),
                 capabilities=sc.capabilities(config), digests=digests, symbols=symbols,
                 placement=dict(eligible=list(placement.layers), offload=list(placement.offload),
                                resident=list(placement.resident)),
-                implementation=dict(hot_pool=hot_pool, resident="stock flash_decode_with_gqa_share_sparse / "
-                                    "flash_prefill_with_gqa_share_sparse over req_to_token rows"),
+                implementation=dict(hot_pool=hot_pool, resident=resident),
                 arena_plan=None if arena_report is None else arena_report["plan"],
                 geometry=geo, capacity=cap, tensor_contracts=tensor_contracts(geo, placement, cap),
                 budget_units=ledger, pending_hardware=list(PENDING_HARDWARE))
 
 
+def build_receipt(config, geo, output):
+    """GPU-only: JIT-build the resident resolver of this arm and record toolchain and artifact identity."""
+    import platform
+    import shutil
+    import subprocess
+    import torch
+    import sglang
+    from sglang.kernels.jit.utils.compile.cache import cache_root
+    bad = {k: v for k, v in verify_digests(Path(sglang.__file__).resolve().parent).items() if v != "ok"}
+    if bad or torch.cuda.get_device_capability() != (8, 0):
+        raise RuntimeError(f"Build receipt requires the pinned source on sm_80; mismatches: {bad}")
+    if config.uses_resident_direct:
+        raise RuntimeError("features.resident_direct launches no resident resolver; pass the resolver arm config")
+    variant = (geo["top_k_blocks"], geo["block_size"])
+    _resident_module(*variant)
+
+    def run(*command):
+        if shutil.which(command[0]) is None:
+            return None
+        return subprocess.run(command, capture_output=True, text=True, check=False).stdout.strip()
+
+    artifacts = [dict(name=path.name, sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                      cuobjdump_list_elf=run("cuobjdump", "--list-elf", str(path)))
+                 for path in sorted(cache_root().rglob(f"*{JIT_NAME}*.so"))]
+    receipt = dict(event="hisparse_layer_placement_build", config_sha256=config.digest,
+                   template_args=[RESIDENT_BLOCK_SIZE, *variant], kernel_source_sha256=kernel_sha256(),
+                   python=platform.python_version(), torch=torch.__version__, torch_cuda=torch.version.cuda,
+                   cxx11_abi=bool(torch._C._GLIBCXX_USE_CXX11_ABI), nccl=list(torch.cuda.nccl.version()),
+                   device=torch.cuda.get_device_name(), capability=list(torch.cuda.get_device_capability()),
+                   nvcc=run("nvcc", "--version"), host_cxx=run("c++", "--version"), artifacts=artifacts)
+    with Path(output).open("x") as handle:
+        json.dump(receipt, handle, indent=2, sort_keys=True)
+    return receipt
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Fixed offload set adapter: CPU dry-run against pinned SGLang.")
+    parser = argparse.ArgumentParser(description="Fixed offload set adapter: CPU dry-run against pinned SGLang, "
+                                                 "or the GPU build receipt of the resident resolver.")
     commands = parser.add_subparsers(dest="command", required=True)
     dry = commands.add_parser("dry-run", help="resolve pinned symbols, split pools and contracts; CPU only")
     dry.add_argument("--sglang-src", type=Path, required=True, help="pinned checkout or its python/sglang package")
@@ -581,6 +665,11 @@ def main(argv=None):
     sizing.add_argument("--host-to-device-ratio", type=int, default=2)
     sizing.add_argument("--index-bytes-per-token", type=int, default=0,
                         help="index K(+V) bytes per logical token over all sparse layers; 0 leaves it out")
+    build = commands.add_parser("build-receipt", help="GPU only: JIT build of the resident resolver and toolchain")
+    build.add_argument("--config", type=Path, required=True, help="fixed_layers config without resident_direct")
+    build.add_argument("--output", type=Path, required=True)
+    build.add_argument("--allow-cuda-build", action="store_true")
+    arena._geometry_args(build)
     args = parser.parse_args(argv)
     try:
         config, _ = sc.read(args.config)
@@ -595,14 +684,22 @@ def main(argv=None):
             hot_rows=args.hot_rows, page=args.page, top_k_blocks=args.top_k_blocks, block_size=args.block_size,
             head_dim=args.head_dim, dtype_bytes=args.dtype_bytes, kv_heads_per_rank=args.kv_heads_per_rank,
             slots=args.slots, plane_rows=args.plane_rows)
-        root = args.sglang_src / "python" / "sglang" if (args.sglang_src / "python" / "sglang").is_dir() \
-            else args.sglang_src
-        report = dry_run(root, config, geo, dense_layers=args.dense_layers, ratio=args.host_to_device_ratio,
-                         index_bytes=args.index_bytes_per_token)
+        if args.command == "dry-run":
+            root = args.sglang_src / "python" / "sglang" if (args.sglang_src / "python" / "sglang").is_dir() \
+                else args.sglang_src
+            report = dry_run(root, config, geo, dense_layers=args.dense_layers, ratio=args.host_to_device_ratio,
+                             index_bytes=args.index_bytes_per_token)
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report["status"] == "pass" else 1
+    if args.command == "dry-run":
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["status"] == "pass" else 1
+    if not args.allow_cuda_build:
+        parser.error("Run only in an approved idle GPU process with --allow-cuda-build")
+    if args.output.exists():
+        parser.error(f"Refusing to overwrite {args.output}")
+    print(json.dumps(build_receipt(config, geo, args.output), indent=2, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":

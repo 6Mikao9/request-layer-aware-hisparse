@@ -3,5 +3,6 @@
   "placement": {"mode": "fixed_layers", "selection": "fixed", "offload_layers": [1, 3]},
   "hot_pool": {"mode": "isolated", "scope": "request_rank", "layout": "arena", "eviction": "lru",
                "admission": "all", "quota": "none"},
+  "features": {"resident_direct": true},
   "diagnostics": {"mode": "none"}
 }

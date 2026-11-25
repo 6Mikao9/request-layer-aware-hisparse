@@ -20,7 +20,6 @@ from unittest.mock import patch
 
 from runtime import layer_placement as lp
 from runtime import layer_placement_device as device
-from runtime import shared_lru as s
 from runtime import shared_lru_device as arena
 from runtime import study_config as sc
 
@@ -35,8 +34,10 @@ COORDINATOR = "sglang.srt.managers.hisparse_coordinator"
 DENSE, SPARSE = (0,), (1, 2, 3, 4, 5)
 
 
-def fixed(offload, **pool):
-    data = {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": list(offload)}}
+def fixed(offload, direct=True, **pool):
+    """Fixed offload set; resident layers read directly unless ``direct=False`` selects the resolver."""
+    data = {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": list(offload)},
+            "features": {"resident_direct": direct}}
     if pool:
         data["hot_pool"] = pool
     return sc.parse(data)
@@ -460,6 +461,12 @@ class SplitPools(Harness):
         with self.assertRaisesRegex(RuntimeError, "One HiSparse coordinator"):
             self.coordinator(self.allocator)
 
+    def test_runner_receipt_directory_keeps_one_file_per_rank(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {arena.RECEIPT_DIR_ENV: tmp}):
+            _, printed = self.coordinator(self.allocator)
+            files = {path.name: json.loads(path.read_text()) for path in Path(tmp).iterdir()}
+        self.assertEqual(files, {"hisparse_layer_placement_bound.rank0.json": printed[0]})
+
     def test_gate_rejects_mismatched_tables_hosts_and_modes(self):
         mutations = [lambda c: setattr(c.mem_pool_host, "layer_num", 5),
                      lambda c: setattr(c, "lru_slots", torch.zeros((5, 4, 8), dtype=torch.int16)),
@@ -490,6 +497,65 @@ class SplitPools(Harness):
                              lambda out, value, group=None: out.__setitem__(slice(None), [value, "other"])), \
                 self.assertRaisesRegex(RuntimeError, "disagree"):
             self.coordinator(self.allocator)
+
+
+class ResidentResolver(Harness):
+    """features.resident_direct=false: resident layers resolve their req_to_token rows into the native buffer."""
+    CONFIG = fixed((2, 4), direct=False)
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(device.install(self.CONFIG, "c" * 64))
+        self.pool, self.allocator = build_pool(self.h)
+        self.coordinator_, self.receipts = self.coordinator(self.allocator)
+        self.calls = []
+
+        def resolve_resident(top_k, rpi, seq, num_real, req_to_token, out):       # the CPU mirror stands in
+            self.calls.append((top_k, rpi, seq, num_real, req_to_token, out))
+            table = lp.resident_slot_table(top_k.tolist(), rpi.tolist(), seq.tolist(), req_to_token.tolist(),
+                                           num_real=int(num_real[0]), block_size=2)
+            out.copy_(torch.tensor(table, dtype=torch.int32))
+
+        module = types.SimpleNamespace(resolve_resident=resolve_resident)
+        patcher = patch.object(device, "_resident_module", lambda blocks, block: module)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def backend(self):
+        backend = self.h.Backend(self.pool)
+        backend.hisparse_coordinator, backend.block_size_k = self.coordinator_, 2
+        backend.req_to_token = (torch.arange(4 * 16, dtype=torch.int32).reshape(4, 16) * 7) % 31 + 2
+        return backend
+
+    def test_resident_rows_become_slots_in_the_native_output_buffer(self):
+        backend, coordinator = self.backend(), self.coordinator_
+        batch = types.SimpleNamespace(req_pool_indices=torch.tensor([2, 0, 1], dtype=torch.int64),
+                                      seq_lens=torch.tensor([9, 5, 7], dtype=torch.int32))
+        topk = torch.tensor([[[4, -1], [2, 2], [3, 1]]], dtype=torch.int32)   # invalid/out-of-range, duplicate
+        coordinator.num_real_reqs.fill_(2)                                     # the third row is graph padding
+        slots = backend._hisparse_swap_in_blocks(batch, topk, 3)
+        self.assertEqual(tuple(slots.shape), (1, 3, 4))
+        self.assertEqual(slots.data_ptr(), coordinator.top_k_device_locs_buffer.data_ptr(), "native output buffer")
+        r2t = backend.req_to_token
+        self.assertEqual(slots[0].tolist(), [[r2t[2, 8].item(), -1, -1, -1],
+                                             [r2t[0, 4].item(), -1, r2t[0, 4].item(), -1],
+                                             [-1] * 4])
+        top_k, rpi, seq, num_real, req_to_token, _ = self.calls[-1]
+        self.assertIs(num_real, coordinator.num_real_reqs)
+        self.assertIs(req_to_token, r2t)
+        self.assertEqual((top_k.tolist(), rpi.tolist(), seq.tolist()), (topk[0].tolist(), [2, 0, 1], [9, 5, 7]))
+        self.assertEqual(backend._hisparse_swap_in_blocks(batch, topk, 4), ("stock swap-in", 4))
+        self.assertEqual(len(self.calls), 1, "offloaded layers never launch the resident resolver")
+        with self.assertRaisesRegex(ValueError, "resident resolver contract"):
+            backend._hisparse_swap_in_blocks(batch, topk.long(), 5)
+
+    def test_receipt_and_tp_signature_name_the_resolver_and_its_kernel(self):
+        receipt = self.receipts[0]
+        self.assertEqual(receipt["signature"]["resident_path"], "resolver")
+        self.assertEqual(receipt["signature"]["resident_kernel_sha256"], device.kernel_sha256())
+        self.assertEqual(receipt["resident_resolver"]["output"], "coordinator.top_k_device_locs_buffer")
+        self.assertTrue(receipt["capabilities"]["resident_path"].startswith("resolver"))
+        self.assertEqual(receipt["capabilities"]["features"], {"resident_direct": False})
 
 
 class ArenaOverTheOffloadSet(Harness):

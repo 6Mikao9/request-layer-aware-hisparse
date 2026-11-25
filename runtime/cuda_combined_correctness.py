@@ -7,11 +7,14 @@ and an arena over the offloaded planes only. Each decode step runs, per layer in
 model order, the path the adapter dispatches: offloaded layers resolve through
 ``rlh_shared_lru::resolve`` (checked against ``KernelMirror`` like the arena gate)
 and attend with HiSparse slots over the arena view; resident layers attend through
-``req_to_token`` with no slots. The pinned consumer ``flash_decode_with_gqa_share_sparse``
-must give bit-identical outputs over a dense logical twin of each offloaded layer,
-the paged-contiguous resident read must equal its gather read, and every output
-must match an FP32 softmax over the host-history K/V of the selected tokens.
-Eager and CUDA Graph replay (one bucket, changing real rows) are both covered.
+``req_to_token`` with no slots (``features.resident_direct``) and, for the ablation's
+off arm, through the slots ``rlh_layer_placement::resolve_resident`` writes (checked
+against ``layer_placement.resident_slot_table``). The pinned consumer
+``flash_decode_with_gqa_share_sparse`` must give bit-identical outputs over a dense
+logical twin of each offloaded layer; for a resident layer the paged-contiguous read,
+its gather read and the resolver read must agree bit for bit, and every output must
+match an FP32 softmax over the host-history K/V of the selected tokens. Eager and
+CUDA Graph replay (one bucket, changing real rows) are both covered.
 
     python -m runtime.cuda_combined_correctness --allow-cuda-test --output /tmp/combined-gate.json
 """
@@ -21,6 +24,7 @@ from pathlib import Path
 import random
 
 from runtime import cuda_shared_lru_correctness as gate
+from runtime import layer_placement as lp
 from runtime import shared_lru as reference
 from runtime import study_config as sc
 
@@ -48,6 +52,11 @@ def load_consumer():
     return flash_decode_with_gqa_share_sparse
 
 
+def load_resident_resolver(geometry=GEOMETRY):
+    from runtime.layer_placement_device import _resident_module
+    return _resident_module(geometry.blocks, geometry.block)
+
+
 class CombinedBench:
     """Arena bench over the offloaded planes, resident planes, logical twins and the decode consumer."""
 
@@ -55,6 +64,8 @@ class CombinedBench:
         from runtime.shared_lru_device import ArenaRuntime
         g, bf16 = geometry, torch.bfloat16
         self.torch, self.consumer, self.device, self.g = torch, consumer, device, geometry
+        self.resolver = load_resident_resolver(geometry)
+        self.resident_out = torch.full((BUCKET, g.blocks * g.block), -1, dtype=torch.int32, device=device)
         plain = sc.parse({"schema": sc.SCHEMA, "hot_pool": {"mode": "isolated", "layout": "arena"}})
         self.arena = gate.Bench(torch, plain, seed, device, geometry)
         pool = self.arena.coordinator.mem_pool_device        # bind the arena to absolute layers S, like the adapter
@@ -98,7 +109,11 @@ class CombinedBench:
             torch.bfloat16).to(self.device)
 
     def forward(self, layer, rpi, seq, blocks, q):
-        """The dispatched decode of one layer plus its comparison read; returns (main, twin) outputs."""
+        """The dispatched decode of one layer plus its comparison reads.
+
+        Offloaded: (arena read, twin read). Resident: (direct paged read, gather read,
+        resolver read, resolver slots), the two arms of ``features.resident_direct``.
+        """
         g, consumer, topk = self.g, self.consumer, blocks.unsqueeze(0)
         common = dict(q=q, sink=None, req_to_token=self.req_to_token, seq_lens=seq, slot_ids=rpi,
                       block_size=g.block, topk_idx=topk)
@@ -110,7 +125,13 @@ class CombinedBench:
                             hisparse_slots=slots.unsqueeze(0), **common)
             return main, consumer(k_cache=twin_k, v_cache=twin_v, page_size=g.page, hisparse_slots=None, **common)
         main = consumer(k_cache=twin_k, v_cache=twin_v, page_size=g.page, hisparse_slots=None, **common)
-        return main, consumer(k_cache=twin_k, v_cache=twin_v, page_size=0, hisparse_slots=None, **common)
+        gathered = consumer(k_cache=twin_k, v_cache=twin_v, page_size=0, hisparse_slots=None, **common)
+        slots = self.resident_out[:blocks.size(0)]
+        self.resolver.resolve_resident(blocks, rpi, seq, self.arena.coordinator.num_real_reqs, self.req_to_token,
+                                       slots)
+        resolved = consumer(k_cache=twin_k, v_cache=twin_v, page_size=g.page, hisparse_slots=slots.unsqueeze(0),
+                            **common)
+        return main, gathered, resolved, slots
 
     def reference(self, layer, slot, blocks, seq_len, q):
         """FP32 softmax over the host-history K/V of every selected position, in selection order."""
@@ -123,8 +144,8 @@ class CombinedBench:
         return torch.softmax(scores, dim=-1) @ values
 
     def check(self, layer, rows, q, outputs):
-        torch = self.torch
-        main, twin = outputs
+        torch, g = self.torch, self.g
+        main, twin, *resident = outputs
         if self.device == "cuda":
             torch.cuda.synchronize()
         for b, (slot, blocks) in enumerate(rows):
@@ -133,6 +154,17 @@ class CombinedBench:
             expected = self.reference(layer, slot, blocks, self.arena.seq[slot], q[b])
             error = (got - expected).abs().max().item()
             assert torch.allclose(got, expected, atol=ATOL, rtol=RTOL), f"layer {layer} row {b}: max error {error}"
+        if not resident:
+            return
+        resolved, slots = resident
+        table = lp.resident_slot_table([blocks for _, blocks in rows], [slot for slot, _ in rows],
+                                       [self.arena.seq[slot] for slot, _ in rows], self.req_to_token.tolist(),
+                                       num_real=len(rows), block_size=g.block)
+        got = slots.tolist()
+        assert got[:len(rows)] == table and all(x == -1 for row in got[len(rows):] for x in row), \
+            f"layer {layer}: resident resolver slots differ from resident_slot_table"
+        for b in range(len(rows)):
+            assert torch.equal(resolved[b], main[b]), f"layer {layer} row {b}: resolver read differs from direct read"
 
 
 def run_case(torch, pool, *, seq_dtype, rpi_dtype, graph, seed, steps, consumer, device="cuda"):
@@ -195,7 +227,7 @@ def main():
         parser.error(f"Refusing to overwrite {args.output}")
     import torch
     import sglang
-    from runtime.layer_placement_device import verify_digests
+    from runtime.layer_placement_device import kernel_sha256, verify_digests
     bad = {k: v for k, v in verify_digests(Path(sglang.__file__).resolve().parent).items() if v != "ok"}
     if bad:
         raise RuntimeError(f"Pinned SGLang source mismatch: {bad}")
@@ -210,13 +242,14 @@ def main():
                 results.append(dict(arm=name, seq_dtype=str(seq_dtype), rpi_dtype=str(rpi_dtype), graph=graph,
                                     launches=launches, status="pass"))
     summary = dict(event="hisparse_combined_cuda_gate", status="pass", layers=list(LAYERS), offload=list(OFFLOAD),
+                   resident_paths=["direct", "resolver"], resident_kernel_sha256=kernel_sha256(),
                    cases=len(results), launches=sum(r["launches"] for r in results),
                    device=torch.cuda.get_device_name(), torch=torch.__version__, results=results)
     if args.output is not None:
         with args.output.open("x") as handle:
             json.dump(summary, handle, indent=2, sort_keys=True)
     print(f"PASS {summary['cases']} cases / {summary['launches']} layer launches: arena tables and bytes on S, "
-          "resident direct reads, twin-exact consumer outputs; eager and graph")
+          "resident direct and resolver reads, twin-exact consumer outputs; eager and graph")
 
 
 if __name__ == "__main__":

@@ -44,13 +44,33 @@ def emulated_consumer(*, shift_resident=0):
     return consumer
 
 
+def emulated_resident_resolver(*, ignore_seq_len=False):
+    """``rlh_layer_placement::resolve_resident`` in torch ops, independent of the Python mirror."""
+
+    def resolve_resident(top_k, req_pool_indices, seq_lens, num_real_reqs, req_to_token, out):
+        blocks = top_k.long()
+        block = out.shape[1] // blocks.shape[1]
+        tokens = (blocks.unsqueeze(-1) * block + torch.arange(block)).reshape(blocks.shape[0], -1)
+        valid = blocks.repeat_interleave(block, dim=1) >= 0
+        if not ignore_seq_len:
+            valid &= tokens < seq_lens.long().unsqueeze(1)
+        valid &= tokens < req_to_token.shape[1]
+        rows = req_to_token[req_pool_indices.long()]
+        locs = torch.gather(rows, 1, tokens.clamp(0, req_to_token.shape[1] - 1))
+        real = torch.arange(blocks.shape[0]).unsqueeze(1) < int(num_real_reqs[0])
+        out.copy_(torch.where(valid & real, locs, torch.full_like(locs, -1)).to(torch.int32))
+
+    return type("ResidentModule", (), {"resolve_resident": staticmethod(resolve_resident)})
+
+
 @unittest.skipUnless(torch is not None, "CPU torch required")
 class CombinedGateHarness(unittest.TestCase):
-    def run_arms(self, consumer, arms=None, steps=8):
+    def run_arms(self, consumer, arms=None, steps=8, resolver=None):
         from runtime import cuda_combined_correctness as gate
         from runtime import shared_lru_device as device
         from runtime.test_shared_lru_gate import Emulator
         plans, launches = {}, 0
+        resident = resolver or emulated_resident_resolver()
 
         def jit(block_size, num_top_k, sparse_block_size, fifo, soft_floor, bypass, counters):
             return Emulator(plans["plan"], num_top_k, sparse_block_size, bypass)
@@ -62,7 +82,9 @@ class CombinedGateHarness(unittest.TestCase):
             plans["plan"] = self.plan
 
         for index, (name, pool) in enumerate((arms or gate.ARMS).items()):
-            with patch.object(device, "_jit_module", jit), patch.object(device.ArenaRuntime, "__init__", capture_plan):
+            with patch.object(device, "_jit_module", jit), \
+                    patch.object(device.ArenaRuntime, "__init__", capture_plan), \
+                    patch.object(gate, "load_resident_resolver", lambda geometry=None: resident):
                 launches += gate.run_case(torch, pool, seq_dtype=torch.int32, rpi_dtype=torch.int64, graph=False,
                                           seed=11 + index, steps=steps, consumer=consumer, device="cpu")
         return launches
@@ -75,6 +97,12 @@ class CombinedGateHarness(unittest.TestCase):
         from runtime import cuda_combined_correctness as gate
         with self.assertRaisesRegex(AssertionError, "layer 0 row 0: dispatched read differs"):
             self.run_arms(emulated_consumer(shift_resident=1), arms={"shared": gate.ARMS["shared"]}, steps=1)
+
+    def test_a_resident_resolver_that_reads_past_seq_len_is_caught(self):
+        from runtime import cuda_combined_correctness as gate
+        with self.assertRaisesRegex(AssertionError, "resident resolver slots differ"):
+            self.run_arms(emulated_consumer(), arms={"shared": gate.ARMS["shared"]}, steps=4,
+                          resolver=emulated_resident_resolver(ignore_seq_len=True))
 
 
 if __name__ == "__main__":
