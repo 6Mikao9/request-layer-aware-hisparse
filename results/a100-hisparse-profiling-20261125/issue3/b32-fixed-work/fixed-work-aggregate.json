@@ -1,0 +1,83 @@
+{
+  "arms": {
+    "calibrated_t40_stock_layout": {
+      "actual_graph_samples_in_window": 60,
+      "logical_capacity": 889344,
+      "postbatch_nvml_mib_range": [
+        72632,
+        73208
+      ],
+      "valid_outputs": 32,
+      "window": {
+        "delivered_tokens": 15266,
+        "seconds": 28.06905026594177,
+        "steps": 476,
+        "tokens_per_s": 543.87305075738,
+        "tpot_ms": {
+          "included": 32,
+          "p50": 58.64031402726302,
+          "p95": 58.655716975436235,
+          "p99": 58.713033455242105
+        },
+        "ttft_s": {
+          "included": 32,
+          "p50": 42.17902092047734,
+          "p95": 77.19315017533371,
+          "p99": 80.47213276203955
+        },
+        "warmup_steps": 32
+      }
+    },
+    "stock": {
+      "actual_graph_samples_in_window": 60,
+      "logical_capacity": 1037824,
+      "postbatch_nvml_mib_range": [
+        72738,
+        73314
+      ],
+      "valid_outputs": 32,
+      "window": {
+        "delivered_tokens": 15265,
+        "seconds": 37.38229937700089,
+        "steps": 476,
+        "tokens_per_s": 408.3483427825643,
+        "tpot_ms": {
+          "included": 32,
+          "p50": 78.12722398326713,
+          "p95": 78.13843587614467,
+          "p99": 78.19890873395573
+        },
+        "ttft_s": {
+          "included": 32,
+          "p50": 42.09792130149435,
+          "p95": 77.83798928786418,
+          "p99": 81.14431295756717
+        },
+        "warmup_steps": 32
+      }
+    }
+  },
+  "geometry": {
+    "batch": 32,
+    "kv_dtype": "bfloat16",
+    "mem_fraction_static": 0.84,
+    "offloaded_layers_fixed_arm": 40,
+    "output_tokens_each": 512,
+    "point": "16-32Ki",
+    "tp": 8
+  },
+  "minimum_window_steps": 128,
+  "plan_sha256": "fe1bc4c3defe4b8b63a286a6d50467d3f8f4753a994ee5d404bef75b030d9718",
+  "repeated_stock_observation": {
+    "steps": 476,
+    "tokens_per_s": 408.74167749303047,
+    "tpot_ms": {
+      "included": 32,
+      "p50": 78.05455844221292,
+      "p95": 78.07056942947078,
+      "p99": 78.12774823340534
+    }
+  },
+  "scope": "One fixed-output-work diagnostic; EOS suppression was common to the two measured batches. No natural-EOS acceptance verdict.",
+  "status": "both_arms_valid_with_fixed_output_work"
+}
