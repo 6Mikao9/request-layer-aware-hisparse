@@ -120,6 +120,43 @@ class PlanesAndTables(unittest.TestCase):
                     self.assertTrue(torch.all(runtime.row_owner[2] == s.FREE_TAG))
                 self.assertTrue(torch.all(runtime.row_owner[0] == s.FREE_TAG), "other slots untouched")
                 self.assertEqual(tuple(runtime.counters.shape), (3, 8) if config is FLOOR else (0, 0))
+                self.assertEqual(tuple(runtime.owner_summary.shape), (0, 0))
+
+    def test_owner_summary_tables_follow_the_mirror_and_the_ledger(self):
+        for pool in ({"mode": "shared", "layout": "arena"},
+                     {"mode": "isolated", "layout": "arena", "quota": "static", "quota_rows": {"0": 4, "1": 12, "2": 8}},
+                     {"mode": "shared", "layout": "arena", "admission": "bypass_list", "bypass_layers": [1]}):
+            config = sc.parse({"schema": sc.SCHEMA, "hot_pool": pool, "features": {"owner_summary": True}})
+            with self.subTest(pool=pool):
+                coordinator = fake_coordinator(self.pool)
+                runtime = device.ArenaRuntime(coordinator, config, "0" * 64, torch=torch)
+                mirror = s.KernelMirror(runtime.plan, plane_rows=runtime.plane_rows, features=("owner_summary",))
+                self.assertEqual(tuple(runtime.owner_summary.shape), (4, 1))   # 24 rows -> one 32-row block
+                runtime.init_slot(1)
+                mirror.init_slot(1, 0, list(range(10)))
+                words = [w & (2**64 - 1) for w in runtime.owner_summary[1].tolist()]
+                self.assertEqual(words, mirror.slots[1]["summary"])
+                self.assertEqual(words, mirror.live_summary(1))
+                self.assertFalse(runtime.owner_summary[0].any(), "other slots untouched")
+                runtime.reset_slot(1)
+                mirror.reset_slot(1)
+                self.assertFalse(runtime.owner_summary[1].any())
+                self.assertEqual(mirror.slots[1]["summary"], [0])
+                receipt = runtime.receipt(coordinator, 0, 1)
+                ledger = s.byte_ledger(layers=runtime.layers, hot_rows=8, page=2, item_bytes=8, slots=4, pool_rows=64,
+                                       plan=runtime.plan, features=("owner_summary",))
+                self.assertEqual(ledger["arena_metadata_bytes"], sum(receipt["bytes"]["arena_tables"].values()))
+                self.assertEqual(receipt["bytes"]["arena_tables"]["owner_summary"], 4 * 8)
+        high = sc.parse({"schema": sc.SCHEMA, "hot_pool": {"mode": "shared", "layout": "arena"},
+                         "features": {"owner_summary": True}})
+        wide = fake_pool(layers=64)                                      # plane 63 is the int64 sign bit
+        device.contiguous_create_buffers(wide)
+        runtime = device.ArenaRuntime(fake_coordinator(wide), high, "0" * 64, torch=torch)
+        self.assertEqual(tuple(runtime.owner_summary.shape), (4, 16))     # 64 planes x 8 rows = 512 rows
+        runtime.init_slot(0)
+        words = [w & (2**64 - 1) for w in runtime.owner_summary[0].tolist()]
+        self.assertEqual(words, s.owner_summary(runtime.plan.owner_template()))
+        self.assertEqual(words[-1], (1 << 63) | (1 << 62) | (1 << 61) | (1 << 60))
 
     def test_consumer_views_accept_only_arena_planes(self):
         runtime = device.ArenaRuntime(fake_coordinator(self.pool), SHARED, "0" * 64, torch=torch)
@@ -154,13 +191,18 @@ class PlanesAndTables(unittest.TestCase):
                 blocks = torch.tensor([[2, -1], [5, 1]], dtype=torch.int32)
                 out = runtime.resolve(coordinator, rpi, seq, blocks, plane, 2)
                 args = calls[-1]
-                self.assertEqual(variants[-1], (device.BLOCK_SIZE, 2, 2, False, False, bypass, False))
+                self.assertEqual(variants[-1], (device.BLOCK_SIZE, 2, 2, False, False, bypass, False, False, False))
                 self.assertIs(args[0], blocks)
                 self.assertIs(args[3], coordinator.num_real_reqs)
                 self.assertEqual(args[10].data_ptr(), coordinator.req_device_buffer_token_locs[plane].data_ptr())
                 self.assertIs(args[12], coordinator.mem_pool_host.k_buffer[plane])
                 self.assertIs(args[14], runtime.k_all)
-                self.assertEqual(args[19:], (plane, 3, 8, 64, *domain, *runtime.plan.scratch, 8))
+                self.assertIs(args[19], runtime.owner_summary)
+                self.assertEqual(tuple(args[19].shape), (0, 0))
+                self.assertEqual(args[20:], (plane, 3, 8, 64, *domain, *runtime.plan.scratch, 8))
+                # the kernel requires the recency table to reach the domain end; bypass scratch has no entries
+                self.assertEqual(tuple(args[6].shape), (4, sum(size for _, size in runtime.plan.domains)))
+                self.assertGreaterEqual(args[6].shape[1], domain[0] + domain[1])
                 self.assertEqual((tuple(out.shape), out.data_ptr()),
                                  ((2, 4), coordinator.top_k_device_locs_buffer.data_ptr()))
                 with self.assertRaises(ValueError):
@@ -415,8 +457,33 @@ class DryRun(unittest.TestCase):
         self.assertEqual(per_request["tail_payload_bytes"], int(3.75 * 2**20))
         self.assertEqual(per_request["bypass_scratch_rows"], 2048)
         self.assertEqual(report["implementation"]["template_args"],
-                         [[1024, 16, 128, False, False, False, False], [1024, 16, 128, False, False, True, False]])
+                         [[1024, 16, 128, False, False, False, False, False, False],
+                          [1024, 16, 128, False, False, True, False, False, False]])
+        self.assertEqual(report["implementation"]["max_shared_memory_bytes_per_cta"], 100_904)
         self.assertIn("plane * 396672 + loc", report["tensor_contracts"]["output"])
+
+    def test_resolver_switches_change_variants_ledger_and_shared_memory(self):
+        geo = device.describe_geometry(tp_size=8, layers=range(60), hot_rows=4096, page=128, top_k_blocks=16,
+                                       block_size=128, head_dim=128, dtype_bytes=2, kv_heads_per_rank=1,
+                                       slots=128, plane_rows=396_672)
+        both = sc.parse({"schema": sc.SCHEMA, "hot_pool": {"mode": "shared", "layout": "arena"},
+                         "features": {"owner_summary": True, "touched_bitmap": True}})
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_tree(tmp)
+            plain, report = device.dry_run(tmp, SHARED, geo), device.dry_run(tmp, both, geo)
+        self.assertEqual(report["implementation"]["template_args"],
+                         [[1024, 16, 128, False, False, False, False, True, True]])
+        # 7,680 owner-summary words per slot plus the template; the bitmap uses shared memory only
+        extra = report["budget_units"]["arena_metadata_bytes"] - plain["budget_units"]["arena_metadata_bytes"]
+        self.assertEqual(extra, 129 * 7680 * 8)
+        self.assertEqual(report["implementation"]["max_shared_memory_bytes_per_cta"], 100_912 + 7680 * 4)
+        self.assertEqual(report["capabilities"]["features"], {"owner_summary": True, "touched_bitmap": True})
+        bitmap = sc.parse({"schema": sc.SCHEMA, "hot_pool": {"mode": "shared", "layout": "arena"},
+                           "features": {"touched_bitmap": True}})
+        wide = s.plan_arena(bitmap, tuple(range(64)), 16384, 2048)   # 1,048,576-row shared domain
+        with self.assertRaisesRegex(ValueError, "shared memory"):
+            device.check_shared_memory(bitmap, wide)
+        self.assertEqual(device.check_shared_memory(SHARED, wide), 100_904)
 
     @unittest.skipUnless("SGLANG_SRC" in __import__("os").environ, "set SGLANG_SRC to a pinned checkout")
     def test_pinned_checkout_resolves(self):

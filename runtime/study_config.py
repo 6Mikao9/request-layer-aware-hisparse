@@ -22,8 +22,16 @@ ADMISSIONS = ("all", "bypass_list")
 QUOTAS = ("none", "static", "soft_floor")
 DIAGNOSTICS = ("none", "counters", "nsys")
 # Named engineering switches. An effort registers a name together with its
-# implementation and off/on parity test; unregistered names are rejected.
-FEATURES = ()
+# implementation and off/on parity test; unregistered names are rejected. Only
+# enabled switches enter the canonical form, so false and absent are one config.
+# Both switches below change how the arena resolver finds rows, never which rows
+# (shared-lru-scan-microbenchmark.md, "优先消融"):
+# owner_summary: per 32-row block owner-plane bits; the hit search reads owner tags
+#   only in blocks that can hold a row of the requesting layer.
+# touched_bitmap: a shared-memory bitmap of the rows one invocation hits or admits
+#   replaces the repeated owner/token/hash lookups of the victim scan and the
+#   stable recency compaction, and orders the touched rows without a sort.
+FEATURES = ("owner_summary", "touched_bitmap")
 
 _TOP = {"schema", "placement", "hot_pool", "features", "diagnostics"}
 _PLACEMENT = {"mode", "selection", "offload_layers", "seed", "calibration"}
@@ -173,6 +181,12 @@ class StudyConfig:
     def uses_arena(self):
         return self.hot_pool.layout == "arena"
 
+    def feature(self, name):
+        """Resolved value of a registered engineering switch (absent means off)."""
+        if name not in FEATURES:
+            raise KeyError(f"Unregistered feature switch {name!r}")
+        return dict(self.features).get(name, False)
+
 
 def parse(data):
     if type(data) is not dict:
@@ -242,7 +256,10 @@ def parse(data):
             raise ValueError(f"Unknown feature switch {name!r}; this build registers {list(FEATURES)}")
         if type(enabled) is not bool:
             raise ValueError(f"features.{name} must be a boolean")
-    features = tuple(sorted(raw.items()))
+        if enabled and layout != "arena":
+            raise ValueError(f"features.{name} changes the arena resolver; hot_pool.layout=native runs the "
+                             "stock kernel unmodified")
+    features = tuple(sorted((name, True) for name, enabled in raw.items() if enabled))
 
     raw = _section(data, "diagnostics", {"mode"})
     diagnostics = _choice(raw, "mode", DIAGNOSTICS, "diagnostics")
@@ -264,9 +281,6 @@ def unsupported_reasons(config):
     if config.placement.mode != "native":
         reasons.append(f"placement.mode={config.placement.mode} is owned by the layer-eviction/combined "
                        "efforts and is not implemented in this build")
-    enabled = [name for name, on in config.features if on]
-    if enabled:
-        reasons.append(f"feature switch(es) {enabled} have no implementation in this build")
     if config.hot_pool.layout == "native" and config.diagnostics != "none":
         reasons.append("diagnostics counters/nsys instrument the arena resolver; stock layout runs unmodified")
     return reasons
@@ -274,17 +288,27 @@ def unsupported_reasons(config):
 
 def capabilities(config):
     """Effective implementation selected for a parsed configuration (startup receipt)."""
-    pool = config.hot_pool
+    pool, arena = config.hot_pool, config.uses_arena
+    hit_search = recency_update = None
+    if arena:
+        hit_search = ("owner_summary: physical 32-row blocks whose owner-plane bits include the layer"
+                      if config.feature("owner_summary") else "recency list walk with an owner lookup per row")
+        recency_update = ("touched_bitmap: shared-memory bitmap, chunked stable compaction, bit-order append"
+                          if config.feature("touched_bitmap")
+                          else "per-row owner/token/hash lookup, per-1024-row compaction, bitonic sort")
     return dict(
-        runtime="stock_hisparse" if not config.uses_arena else "shared_lru_arena",
-        experimental_gpu_state=config.uses_arena,
-        resolver=None if not config.uses_arena else "rlh_shared_lru::resolve (CUDA C++, sm_80)",
-        consumer_base="per-layer main KV plane" if not config.uses_arena else "contiguous all-layer main KV view",
+        runtime="stock_hisparse" if not arena else "shared_lru_arena",
+        experimental_gpu_state=arena,
+        resolver=None if not arena else "rlh_shared_lru::resolve (CUDA C++, sm_80)",
+        consumer_base="per-layer main KV plane" if not arena else "contiguous all-layer main KV view",
         borrowing=pool.mode == "shared",
         eviction=pool.eviction,
         quota=pool.quota,
         admission=pool.admission,
         diagnostics=config.diagnostics,
         registered_features=list(FEATURES),
+        features={name: config.feature(name) for name in FEATURES} if arena else {},
+        hit_search=hit_search,
+        recency_update=recency_update,
         unsupported=unsupported_reasons(config),
     )

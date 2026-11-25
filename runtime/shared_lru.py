@@ -22,6 +22,21 @@ FREE, LOADING, VALID, SCRATCH = "free", "loading", "valid", "scratch"
 EPOCH_MASK = (1 << 32) - 1
 FREE_TAG, TAKEN_TAG = -1, -2  # device owner-tag sentinels (KernelMirror / CUDA)
 GENERATION_MASK = 0x7FFF      # device tag = generation << 16 | eligible plane index
+SUMMARY_ROWS = 32             # arena rows per owner-summary block (kSummaryRows in the CUDA kernel)
+RESOLVER_FEATURES = ("owner_summary", "touched_bitmap")  # study_config.FEATURES the resolver implements
+
+
+def summary_blocks(rows):
+    return -(-rows // SUMMARY_ROWS)
+
+
+def owner_summary(planes):
+    """Bit set of owning planes per 32-row block; ``planes`` holds a plane index or None per arena row."""
+    words = [0] * summary_blocks(len(planes))
+    for row, plane in enumerate(planes):
+        if plane is not None:
+            words[row // SUMMARY_ROWS] |= 1 << plane
+    return words
 
 
 class Deferred(RuntimeError):
@@ -730,10 +745,21 @@ class KernelMirror:
     ``req_device_buffer_tokens`` entry of the row's plane/slot), ``order``
     (recency list per domain region) and ``occ`` (rows owned per plane).
     Decode is single-stream, so the device keeps no lease table.
+
+    ``features`` selects the statements of the resolver switches.
+    ``owner_summary`` adds ``summary`` (owner-plane bits per 32-row block) and
+    finds hits by walking the blocks that carry the plane's bit;
+    ``touched_bitmap`` tests the hit/touched row set instead of repeating the
+    owner/token lookup and appends touched rows in row order. Both must leave
+    every output and table equal to the plain statement.
     """
 
-    def __init__(self, plan, *, plane_rows):
+    def __init__(self, plan, *, plane_rows, features=()):
+        unknown = set(features) - set(RESOLVER_FEATURES)
+        if unknown:
+            raise ValueError(f"Unknown resolver feature(s) {sorted(unknown)}")
         self.plan, self.plane_rows, self.status = plan, plane_rows, 0
+        self.features = frozenset(features)
         self._owners, self._order = plan.owner_template(), plan.order_template()
         self.slots = {}
 
@@ -744,10 +770,20 @@ class KernelMirror:
             owner=[FREE_TAG if o is None else owner_tag(generation, o) for o in self._owners],
             token=[row % H for row in range(self.plan.rows)], order=list(self._order),
             occ=[sum(1 for o in self._owners if o == p) for p in range(planes)])
+        if "owner_summary" in self.features:
+            self.slots[slot]["summary"] = owner_summary(self._owners)
 
     def reset_slot(self, slot):
         if slot in self.slots:
-            self.slots[slot]["owner"] = [FREE_TAG] * self.plan.rows
+            state = self.slots[slot]
+            state["owner"] = [FREE_TAG] * self.plan.rows
+            if "summary" in state:
+                state["summary"] = [0] * summary_blocks(self.plan.rows)
+
+    def live_summary(self, slot):
+        """Owner bits recomputed from the tags: what the maintained ``summary`` must equal."""
+        state = self.slots[slot]
+        return owner_summary([None if t < 0 or (t >> 16) != state["gen"] else t & 0xFFFF for t in state["owner"]])
 
     def flat(self, slot, row):
         H = self.plan.hot_rows
@@ -780,9 +816,20 @@ class KernelMirror:
         def is_hit(row):
             return owner[row] == tag and token[row] in uid
 
-        for row in region:
-            if is_hit(row):
-                uid_row[uid[token[row]]] = row
+        if "owner_summary" in self.features:  # physical 32-row blocks whose summary carries the plane's bit
+            summary, end = st["summary"], offset + size
+            for block in range(offset // SUMMARY_ROWS, (end - 1) // SUMMARY_ROWS + 1):
+                if summary[block] >> plane & 1:
+                    for row in range(max(offset, block * SUMMARY_ROWS), min(end, (block + 1) * SUMMARY_ROWS)):
+                        if is_hit(row):
+                            uid_row[uid[token[row]]] = row
+        else:
+            for row in region:
+                if is_hit(row):
+                    uid_row[uid[token[row]]] = row
+        if "touched_bitmap" in self.features:  # later phases test the phase-3 hit set, not the tables
+            hit_rows = {row for row in uid_row if row >= 0}
+            is_hit = hit_rows.__contains__
         hits = sum(r >= 0 for r in uid_row)
         need = len(uid_token) - hits
         victims, old, breaches = [], [], 0
@@ -833,6 +880,11 @@ class KernelMirror:
                 if old[k] is not None:
                     st["occ"][old[k]] -= 1
             st["occ"][plane] += len(miss_uid)
+            if "owner_summary" in self.features:  # recompute every block that received a victim
+                for row in victims:
+                    first = row // SUMMARY_ROWS * SUMMARY_ROWS
+                    block = [owner_index(owner[r]) for r in range(first, min(plan.rows, first + SUMMARY_ROWS))]
+                    st["summary"][row // SUMMARY_ROWS] = owner_summary(block)[0]
         for i, t in enumerate(tokens):
             if t >= 0 and t != newest:
                 out[i] = self.flat(slot, uid_row[uid[t]])
@@ -841,11 +893,21 @@ class KernelMirror:
             touched = [uid_row[u] for u in range(len(uid_row)) if not (bypass and u in missed)]
         else:
             touched = [] if bypass else [uid_row[u] for u in miss_uid]
-        touched_set = set(touched)
-        kept = [row for row in region if row not in touched_set]
-        if len(kept) + len(touched) != size:
-            self.status |= 2
-        order[offset:offset + size] = kept + sorted(touched)
+        if "touched_bitmap" in self.features:  # bit set of the touched rows, appended in bit order
+            bits = set(hit_rows) if plan.eviction == "lru" else set()
+            if not bypass:
+                bits.update(uid_row[u] for u in miss_uid)
+            kept = [row for row in region if row not in bits]
+            appended = [row for row in range(offset, offset + size) if row in bits]
+            if len(kept) + len(touched) != size or len(appended) != len(touched):
+                self.status |= 2
+            order[offset:offset + size] = kept + appended
+        else:
+            touched_set = set(touched)
+            kept = [row for row in region if row not in touched_set]
+            if len(kept) + len(touched) != size:
+                self.status |= 2
+            order[offset:offset + size] = kept + sorted(touched)
         counters.update(unique=len(uid_row), hits=hits, misses=need,
                         bypassed=need if bypass else 0, breaches=breaches)
         return out, copies, counters
@@ -886,24 +948,30 @@ class DirectReader:
 COUNTER_FIELDS = ("unique", "hits", "misses", "bypassed", "bytes", "breaches", "latest", "invalid")
 
 
-def byte_ledger(*, layers, hot_rows, page, item_bytes, slots, pool_rows, plan=None, counters=False):
+def byte_ledger(*, layers, hot_rows, page, item_bytes, slots, pool_rows, plan=None, counters=False,
+                features=()):
     """Estimated per-rank byte categories for one arm; GPU receipts replace them with allocations.
 
     ``pool_rows`` is the row count of one main-KV plane including its padding
     page. Categories are mutually exclusive. Main KV and per-request
     history/tails overlap by construction (the arena reuses native hot slots)
     and are therefore listed under ``overlaps`` instead of being summed.
+    ``owner_summary`` adds one 64-bit word per 32 arena rows for every slot and
+    the template; ``touched_bitmap`` lives in shared memory and adds no HBM.
     """
     L, H = len(layers), hot_rows
     padded = H + page
     native_tables = 2 * L * slots * padded * 4 + L * slots * H * 2   # tokens/locs int32, LRU int16
     arena_tables = 0
     if plan is not None:
-        live_tables = 2 * slots * plan.rows + slots * L + slots + L + 1
-        init_templates = 3 * plan.rows + L
+        order_rows = sum(size for _, size in plan.domains)    # bypass scratch rows have no recency entry
+        live_tables = slots * (plan.rows + order_rows) + slots * L + slots + L + 1
+        init_templates = 2 * plan.rows + order_rows + L
         arena_tables = (live_tables + init_templates) * 4
         if counters:
             arena_tables += L * len(COUNTER_FIELDS) * 8
+        if "owner_summary" in features:
+            arena_tables += (slots + 1) * summary_blocks(plan.rows) * 8
     scratch = 0 if plan is None else plan.scratch[1]
     return dict(
         estimated=True,

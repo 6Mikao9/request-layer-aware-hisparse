@@ -9,6 +9,18 @@
 // arena therefore reuses the request's native lockstep device locations in
 // every plane and allocates no second hot cache. Planes are one contiguous
 // allocation, so the consumer reads index plane * plane_rows + loc.
+//
+// Two engineering switches change how the resolver finds rows, never which rows
+// (features.owner_summary, features.touched_bitmap; each is its own template
+// argument, and off compiles the original statements):
+// * owner_summary keeps, per 32-row block of the arena, the bit set of planes that
+//   own a live row in it. Phase 3 walks physical blocks and reads owner tags only
+//   where the requesting plane's bit is set; publication recomputes the bits of
+//   every block that received a victim.
+// * touched_bitmap marks the rows a call hits and admits in shared memory. The
+//   victim scan and the recency compaction test that bit instead of repeating the
+//   owner/token/hash lookup, compaction runs on multi-entry chunks with uniform
+//   fast paths, and touched rows are appended in bit order instead of being sorted.
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -45,6 +57,9 @@ constexpr int kOwners = kMaxPlanes + 1;
 constexpr int32_t kStatusCapacity = 1;  // fewer eligible victims than misses (capacity preflight forbids)
 constexpr int32_t kStatusOrder = 2;     // recency list would lose or duplicate a row
 constexpr int kNumCounters = 8;         // unique, hits, misses, bypassed, bytes, breaches, latest, invalid
+constexpr int kSummaryRows = 32;        // arena rows per owner-summary block: one warp lane per row
+constexpr int kSummaryUnroll = 4;       // summary blocks whose owner tags one warp loads together
+constexpr int kCompactUnroll = 8;       // recency entries each thread loads per compaction chunk
 struct Params {
   const int32_t* top_k;             // [B, NUM_TOP_K] selector blocks, -1 invalid
   int64_t top_k_stride;
@@ -74,11 +89,14 @@ struct Params {
   int64_t out_stride;
   int32_t* status;                  // [1] sticky error bits
   unsigned long long* counters;     // [planes, kNumCounters] when diagnostics are on
+  unsigned long long* owner_summary;  // [slots, ceil(planes * H / 32)] owner-plane bits per block (owner_summary)
+  int64_t summary_slot_stride;
   int64_t plane_rows;
   int64_t item_size_bytes;
   int32_t plane;
   int32_t num_planes;
   int32_t hot_rows;
+  int32_t arena_rows;
   int32_t order_offset;
   int32_t order_size;
   int32_t scratch_offset;
@@ -93,6 +111,11 @@ struct SmemLayout {
   static constexpr int I32 = 6 * N + 2 * HASH + (WARPS + 1) + 8 + kOwners + WARPS * kOwners;
   static constexpr int I16 = 2 * N;
   static constexpr size_t BYTES = I32 * sizeof(int32_t) + I16 * sizeof(int16_t) + N * sizeof(uint8_t);
+  // touched_bitmap: one bit per domain row after the fixed layout (size depends on the domain).
+  static constexpr size_t BITMAP_OFFSET = (BYTES + 15) / 16 * 16;
+  static constexpr size_t bytes_with_bitmap(int64_t domain_rows) {
+    return BITMAP_OFFSET + static_cast<size_t>((domain_rows + 31) / 32) * sizeof(uint32_t);
+  }
 };
 // Exclusive prefix sum over the CTA in thread order. Every thread must call it.
 template <int BLOCK_SIZE>
@@ -166,6 +189,17 @@ __device__ __forceinline__ int32_t* token_of(const Params& p, int64_t rid, int32
          rid * p.token_slot_stride + row % p.hot_rows;
 }
 
+// Shared-memory bit set over domain-relative row indices (touched_bitmap).
+__device__ __forceinline__ bool bit_test(const uint32_t* bits, int index) {
+  return (bits[index >> 5] >> (index & 31)) & 1u;
+}
+__device__ __forceinline__ void bit_set(uint32_t* bits, int index) {
+  atomicOr(&bits[index >> 5], 1u << (index & 31));
+}
+__device__ __forceinline__ void bit_clear(uint32_t* bits, int index) {
+  atomicAnd(&bits[index >> 5], ~(1u << (index & 31)));
+}
+
 template <int N, int BLOCK_SIZE>
 __device__ __forceinline__ void bitonic_sort(int32_t* data) {
   for (int k = 2; k <= N; k <<= 1) {
@@ -193,6 +227,8 @@ template <
     bool kSoftFloor,
     bool kBypass,
     bool kCounters,
+    bool kOwnerSummary,
+    bool kTouchedBitmap,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_kernel(const Params p) {
@@ -245,9 +281,14 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_kernel(const Params p) 
   int16_t* s_pos_hslot = reinterpret_cast<int16_t*>(s_owner_tab + WARPS * kOwners);
   int16_t* s_victim_old = s_pos_hslot + N;
   uint8_t* s_uid_miss = reinterpret_cast<uint8_t*>(s_victim_old + N);
+  uint32_t* s_touched = reinterpret_cast<uint32_t*>(smem_raw + SmemLayout<N, BLOCK_SIZE>::BITMAP_OFFSET);
+  const int bitmap_words = (p.order_size + 31) / 32;  // allocated only by touched_bitmap launches
   for (int i = tid; i < HASH; i += BLOCK_SIZE) {
     s_hash_key[i] = kHashEmpty;
     s_hash_val[i] = INT_MAX;
+  }
+  if constexpr (kTouchedBitmap) {
+    for (int w = tid; w < bitmap_words; w += BLOCK_SIZE) s_touched[w] = 0u;
   }
   if (tid < 8) s_vars[tid] = 0;
   __syncthreads();
@@ -311,18 +352,67 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_kernel(const Params p) 
   auto owner_index = [&](int32_t tag) -> int {
     return (tag < 0 || (tag >> 16) != gen) ? kFreeOwner : (tag & 0xFFFF);
   };
+  auto record_hit = [&](int u, int32_t row) {
+    s_uid_row[u] = row;
+    atomicAdd(&s_vars[0], 1);
+    if constexpr (kTouchedBitmap) bit_set(s_touched, row - p.order_offset);
+  };
 
   // Phase 3: snapshot every hit of the complete selection before choosing any victim.
-  for (int j = tid; j < p.order_size; j += BLOCK_SIZE) {
-    const int32_t row = region[j];
-    const int u = lookup(row);
-    if (u >= 0) {
-      s_uid_row[u] = row;
-      atomicAdd(&s_vars[0], 1);
+  if constexpr (kOwnerSummary) {
+    // owner_summary: the domain's rows are one contiguous range. Walk it in 32-row blocks and read
+    // owner tags only where the block's summary has this plane's bit; summaries cover every live
+    // row, so this finds exactly the rows the recency-list walk would find.
+    const unsigned long long* summary = p.owner_summary + rid * p.summary_slot_stride;
+    const unsigned long long plane_bit = 1ull << p.plane;
+    const int lo = p.order_offset;
+    const int hi = p.order_offset + p.order_size;
+    const int last = (hi - 1) / kSummaryRows;
+    for (int b0 = lo / kSummaryRows + warp * WARP_SIZE; b0 <= last; b0 += WARPS * WARP_SIZE) {
+      const int b = b0 + lane;
+      unsigned pending = __ballot_sync(FULL_WARP_MASK, b <= last && (summary[b] & plane_bit) != 0ull);
+      while (pending != 0u) {  // warp-uniform; owner tags and reverse tokens of up to kSummaryUnroll
+                               // blocks load together (for H % 32 == 0 a block lies in one plane)
+        int32_t row[kSummaryUnroll];
+        int32_t tag[kSummaryUnroll];
+        int32_t token[kSummaryUnroll];
+#pragma unroll
+        for (int q = 0; q < kSummaryUnroll; ++q) {
+          row[q] = -1;
+          if (pending != 0u) {
+            const int r = (b0 + __ffs(pending) - 1) * kSummaryRows + lane;
+            pending &= pending - 1u;
+            if (r >= lo && r < hi) row[q] = r;
+          }
+          tag[q] = row[q] >= 0 ? owner[row[q]] : kFreeTag;
+          token[q] = row[q] >= 0 ? *token_of(p, rid, row[q]) : kHashEmpty;
+        }
+#pragma unroll
+        for (int q = 0; q < kSummaryUnroll; ++q) {
+          if (tag[q] == my_tag) {
+            const int slot = hash_find<HASH>(s_hash_key, token[q]);
+            if (slot >= 0) record_hit(s_hash_val[slot], row[q]);
+          }
+        }
+      }
+    }
+  } else {
+    for (int j = tid; j < p.order_size; j += BLOCK_SIZE) {
+      const int32_t row = region[j];
+      const int u = lookup(row);
+      if (u >= 0) record_hit(u, row);
     }
   }
   __syncthreads();
   const int need = unique - s_vars[0];
+  // A domain row holds a selected token of this layer: the phase-3 hits.
+  auto is_hit = [&](int32_t row) -> bool {
+    if constexpr (kTouchedBitmap) {
+      return bit_test(s_touched, row - p.order_offset);
+    } else {
+      return lookup(row) >= 0;
+    }
+  };
 
   // Phase 4: ordered victim scan of the domain list (free rows lead it). A floor-aware pass
   // takes a row only while its owner keeps more rows than its soft floor.
@@ -336,7 +426,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_kernel(const Params p) 
       if (j < p.order_size) {
         row = region[j];
         const int32_t tag = owner[row];
-        candidate = tag != kTakenTag && lookup(row) < 0;
+        candidate = tag != kTakenTag && !is_hit(row);
         owner_idx = owner_index(tag);
       }
       bool accept = candidate;
@@ -456,6 +546,19 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_kernel(const Params p) 
     if (tid == 0 && need > 0) atomicAdd(&occupancy[p.plane], need);
   }
   __syncthreads();
+  if constexpr (kOwnerSummary && !kBypass) {
+    // owner_summary: recompute every block that received a victim from the published tags, so a
+    // block's bits stay exactly the planes owning a live row in it (the new owner included).
+    unsigned long long* summary = p.owner_summary + rid * p.summary_slot_stride;
+    for (int k = warp; k < need; k += WARPS) {
+      const int b = s_victim_row[k] / kSummaryRows;
+      const int r = b * kSummaryRows + lane;
+      const int o = r < p.arena_rows ? owner_index(owner[r]) : kFreeOwner;
+      const unsigned low = __reduce_or_sync(FULL_WARP_MASK, o < 32 ? 1u << o : 0u);
+      const unsigned high = __reduce_or_sync(FULL_WARP_MASK, o >= 32 && o < kMaxPlanes ? 1u << (o - 32) : 0u);
+      if (lane == 0) summary[b] = (static_cast<unsigned long long>(high) << 32) | low;
+    }
+  }
 
   // Phase 8: fill the consumer table in the original selection order.
   for (int i = tid; i < N; i += BLOCK_SIZE) {
@@ -465,43 +568,140 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_kernel(const Params p) 
 
   // Phase 9: recency. Untouched rows keep their order; touched rows move to the end by row ID
   // (LRU: hits and admitted misses, FIFO: admitted misses only).
-  for (int i = tid; i < N; i += BLOCK_SIZE) {
-    int32_t value = INT_MAX;
-    if (i < unique) {
-      const bool miss = s_uid_miss[i] != 0;
-      const bool touched = kFifo ? (miss && !kBypass) : !(miss && kBypass);
-      if (touched) {
-        value = s_uid_row[i];
-        atomicAdd(&s_vars[4], 1);
+  if constexpr (kTouchedBitmap) {
+    // touched_bitmap: the bitmap holds the hits; turn it into the touched set.
+    for (int u = tid; u < unique; u += BLOCK_SIZE) {
+      const bool miss = s_uid_miss[u] != 0;
+      if (miss && !kBypass) bit_set(s_touched, s_uid_row[u] - p.order_offset);
+      if (!miss && kFifo) bit_clear(s_touched, s_uid_row[u] - p.order_offset);
+      if (kFifo ? (miss && !kBypass) : !(miss && kBypass)) atomicAdd(&s_vars[4], 1);
+    }
+    __syncthreads();
+    // Stable in-place compaction in chunks of kCompactUnroll entries per thread. A chunk without a
+    // touched row is left in place (or shifted as a whole) without a scan. Every write goes to an
+    // index <= the entry's own, and every read of a chunk precedes its first barrier.
+    constexpr int CHUNK = BLOCK_SIZE * kCompactUnroll;
+    constexpr int COUNTS = kCompactUnroll * WARPS;  // kept entries per (sub-chunk, warp), list order
+    constexpr int SEGMENT = (COUNTS + WARP_SIZE - 1) / WARP_SIZE;
+    static_assert(COUNTS + 1 <= WARPS * kOwners, "chunk counts reuse the floor-aware owner table");
+    int32_t* s_count = s_owner_tab;
+    int write = 0;
+    for (int start = 0; start < p.order_size; start += CHUNK) {
+      int32_t row[kCompactUnroll];
+      bool keep[kCompactUnroll];
+      int removed = 0;
+#pragma unroll
+      for (int k = 0; k < kCompactUnroll; ++k) {
+        const int j = start + k * BLOCK_SIZE + tid;
+        row[k] = j < p.order_size ? region[j] : -1;
       }
+#pragma unroll
+      for (int k = 0; k < kCompactUnroll; ++k) {
+        keep[k] = row[k] >= 0 && !bit_test(s_touched, row[k] - p.order_offset);
+        removed += row[k] >= 0 && !keep[k] ? 1 : 0;
+      }
+      const int entries = min(CHUNK, p.order_size - start);
+      if (__syncthreads_or(removed) == 0) {
+        if (write != start) {
+#pragma unroll
+          for (int k = 0; k < kCompactUnroll; ++k) {
+            if (row[k] >= 0) region[write + k * BLOCK_SIZE + tid] = row[k];
+          }
+        }
+        write += entries;
+        continue;
+      }
+      int rank[kCompactUnroll];
+#pragma unroll
+      for (int k = 0; k < kCompactUnroll; ++k) {  // list order inside a chunk is (k, warp, lane)
+        const unsigned kept = __ballot_sync(FULL_WARP_MASK, keep[k]);
+        rank[k] = __popc(kept & ((1u << lane) - 1u));
+        if (lane == 0) s_count[k * WARPS + warp] = __popc(kept);
+      }
+      __syncthreads();
+      if (warp == 0) {  // exclusive prefix of the counts; s_count[COUNTS] is the chunk total
+        const int first = min(COUNTS, lane * SEGMENT);
+        const int end = min(COUNTS, first + SEGMENT);
+        int sum = 0;
+        for (int i = first; i < end; ++i) sum += s_count[i];
+        int prefix = sum;
+#pragma unroll
+        for (int d = 1; d < WARP_SIZE; d <<= 1) {
+          const int n = __shfl_up_sync(FULL_WARP_MASK, prefix, d);
+          if (lane >= d) prefix += n;
+        }
+        if (lane == WARP_SIZE - 1) s_count[COUNTS] = prefix;
+        int running = prefix - sum;
+        for (int i = first; i < end; ++i) {
+          const int count = s_count[i];
+          s_count[i] = running;
+          running += count;
+        }
+      }
+      __syncthreads();
+#pragma unroll
+      for (int k = 0; k < kCompactUnroll; ++k) {
+        if (keep[k]) region[write + s_count[k * WARPS + warp] + rank[k]] = row[k];
+      }
+      write += s_count[COUNTS];
     }
-    s_sort[i] = value;
-  }
-  __syncthreads();
-  bitonic_sort<N, BLOCK_SIZE>(s_sort);
-  for (int start = 0; start < p.order_size; start += BLOCK_SIZE) {
-    const int j = start + tid;
-    int32_t row = -1;
-    bool keep = false;
-    if (j < p.order_size) {
-      row = region[j];
-      const int u = lookup(row);
-      keep = !(u >= 0 && (!kFifo || s_uid_miss[u] != 0));
+    // Touched rows in ascending row ID are the set bits in index order: no sort.
+    const int per = (bitmap_words + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int w_begin = min(bitmap_words, tid * per);
+    const int w_end = min(bitmap_words, w_begin + per);
+    int mine = 0;
+    for (int w = w_begin; w < w_end; ++w) mine += __popc(s_touched[w]);
+    int set_bits = 0;
+    int position = write + block_exclusive_scan<BLOCK_SIZE>(mine, s_scan, set_bits);
+    const int touched = s_vars[4];
+    if (write + touched == p.order_size && set_bits == touched) {
+      for (int w = w_begin; w < w_end; ++w) {
+        for (unsigned bits = s_touched[w]; bits != 0u; bits &= bits - 1u) {
+          region[position++] = p.order_offset + w * 32 + __ffs(bits) - 1;
+        }
+      }
+    } else if (tid == 0) {
+      atomicOr(p.status, kStatusOrder);
     }
-    int kept = 0;
-    const int position = block_exclusive_scan<BLOCK_SIZE>(keep ? 1 : 0, s_scan, kept);
+  } else {
+    for (int i = tid; i < N; i += BLOCK_SIZE) {
+      int32_t value = INT_MAX;
+      if (i < unique) {
+        const bool miss = s_uid_miss[i] != 0;
+        const bool touched = kFifo ? (miss && !kBypass) : !(miss && kBypass);
+        if (touched) {
+          value = s_uid_row[i];
+          atomicAdd(&s_vars[4], 1);
+        }
+      }
+      s_sort[i] = value;
+    }
+    __syncthreads();
+    bitonic_sort<N, BLOCK_SIZE>(s_sort);
+    for (int start = 0; start < p.order_size; start += BLOCK_SIZE) {
+      const int j = start + tid;
+      int32_t row = -1;
+      bool keep = false;
+      if (j < p.order_size) {
+        row = region[j];
+        const int u = lookup(row);
+        keep = !(u >= 0 && (!kFifo || s_uid_miss[u] != 0));
+      }
+      int kept = 0;
+      const int position = block_exclusive_scan<BLOCK_SIZE>(keep ? 1 : 0, s_scan, kept);
+      const int write = s_vars[2];
+      if (keep) region[write + position] = row;  // write index <= j: in-place stable compaction
+      __syncthreads();
+      if (tid == 0) s_vars[2] = write + kept;
+      __syncthreads();
+    }
     const int write = s_vars[2];
-    if (keep) region[write + position] = row;  // write index <= j: in-place stable compaction
-    __syncthreads();
-    if (tid == 0) s_vars[2] = write + kept;
-    __syncthreads();
-  }
-  const int write = s_vars[2];
-  const int touched = s_vars[4];
-  if (write + touched == p.order_size) {
-    for (int k = tid; k < touched; k += BLOCK_SIZE) region[write + k] = s_sort[k];
-  } else if (tid == 0) {
-    atomicOr(p.status, kStatusOrder);
+    const int touched = s_vars[4];
+    if (write + touched == p.order_size) {
+      for (int k = tid; k < touched; k += BLOCK_SIZE) region[write + k] = s_sort[k];
+    } else if (tid == 0) {
+      atomicOr(p.status, kStatusOrder);
+    }
   }
 
   if constexpr (kCounters) {
@@ -518,16 +718,22 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_kernel(const Params p) 
     }
   }
 }
-template <auto kKernel, int BLOCK_SIZE, size_t kSmem>
-inline void launch(DLDevice device, int64_t batch, const Params& params) {
-  if constexpr (kSmem > 48u * 1024u) {
-    host::runtime::set_max_dynamic_smem_per_device<kKernel>(device, kSmem);
-  }
-  host::LaunchKernel(batch, BLOCK_SIZE, host::LaunchKernel::resolve_device(device), kSmem)(kKernel, params);
-}
-
 [[noreturn]] inline void reject(const char* message) {
   throw std::runtime_error(std::string("rlh_shared_lru::resolve: ") + message);
+}
+
+// kRuntimeSmem (touched_bitmap): the bitmap grows with the domain, so the kernel opts in once to the
+// device's shared-memory limit and every launch checks its own size against it.
+template <auto kKernel, int BLOCK_SIZE, size_t kSmem, bool kRuntimeSmem>
+inline void launch(DLDevice device, int64_t batch, const Params& params, size_t smem) {
+  if constexpr (kRuntimeSmem) {
+    const size_t limit = host::runtime::get_max_smem_per_block(device.device_id);
+    if (smem > limit) reject("the touched-row bitmap of this domain exceeds the device shared memory");
+    host::runtime::set_max_dynamic_smem_per_device<kKernel>(device, limit);
+  } else if constexpr (kSmem > 48u * 1024u) {
+    host::runtime::set_max_dynamic_smem_per_device<kKernel>(device, kSmem);
+  }
+  host::LaunchKernel(batch, BLOCK_SIZE, host::LaunchKernel::resolve_device(device), smem)(kKernel, params);
 }
 
 // Host entry point. Shapes and dtypes are validated in Python before capture; the checks
@@ -539,7 +745,9 @@ template <
     bool kFifo,
     bool kSoftFloor,
     bool kBypass,
-    bool kCounters>
+    bool kCounters,
+    bool kOwnerSummary,
+    bool kTouchedBitmap>
 void resolve(
     tvm::ffi::TensorView top_k,
     tvm::ffi::TensorView req_pool_indices,
@@ -560,6 +768,7 @@ void resolve(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView status,
     tvm::ffi::TensorView counters,
+    tvm::ffi::TensorView owner_summary,
     int64_t plane,
     int64_t num_planes,
     int64_t hot_rows,
@@ -586,8 +795,8 @@ void resolve(
     reject("row_token must be the native [planes, slots, H + page] token table");
   }
   if (row_owner.ndim() != 2 || row_owner.shape()[1] != arena_rows || order.ndim() != 2 ||
-      order.shape()[1] != arena_rows || occupancy.ndim() != 2 || occupancy.shape()[1] != num_planes) {
-    reject("arena tables must be [slots, planes * H] and [slots, planes]");
+      order.shape()[1] < order_offset + order_size || occupancy.ndim() != 2 || occupancy.shape()[1] != num_planes) {
+    reject("arena tables must be [slots, planes * H], [slots, >= domain end] and [slots, planes]");
   }
   if (device_locs.ndim() != 2 || device_locs.shape()[1] <= hot_rows || host_locs.ndim() != 2) {
     reject("location tables must be [slots, H + page] and [slots, context]");
@@ -602,6 +811,12 @@ void resolve(
   }
   if (kCounters && (counters.ndim() != 2 || counters.shape()[0] != num_planes || counters.shape()[1] != kNumCounters)) {
     reject("counters must be [planes, 8] int64");
+  }
+  const int64_t summary_blocks = (arena_rows + kSummaryRows - 1) / kSummaryRows;
+  if (kOwnerSummary && (owner_summary.ndim() != 2 || owner_summary.shape()[0] != row_owner.shape()[0] ||
+                        owner_summary.shape()[1] != summary_blocks || owner_summary.strides()[1] != 1 ||
+                        owner_summary.dtype().bits != 64)) {
+    reject("owner_summary must be [slots, ceil(planes * H / 32)] 64-bit words");
   }
   if (batch == 0) return;
 
@@ -634,25 +849,30 @@ void resolve(
   params.out_stride = out.strides()[0];
   params.status = static_cast<int32_t*>(status.data_ptr());
   params.counters = kCounters ? static_cast<unsigned long long*>(counters.data_ptr()) : nullptr;
+  params.owner_summary = kOwnerSummary ? static_cast<unsigned long long*>(owner_summary.data_ptr()) : nullptr;
+  params.summary_slot_stride = kOwnerSummary ? owner_summary.strides()[0] : 0;
   params.plane_rows = plane_rows;
   params.item_size_bytes = item_size_bytes;
   params.plane = static_cast<int32_t>(plane);
   params.num_planes = static_cast<int32_t>(num_planes);
   params.hot_rows = static_cast<int32_t>(hot_rows);
+  params.arena_rows = static_cast<int32_t>(arena_rows);
   params.order_offset = static_cast<int32_t>(order_offset);
   params.order_size = static_cast<int32_t>(order_size);
   params.scratch_offset = static_cast<int32_t>(scratch_offset);
+  const size_t smem = kTouchedBitmap ? SmemLayout<N, BLOCK_SIZE>::bytes_with_bitmap(order_size) : kSmem;
   const auto device = top_k.device();
   const auto seq_dtype = seq_lens.dtype();
   const auto rpi_dtype = req_pool_indices.dtype();
   const bool seq_is_i64 = seq_dtype.code == kDLInt && seq_dtype.bits == 64;
   const bool rpi_is_i64 = rpi_dtype.code == kDLInt && rpi_dtype.bits == 64;
-#define RLH_SHARED_LRU_LAUNCH(SEQ_T, RPI_T)                                                               \
-  launch<                                                                                                 \
-      resolve_kernel<BLOCK_SIZE, NUM_TOP_K, SPARSE_BLOCK_SIZE, kFifo, kSoftFloor, kBypass, kCounters, SEQ_T, \
-                     RPI_T>,                                                                              \
-      BLOCK_SIZE,                                                                                         \
-      kSmem>(device, batch, params)
+#define RLH_SHARED_LRU_LAUNCH(SEQ_T, RPI_T)                                                                     \
+  launch<                                                                                                       \
+      resolve_kernel<BLOCK_SIZE, NUM_TOP_K, SPARSE_BLOCK_SIZE, kFifo, kSoftFloor, kBypass, kCounters,          \
+                     kOwnerSummary, kTouchedBitmap, SEQ_T, RPI_T>,                                              \
+      BLOCK_SIZE,                                                                                               \
+      kSmem,                                                                                                    \
+      kTouchedBitmap>(device, batch, params, smem)
   if (seq_is_i64 && rpi_is_i64) {
     RLH_SHARED_LRU_LAUNCH(int64_t, int64_t);
   } else if (seq_is_i64) {

@@ -123,6 +123,37 @@ class StudyConfigParser(unittest.TestCase):
         self.assertTrue(sc.unsupported_reasons(counters))
         self.assertEqual(sc.unsupported_reasons(parse(dict(SHARED, diagnostics={"mode": "counters"}))), [])
 
+    def test_resolver_switches_are_arena_only_and_canonical_when_enabled(self):
+        self.assertEqual(sc.FEATURES, ("owner_summary", "touched_bitmap"))
+        for name in sc.FEATURES:
+            on = parse(dict(SHARED, features={name: True}))
+            with self.subTest(feature=name):
+                self.assertTrue(on.feature(name))
+                self.assertEqual(sc.unsupported_reasons(on), [])
+                self.assertEqual(on.as_dict()["features"], {name: True})
+                self.assertNotEqual(on.digest, parse(SHARED).digest)
+                caps = sc.capabilities(on)
+                self.assertEqual(caps["features"], {n: n == name for n in sc.FEATURES})
+                self.assertTrue(caps["hit_search" if name == "owner_summary" else "recency_update"]
+                                .startswith(name))
+                for value in (with_pool(), with_pool(mode="isolated", layout="native")):
+                    with self.assertRaisesRegex(ValueError, "layout=native"):
+                        parse(dict(value, features={name: True}))
+                with self.assertRaises(ValueError):
+                    parse(dict(SHARED, features={name: 1}))
+        # false and absent are one configuration, including the all-default stock arm
+        self.assertEqual(parse(dict(SHARED, features={"owner_summary": False})).digest, parse(SHARED).digest)
+        stock = parse({"schema": sc.SCHEMA, "features": {"touched_bitmap": False}})
+        self.assertTrue(stock.is_native)
+        self.assertEqual(sc.capabilities(stock)["features"], {})
+        both = parse(dict(SHARED, features={"touched_bitmap": True, "owner_summary": True}))
+        self.assertEqual(both.features, (("owner_summary", True), ("touched_bitmap", True)))
+        self.assertEqual(parse(both.canonical()), both)
+        isolated = parse(dict(with_pool(mode="isolated", layout="arena"), features={"owner_summary": True}))
+        self.assertTrue(isolated.feature("owner_summary") and not isolated.feature("touched_bitmap"))
+        with self.assertRaises(KeyError):
+            both.feature("zero_miss_fast_path")
+
     def test_canonical_digest_and_file_pin(self):
         a = parse(json.dumps({"hot_pool": {"layout": "arena", "mode": "shared"}, "schema": sc.SCHEMA}, indent=3))
         b = parse(SHARED)

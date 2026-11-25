@@ -22,20 +22,38 @@ from . import study_config as sc
 
 SPEC_SCHEMA = "shared-lru-plan-spec-v1"
 PLAN_SCHEMA = "shared-lru-paired-plan-v1"
-# (arm, hot_pool fields, control arm, fields expected to differ from the control)
+SHARED = {"mode": "shared", "layout": "arena"}
+SWITCHES = {"owner_summary": True, "touched_bitmap": True}
+# (arm, hot_pool fields, features)
 ARMS = (
-    ("stock", {}, None, ()),
-    ("isolated_arena", {"layout": "arena"}, "stock", ("hot_pool.layout",)),
-    ("isolated_static", {"layout": "arena", "quota": "static", "quota_rows": "static_quota_rows"},
-     "isolated_arena", ("hot_pool.quota", "hot_pool.quota_rows")),
-    ("shared_lru", {"mode": "shared", "layout": "arena"}, "isolated_arena", ("hot_pool.mode",)),
-    ("shared_fifo", {"mode": "shared", "layout": "arena", "eviction": "fifo"}, "shared_lru",
-     ("hot_pool.eviction",)),
-    ("shared_soft_floor", {"mode": "shared", "layout": "arena", "quota": "soft_floor", "floor_rows": "floor_rows"},
-     "shared_lru", ("hot_pool.floor_rows", "hot_pool.quota")),
-    ("shared_bypass", {"mode": "shared", "layout": "arena", "admission": "bypass_list",
-                       "bypass_layers": "bypass_layers"}, "shared_lru",
-     ("hot_pool.admission", "hot_pool.bypass_layers")),
+    ("stock", {}, {}),
+    ("isolated_arena", {"layout": "arena"}, {}),
+    ("isolated_static", {"layout": "arena", "quota": "static", "quota_rows": "static_quota_rows"}, {}),
+    ("shared_lru", SHARED, {}),
+    ("shared_fifo", dict(SHARED, eviction="fifo"), {}),
+    ("shared_soft_floor", dict(SHARED, quota="soft_floor", floor_rows="floor_rows"), {}),
+    ("shared_bypass", dict(SHARED, admission="bypass_list", bypass_layers="bypass_layers"), {}),
+    ("shared_lru_owner_summary", SHARED, {"owner_summary": True}),
+    ("shared_lru_touched_bitmap", SHARED, {"touched_bitmap": True}),
+    ("shared_lru_optimized", SHARED, SWITCHES),
+    ("isolated_arena_optimized", {"layout": "arena"}, SWITCHES),
+)
+BOTH = ("features.owner_summary", "features.touched_bitmap")
+# (control, candidate, fields expected to differ). Each resolver switch is measured alone and then
+# combined at a fixed algorithm; algorithms are then compared at the same engineering level.
+PAIRS = (
+    ("stock", "isolated_arena", ("hot_pool.layout",)),
+    ("isolated_arena", "isolated_static", ("hot_pool.quota", "hot_pool.quota_rows")),
+    ("isolated_arena", "shared_lru", ("hot_pool.mode",)),
+    ("shared_lru", "shared_fifo", ("hot_pool.eviction",)),
+    ("shared_lru", "shared_soft_floor", ("hot_pool.floor_rows", "hot_pool.quota")),
+    ("shared_lru", "shared_bypass", ("hot_pool.admission", "hot_pool.bypass_layers")),
+    ("shared_lru", "shared_lru_owner_summary", ("features.owner_summary",)),
+    ("shared_lru", "shared_lru_touched_bitmap", ("features.touched_bitmap",)),
+    ("shared_lru", "shared_lru_optimized", BOTH),
+    ("isolated_arena", "isolated_arena_optimized", BOTH),
+    ("isolated_arena_optimized", "shared_lru_optimized", ("hot_pool.mode",)),
+    ("stock", "shared_lru_optimized", BOTH + ("hot_pool.layout", "hot_pool.mode")),
 )
 SPEC_KEYS = {"schema", "seed", "split", "geometry", "static_quota_rows", "floor_rows", "bypass_layers",
              "pressure_points", "repeats", "upstream_args", "sm80_bf16_projections"}
@@ -85,7 +103,7 @@ def read_spec(path):
 def arm_configs(spec):
     """Study config per arm; arms whose frozen inputs are absent are skipped with a reason."""
     configs, skipped = {}, {}
-    for name, fields, _, _ in ARMS:
+    for name, fields, features in ARMS:
         pool = {}
         for key, value in fields.items():
             if value in ("static_quota_rows", "floor_rows", "bypass_layers"):
@@ -95,7 +113,12 @@ def arm_configs(spec):
                 value = spec[value]
             pool[key] = value
         else:
-            configs[name] = sc.parse({"schema": sc.SCHEMA, "hot_pool": pool} if pool else {"schema": sc.SCHEMA})
+            data = {"schema": sc.SCHEMA}
+            if pool:
+                data["hot_pool"] = pool
+            if features:
+                data["features"] = dict(features)
+            configs[name] = sc.parse(data)
     return configs, skipped
 class PlanError(ValueError):
     pass
@@ -118,7 +141,7 @@ def compile_plan(spec, spec_digest, output_dir, replay_results=()):
         plane_rows=g["plane_rows"])
     configs, skipped = arm_configs(spec)
     arms, errors = {}, []
-    for name, _, control, expected in ARMS:
+    for name, _, _ in ARMS:
         if name not in configs:
             continue
         config = configs[name]
@@ -126,8 +149,11 @@ def compile_plan(spec, spec_digest, output_dir, replay_results=()):
                 if config.uses_arena else None)
         ledger = reference.byte_ledger(layers=geo["layers"], hot_rows=geo["hot_rows"], page=geo["page"],
                                        item_bytes=geo["item_size_bytes"], slots=geo["slots"],
-                                       pool_rows=geo["plane_rows"], plan=plan)
-        arms[name] = dict(config=config, plan=plan, ledger=ledger, control=control, expected=tuple(sorted(expected)))
+                                       pool_rows=geo["plane_rows"], plan=plan,
+                                       features=[feature for feature, _ in config.features])
+        if plan is not None:
+            device.check_shared_memory(config, plan)
+        arms[name] = dict(config=config, plan=plan, ledger=ledger)
     stock = arms["stock"]["ledger"]
     for name, arm in arms.items():  # equal-byte contract: same main KV, same history rows per request
         if (arm["ledger"]["main_kv_bytes"], arm["ledger"]["per_request"]["history_rows"]) != (
@@ -137,16 +163,16 @@ def compile_plan(spec, spec_digest, output_dir, replay_results=()):
         if plan is not None and sum(size for _, size in plan.domains) + plan.scratch[1] != plan.rows:
             errors.append(f"{name}: domains and scratch do not partition the arena")
     pairs = []
-    for name, arm in arms.items():
-        if arm["control"] is None:
+    for control, candidate, expected in PAIRS:
+        if candidate not in arms:
+            continue                     # the arm itself is listed in skipped with its reason
+        if control not in arms:
+            skipped[f"{control}->{candidate}"] = f"control {control} was skipped"
             continue
-        if arm["control"] not in arms:
-            skipped[name] = f"control {arm['control']} was skipped"
-            continue
-        actual = changed_fields(arms[arm["control"]]["config"], arm["config"])
-        if actual != arm["expected"]:
-            errors.append(f"{name} vs {arm['control']}: changed {list(actual)}, expected {list(arm['expected'])}")
-        pairs.append(dict(control=arm["control"], candidate=name, changed_fields=list(actual)))
+        actual = changed_fields(arms[control]["config"], arms[candidate]["config"])
+        if actual != tuple(sorted(expected)):
+            errors.append(f"{candidate} vs {control}: changed {list(actual)}, expected {sorted(expected)}")
+        pairs.append(dict(control=control, candidate=candidate, changed_fields=list(actual)))
     digests = {json.loads(Path(p).read_text())["selection_sha256"] for p in replay_results}
     if len(digests) > 1:
         errors.append(f"replay results used different selections: {sorted(digests)}")

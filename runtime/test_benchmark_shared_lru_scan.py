@@ -3,9 +3,11 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from runtime.benchmark_shared_lru_scan import Case, main, selected_blocks
-from runtime.cuda_shared_lru_correctness import Geometry
+from runtime import shared_lru as s
+from runtime.benchmark_shared_lru_scan import LAYOUTS, Case, main, owner_summary_words, selected_blocks
+from runtime.cuda_shared_lru_correctness import FEATURE_SETS, Geometry
 from runtime.cuda_shared_lru_production_correctness import GEOMETRY
 
 try:
@@ -92,6 +94,57 @@ class FixtureTests(unittest.TestCase):
         case.out[0, -1] = case.out[1, -1]
         with self.assertRaisesRegex(RuntimeError, "wrong request"):
             case.verify()
+
+
+@unittest.skipIf(torch is None, "requires CPU torch")
+class SwitchProbeTests(unittest.TestCase):
+    """The probe's switch comparison on CPU: the launch is KernelMirror behind the kernel ABI."""
+
+    def setUp(self):
+        self.g = Geometry(layers=4, hot=32, page=4, slots=2, blocks=2, block=4, dim=8, context=64)
+
+    def launch_with_mirror(self, case):
+        from runtime import shared_lru_device as device
+        from runtime.test_shared_lru_gate import Emulator
+        features = tuple(name for name, _ in case.runtime.config.features)
+        jit = lambda *variant: Emulator(case.runtime.plan, variant[1], variant[2], variant[5], features)
+        with patch.object(device, "_jit_module", jit):
+            case.launch()
+
+    def test_switch_sets_reproduce_the_switches_off_state_on_both_layouts(self):
+        for arm in ("isolated", "shared"):
+            for layout in LAYOUTS:
+                for misses in (0, 1, 2):
+                    states = {}
+                    for name, features in FEATURE_SETS.items():
+                        with self.subTest(arm=arm, layout=layout, misses=misses, features=name):
+                            case = Case(torch, arm, self.g, misses, device="cpu", features=features, layout=layout)
+                            self.launch_with_mirror(case)
+                            self.assertEqual(case.verify(), dict(hits=16 - 8 * misses, misses=8 * misses))
+                            states[name] = case.state_sha256()
+                            case.reset()
+                            self.launch_with_mirror(case)                     # replay from the restored state
+                            self.assertEqual(case.state_sha256(), states[name])
+                    self.assertEqual(len(set(states.values())), 1, f"{arm}/{layout}/{misses}: {states}")
+
+    def test_fragmented_layout_scatters_every_layer_and_keeps_the_summary_exact(self):
+        contiguous = Case(torch, "shared", self.g, 0, device="cpu", features=("owner_summary",))
+        case = Case(torch, "shared", self.g, 0, device="cpu", features=("owner_summary",), layout="fragmented")
+        self.assertEqual(contiguous.home.tolist(), list(range(96, 128)))
+        self.assertGreater(len(set((case.home // 32).tolist())), 2, "measured layer stayed in its home blocks")
+        r = case.runtime
+        planes = [[None if t < 0 else t & 0xFFFF for t in r.row_owner[slot].tolist()] for slot in range(2)]
+        self.assertEqual(sorted(p for p in planes[0] if p is not None), sorted(r.plan.owner_template()))
+        words = [[w & (2**64 - 1) for w in r.owner_summary[slot].tolist()] for slot in range(2)]
+        self.assertEqual(words, [s.owner_summary(p) for p in planes])
+        self.assertTrue(any(bin(w).count("1") > 1 for w in words[0]), "blocks still hold a single layer")
+        self.assertTrue(torch.equal(owner_summary_words(torch, r.row_owner, r.generation, 4), r.owner_summary))
+        for slot in range(2):                             # recency positions follow the moved rows
+            self.assertEqual(sorted(r.order[slot].tolist()), list(range(128)))
+        with self.assertRaises(ValueError):
+            Case(torch, "stock", self.g, 0, device="cpu", layout="fragmented")
+        with self.assertRaises(ValueError):
+            Case(torch, "stock", self.g, 0, device="cpu", features=("touched_bitmap",))
 
 
 if __name__ == "__main__":

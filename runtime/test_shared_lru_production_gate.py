@@ -37,6 +37,29 @@ class ProductionGate(unittest.TestCase):
         self.assertLess(len(set(tokens)), len(tokens))
         self.assertEqual(mirror.status, 0)
 
+    def test_switched_mirrors_follow_the_production_sequence(self):
+        """60 planes, H4096: the gate's sequence gives the same rows and tables with both switches on."""
+        g = gate.GEOMETRY
+        config = sc.parse({"schema": sc.SCHEMA, "hot_pool": gate.ARMS["shared"]})
+        plan = reference.plan_arena(config, range(g.layers), g.hot, g.blocks * g.block)
+        rows = g.page + g.slots * (g.hot + g.page)
+        mirrors = [reference.KernelMirror(plan, plane_rows=rows, features=features)
+                   for features in ((), ("owner_summary", "touched_bitmap"))]
+        for mirror in mirrors:
+            mirror.init_slot(0, 0, list(range(g.page, g.hot + 2 * g.page)))
+        hot, cold, mixed = gate.selections(g)
+        seq, last = (cold[-1] + 1) * g.block + 4, g.layers - 1
+        for plane, blocks in ((last, cold), (0, hot), (last, cold), (last, mixed), (17, mixed)):
+            results = [m.resolve_row(0, plane, blocks, g.block, seq) for m in mirrors]
+            self.assertEqual(results[0], results[1])
+            for table in ("owner", "order", "occ", "token"):
+                self.assertEqual(mirrors[0].slots[0][table], mirrors[1].slots[0][table])
+            self.assertEqual(mirrors[1].slots[0]["summary"], mirrors[1].live_summary(0))
+        summary = mirrors[1].slots[0]["summary"]
+        self.assertEqual(len(summary), 7680)
+        self.assertGreater(sum(w >> last & 1 for w in summary), 64, "the last layer borrowed rows of plane 0")
+        self.assertLess(sum(w >> 17 & 1 for w in summary), 7680 // 2, "a layer's bit stays in few blocks")
+
     def test_cuda_opt_in_precedes_torch_import(self):
         result = subprocess.run(
             [sys.executable, "-B", "-c", "import sys; sys.modules['torch'] = None; "

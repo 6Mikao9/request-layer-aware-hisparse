@@ -72,6 +72,35 @@ python -m runtime.launch --hisparse-study-config runtime/fixtures/shared_lru_arm
 
 每个 worker 在绑定协调器时打印一行 `hisparse_shared_lru_bound` 收据（解析后配置、能力、几何、实际分配字节）；`diagnostics.mode=counters` 在进程退出时打印逐层计数。
 
+#### Resolver 开关：`features.owner_summary`、`features.touched_bitmap`
+
+[2026-11-25 的 A100 profiling](../../results/a100-hisparse-profiling-20261125/README.md) 中，B48、60 层全命中时共享 arena 的换入核仍比隔离 arena 多约 724 µs，GPU DRAM 读取为 190.80 MB。两个开关对应[单核实测的优先消融](shared-lru-scan-microbenchmark.md#优先消融)，只改变 resolver 找行的方式，命中、victim、payload 和各张表都不变。两者默认关闭，可单独或同时打开，只对 `hot_pool.layout=arena` 合法：
+
+- `owner_summary`（命中查找）：每 32 个 arena 行配一个 64 位字，记录哪些 plane 在该块拥有本代的行。阶段 3 按物理块扫描域，只在本 plane 位为 1 的块读取 owner 和反向 token，不再遍历 recency 列表。发布 owner 之后，收到 victim 的块按 owner 表重算。每卡增加 (slots + 1) × ⌈arena 行数 / 32⌉ × 8 B，MiniMax TP8、128 槽为 7,925,760 B，账本和计划的容量扣减已计入。
+- `touched_bitmap`（稳定 LRU 更新）：每次调用在共享内存中为命中行和准入行置位，FIFO 只保留准入行。victim 扫描和阶段 9 改为测位，不再重复 owner/token/hash 查找。阶段 9 每线程一次读 8 项；某块没有触及行时只过一次屏障，原地保留或整体平移；触及行按位序追加，不再做 bitonic 排序。每个 CTA 的共享内存增加 ⌈域行数 / 32⌉ × 4 B，60 层共享域合计 131,632 B，低于 sm_80 的 166,912 B 上限；超出时绑定前报错。
+
+另外修正了旁路臂的一个问题：recency 表只覆盖共享域，不含 scratch 行，原 host 检查却要求它等于 arena 行数，旁路臂在第一次长路径调用时会被拒绝。现在只要求表覆盖到域末尾，账本也按实际行数计费。
+
+CPU 侧的证据：`runtime.test_shared_lru_opt` 让四组开关的 `KernelMirror` 在每种策略的随机轨迹上逐次比较输出、拷贝、计数和各张表，并检查维护后的摘要始终等于按 owner 重算的结果；其中长轨迹会让行在层间反复迁移。该模块还用逐线程的写法核对 CUDA 的分块压缩、按位追加和摘要遍历的下标计算。回放中，开关臂与关臂的 selection、输出和设备字节摘要相同。
+
+```bash
+python -B -m unittest runtime.test_shared_lru_opt runtime.test_benchmark_shared_lru_scan
+python -B -m runtime.shared_lru_replay --fixture runtime/fixtures/shared_lru_fixture.json \
+  --config runtime/fixtures/shared_lru_arms/shared_arena_optimized.json --output /tmp/shared-lru-optimized.json
+```
+
+实机顺序：先构建并过正确性门，两个门默认对四组开关都与 mirror 逐次比较，生产几何门同时比较摘要；再跑受控单核探针。探针对 arena 臂先跑开关全关，其余开关组必须复现它的输出和表摘要（`state_sha256`）才保留计时；`fragmented` 布局会把被测域的行打散到所有块，用来测摘要在碎片化所有权下的收益和维护成本。之后按计划里的配对（每个开关单独、两者合并、同工程水平的 isolated 与 shared，以及与 stock 的对比）跑同批次 Graph 服务。
+
+```bash
+python -m runtime.shared_lru_device build-receipt --allow-cuda-build \
+  --config runtime/fixtures/shared_lru_arms/shared_arena_optimized.json --output "$OUTPUT_DIR/build-optimized.json"
+python -m runtime.cuda_shared_lru_correctness --allow-cuda-test --output "$OUTPUT_DIR/gate.json"
+python -m runtime.cuda_shared_lru_production_correctness --allow-cuda-test --all-planes \
+  --output "$OUTPUT_DIR/production-gate.json"
+python -m runtime.benchmark_shared_lru_scan --allow-cuda-test --arms stock isolated shared --batches 48 \
+  --layers 60 --miss-blocks 0 2 4 --layouts contiguous fragmented --output "$OUTPUT_DIR/scan-switches.json"
+```
+
 ## 后续实机可复用的最小 CUDA 测试
 
 [GLM Hybrid SM80 attention 参考移植](../../reference/glm-hybrid-sm80/README.md)附固定 vLLM 源码摘要、Triton attention、BF16 ABI、CPU 签名测试和隔离补丁生成器。它解决的范围是 attention 适配参考。完整模型索引器、extension 和 Graph 仍需按实验室环境核验。

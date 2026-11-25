@@ -6,6 +6,7 @@ variant is instantiated for host and device. This catches C++ and CUDA front-end
 errors on a CPU machine; it is not an nvcc build and proves nothing about
 runtime behavior (``runtime.cuda_shared_lru_correctness`` does that on an A100).
 """
+import itertools
 from pathlib import Path
 import shutil
 import subprocess
@@ -30,15 +31,21 @@ extern const __device__ uint3 threadIdx;
 extern const __device__ uint3 blockIdx;
 typedef struct CUstream_st* cudaStream_t;
 __device__ void __syncthreads();
+__device__ int __syncthreads_or(int predicate);
 __device__ int __shfl_up_sync(unsigned mask, int value, unsigned delta, int width = 32);
 __device__ unsigned __match_any_sync(unsigned mask, int value);
+__device__ unsigned __ballot_sync(unsigned mask, int predicate);
+__device__ unsigned __reduce_or_sync(unsigned mask, unsigned value);
 __device__ int __popc(unsigned value);
+__device__ int __ffs(int value);
 __device__ int atomicCAS(int* address, int compare, int value);
 __device__ int atomicMin(int* address, int value);
 __device__ int atomicAdd(int* address, int value);
 __device__ unsigned long long atomicAdd(unsigned long long* address, unsigned long long value);
 __device__ int atomicSub(int* address, int value);
 __device__ int atomicOr(int* address, int value);
+__device__ unsigned atomicOr(unsigned* address, unsigned value);
+__device__ unsigned atomicAnd(unsigned* address, unsigned value);
 __device__ int min(int a, int b);
 """
 TENSOR_STUB = r"""
@@ -69,6 +76,7 @@ struct LaunchKernel {
 namespace runtime {
 namespace details { struct MaybeDevice { MaybeDevice(DLDevice d) : device_id(d.device_id) {} unsigned device_id; }; }
 void* get_device_accessible_ptr(const tvm::ffi::TensorView& tensor);
+std::size_t get_max_smem_per_block(int device_id, bool opt_in = true, bool use_cache = true);
 template <auto kernel> void set_max_dynamic_smem_per_device(details::MaybeDevice device, std::size_t bytes);
 }  // namespace runtime
 }  // namespace host
@@ -90,9 +98,11 @@ HEADERS = {"cuda_stub.h": CUDA_STUB, "tensor_stub.h": TENSOR_STUB, "sgl_stub.h":
            "sgl_kernel/runtime.cuh": '#include "../sgl_stub.h"\n', "sgl_kernel/utils.cuh": '#include "../sgl_stub.h"\n',
            "dlpack/dlpack.h": '#include "../tensor_stub.h"\n', "tvm/ffi/container/tensor.h": '#include "../../../tensor_stub.h"\n',
            "kvcacheio/hisparse.cuh": HISPARSE_STUB}
-VARIANTS = [(1024, 16, 128, fifo, floor, bypass, counters)
-            for fifo in (False, True) for floor in (False, True) for bypass in (False, True) for counters in (False, True)]
-VARIANTS += [(1024, 2, 4, False, True, True, True), (256, 4, 2, True, False, False, False)]
+FLAGS = (False, True)
+# (fifo, soft_floor, bypass, counters, owner_summary, touched_bitmap): every policy with every switch pair.
+VARIANTS = [(1024, 16, 128, *flags) for flags in itertools.product(FLAGS, repeat=6)]
+VARIANTS += [(1024, 2, 4, False, True, True, True, True, True), (256, 4, 2, True, False, False, False, True, True),
+             (256, 4, 2, False, True, False, False, False, True)]
 
 
 def clang_cuda():

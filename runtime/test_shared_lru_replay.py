@@ -60,6 +60,36 @@ class ReplayCli(unittest.TestCase):
             counters = run(Path(tmp) / "shared_bypass.json", Path(tmp) / "bypass2.json")[1]["counters"]["total"]
             self.assertGreater(counters["bypassed"], 0)
 
+    def test_resolver_switches_replay_identical_rows_and_bytes(self):
+        """features.owner_summary/touched_bitmap change how rows are found, never which rows."""
+        same = ("selection_sha256", "output_sha256", "device_bytes_sha256", "counters", "history_hit_rate")
+        with tempfile.TemporaryDirectory() as tmp:
+            for plain, optimized in (("shared_arena", "shared_arena_optimized"),
+                                     ("isolated_arena", "isolated_arena_optimized")):
+                with self.subTest(arm=optimized):
+                    _, a = run(ARMS / f"{plain}.json", Path(tmp) / f"{plain}.json")
+                    code, b = run(ARMS / f"{optimized}.json", Path(tmp) / f"{optimized}.json")
+                    self.assertEqual(code, 0)
+                    self.assertEqual({k: a[k] for k in same}, {k: b[k] for k in same})
+                    self.assertNotEqual(a["config_sha256"], b["config_sha256"])
+                    self.assertEqual(b["capabilities"]["features"], {"owner_summary": True, "touched_bitmap": True})
+                    fixture = json.loads(FIXTURE.read_text())
+                    rows, slots = len(fixture["layers"]) * fixture["hot_rows"], len(fixture["requests"]) + 1
+                    rank = next(iter(b["ledger"]))
+                    extra = b["ledger"][rank]["arena_metadata_bytes"] - a["ledger"][rank]["arena_metadata_bytes"]
+                    self.assertEqual(extra, (slots + 1) * -(-rows // 32) * 8)   # one 64-bit word per 32 rows
+            for name, pool in EXTRA_ARMS.items():                                 # every policy with both switches
+                path = Path(tmp) / f"{name}_switched.json"
+                path.write_text(json.dumps({"schema": sc.SCHEMA, "hot_pool": pool,
+                                            "features": {"owner_summary": True, "touched_bitmap": True}}))
+                plain = Path(tmp) / f"{name}.json"
+                plain.write_text(json.dumps({"schema": sc.SCHEMA, "hot_pool": pool}))
+                with self.subTest(arm=name):
+                    _, a = run(plain, Path(tmp) / f"{name}.plain.out.json")
+                    code, b = run(path, Path(tmp) / f"{name}.switched.out.json")
+                    self.assertEqual(code, 0)
+                    self.assertEqual({k: a[k] for k in same}, {k: b[k] for k in same})
+
     def test_invalid_unsupported_and_existing_outputs_exit_nonzero(self):
         with tempfile.TemporaryDirectory() as tmp:
             bad = {"typo": {"schema": sc.SCHEMA, "hot_pool": {"mode": "shared"}},

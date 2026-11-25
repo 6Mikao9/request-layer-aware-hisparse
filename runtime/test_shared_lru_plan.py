@@ -44,10 +44,13 @@ class PairedPlan(unittest.TestCase):
             code, err = run(json.loads(EXAMPLE.read_text()), tmp)
             self.assertEqual(code, 0, err)
             plan = json.loads((Path(tmp) / "plan.json").read_text())
-            self.assertEqual([a["arm"] for a in plan["arms"]], ["stock", "isolated_arena", "shared_lru", "shared_fifo"])
+            self.assertEqual([a["arm"] for a in plan["arms"]],
+                             ["stock", "isolated_arena", "shared_lru", "shared_fifo", "shared_lru_owner_summary",
+                              "shared_lru_touched_bitmap", "shared_lru_optimized", "isolated_arena_optimized"])
             self.assertEqual(set(plan["skipped"]), {"isolated_static", "shared_soft_floor", "shared_bypass"})
             self.assertTrue(plan["split_placeholder"])
-            self.assertEqual(len(plan["schedule"]), 3 * 3 * 3)
+            self.assertEqual(len(plan["pairs"]), 9)
+            self.assertEqual(len(plan["schedule"]), 9 * 3 * 3)
             orders = [run_["order"] for run_ in plan["schedule"][:3]]
             self.assertEqual(orders, [["stock", "isolated_arena"], ["isolated_arena", "stock"],
                                       ["stock", "isolated_arena"]])
@@ -68,7 +71,22 @@ class PairedPlan(unittest.TestCase):
         self.assertEqual(changed[("isolated_arena", "shared_lru")], ["hot_pool.mode"])
         self.assertEqual(changed[("stock", "isolated_arena")], ["hot_pool.layout"])
         self.assertEqual(changed[("shared_lru", "shared_bypass")], ["hot_pool.admission", "hot_pool.bypass_layers"])
-        self.assertEqual(len(plan["arms"]), 7)
+        self.assertEqual(len(plan["arms"]), 11)
+        both = ["features.owner_summary", "features.touched_bitmap"]
+        self.assertEqual(changed[("shared_lru", "shared_lru_owner_summary")], ["features.owner_summary"])
+        self.assertEqual(changed[("shared_lru", "shared_lru_touched_bitmap")], ["features.touched_bitmap"])
+        self.assertEqual(changed[("shared_lru", "shared_lru_optimized")], both)
+        self.assertEqual(changed[("isolated_arena", "isolated_arena_optimized")], both)
+        self.assertEqual(changed[("isolated_arena_optimized", "shared_lru_optimized")], ["hot_pool.mode"])
+        self.assertEqual(changed[("stock", "shared_lru_optimized")], both + ["hot_pool.layout", "hot_pool.mode"])
+        arms = {a["arm"]: a for a in plan["arms"]}
+        summary_bytes = (8 + 1) * 4 * 8              # (slots + template) x ceil(4 x 32 / 32) words x 8 B
+        self.assertEqual(arms["shared_lru_optimized"]["capacity"]["arena_metadata_bytes"]
+                         - arms["shared_lru"]["capacity"]["arena_metadata_bytes"], summary_bytes)
+        self.assertEqual(arms["shared_lru_touched_bitmap"]["capacity"]["arena_metadata_bytes"],
+                         arms["shared_lru"]["capacity"]["arena_metadata_bytes"])       # shared memory only
+        self.assertEqual(arms["shared_lru_optimized"]["capabilities"]["features"],
+                         {"owner_summary": True, "touched_bitmap": True})
 
     def test_invalid_specs_ledgers_and_selection_mismatch_fail(self):
         bad_quota = copy.deepcopy(SMALL)

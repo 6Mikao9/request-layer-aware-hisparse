@@ -4,9 +4,10 @@ Requires the pinned SGLang image, an idle A100 (sm_80) and the repository root o
 PYTHONPATH; never run it on an active service. No model is loaded. Every launch
 is compared with ``runtime.shared_lru.KernelMirror`` on the same synthetic
 tables: flat consumer indices, owner tags, recency lists, occupancy, reverse
-tokens, counters, status bits and the K/V bytes behind every returned index.
-Eager launches and CUDA Graph replay (one bucket, changing real rows, padded
-rows) are both covered. This is a correctness check, not a benchmark.
+tokens, owner summaries, counters, status bits and the K/V bytes behind every
+returned index. Eager launches and CUDA Graph replay (one bucket, changing real
+rows, padded rows) are both covered, for every resolver switch set
+(``--features``). This is a correctness check, not a benchmark.
 
     python -m runtime.cuda_shared_lru_correctness --allow-cuda-test --output /tmp/gate.json
 """
@@ -30,8 +31,16 @@ ARMS = {
                           "floor_rows": {"0": 60, "1": 60, "2": 60}},
     "shared_bypass": {"mode": "shared", "layout": "arena", "admission": "bypass_list", "bypass_layers": [1]},
 }
+# Resolver switches (study_config.FEATURES): every arm runs with each set and must match the same mirror.
+FEATURE_SETS = {"none": (), "owner_summary": ("owner_summary",), "touched_bitmap": ("touched_bitmap",),
+                "both": ("owner_summary", "touched_bitmap")}
 L, H, PAGE, SLOTS, BLOCKS, BLOCK, DIM, BUCKET = 3, 64, 16, 4, 4, 8, 8, 4
 CONTEXT = 4096
+
+
+def study_config(pool, features=(), counters=False):
+    return sc.parse({"schema": sc.SCHEMA, "hot_pool": pool, "features": dict.fromkeys(features, True),
+                     "diagnostics": {"mode": "counters" if counters else "none"}})
 
 
 @dataclass(frozen=True)
@@ -87,7 +96,8 @@ class Bench:
             req_to_host_pool=(torch.arange(geometry.slots * geometry.context, dtype=torch.int64, device=cuda).reshape(geometry.slots, geometry.context)),
             mem_pool_host=types.SimpleNamespace(k_buffer=self.host_k, v_buffer=self.host_v))
         self.runtime = ArenaRuntime(self.coordinator, config, "0" * 64, torch=torch)
-        self.mirror = reference.KernelMirror(self.runtime.plan, plane_rows=plane_rows)
+        self.mirror = reference.KernelMirror(self.runtime.plan, plane_rows=plane_rows,
+                                             features=[name for name, _ in config.features])
         self.k_all, self.v_all, self.plane_rows = k_all, v_all, plane_rows
         self.seq = {}
         self.counters = {p: dict.fromkeys(reference.COUNTER_FIELDS, 0) for p in range(geometry.layers)}
@@ -158,6 +168,9 @@ class Bench:
             assert self.runtime.row_owner[slot].tolist() == state["owner"], "owner tags diverged"
             assert self.runtime.order[slot].tolist() == state["order"], "recency list diverged"
             assert self.runtime.occupancy[slot].tolist() == state["occ"], "occupancy diverged"
+            if self.runtime.owner_summary.numel():
+                words = [w & (2**64 - 1) for w in self.runtime.owner_summary[slot].tolist()]
+                assert words == state["summary"] == self.mirror.live_summary(slot), "owner summary diverged"
             tokens = self.coordinator.req_device_buffer_tokens[:, slot, :self.geometry.hot].reshape(-1).tolist()
             assert tokens == state["token"], "reverse token table diverged"
             selected = reference.selected_tokens(blocks, self.geometry.block, self.seq[slot])
@@ -187,9 +200,8 @@ class Bench:
             got = self.runtime.counter_snapshot()["layers"]
             for plane in range(self.geometry.layers):
                 assert got[str(plane)] == self.counters[plane], f"counters plane {plane}: {got[str(plane)]}"
-def run_case(torch, pool, *, counters, seq_dtype, rpi_dtype, graph, seed, steps, device="cuda"):
-    config = sc.parse({"schema": sc.SCHEMA, "hot_pool": pool,
-                       "diagnostics": {"mode": "counters" if counters else "none"}})
+def run_case(torch, pool, *, counters, seq_dtype, rpi_dtype, graph, seed, steps, device="cuda", features=()):
+    config = study_config(pool, features, counters)
     bench = Bench(torch, config, seed, device)
     for slot, prompt in enumerate((H + 5, H + 200, H - 3)):   # long, longer, short -> long transition
         bench.admit(slot, prompt)
@@ -236,6 +248,8 @@ def main():
     parser.add_argument("--allow-cuda-test", action="store_true")
     parser.add_argument("--steps", type=int, default=24)
     parser.add_argument("--seed", type=int, default=20261124)
+    parser.add_argument("--features", nargs="+", choices=tuple(FEATURE_SETS), default=list(FEATURE_SETS),
+                        help="resolver switch sets to check against the mirror (default: all four)")
     parser.add_argument("--output", type=Path, help="optional JSON result; never overwritten")
     args = parser.parse_args()
     if not args.allow_cuda_test:
@@ -251,14 +265,16 @@ def main():
     if torch.cuda.get_device_capability() != (8, 0):
         raise RuntimeError("A100 (sm_80) required")
     results = []
-    for index, (name, pool) in enumerate(ARMS.items()):
-        for seq_dtype in (torch.int32, torch.int64):
-            for rpi_dtype in (torch.int32, torch.int64):
-                for graph in (False, True):
-                    launches = run_case(torch, pool, counters=name == "shared_soft_floor", seq_dtype=seq_dtype,
-                                        rpi_dtype=rpi_dtype, graph=graph, seed=args.seed + index, steps=args.steps)
-                    results.append(dict(arm=name, seq_dtype=str(seq_dtype), rpi_dtype=str(rpi_dtype),
-                                        graph=graph, launches=launches, status="pass"))
+    for feature_set in args.features:
+        for index, (name, pool) in enumerate(ARMS.items()):
+            for seq_dtype in (torch.int32, torch.int64):
+                for rpi_dtype in (torch.int32, torch.int64):
+                    for graph in (False, True):
+                        launches = run_case(torch, pool, counters=name == "shared_soft_floor", seq_dtype=seq_dtype,
+                                            rpi_dtype=rpi_dtype, graph=graph, seed=args.seed + index,
+                                            steps=args.steps, features=FEATURE_SETS[feature_set])
+                        results.append(dict(arm=name, features=feature_set, seq_dtype=str(seq_dtype),
+                                            rpi_dtype=str(rpi_dtype), graph=graph, launches=launches, status="pass"))
     summary = dict(event="hisparse_shared_lru_cuda_gate", status="pass", cases=len(results),
                    launches=sum(r["launches"] for r in results), device=torch.cuda.get_device_name(),
                    torch=torch.__version__, results=results)
