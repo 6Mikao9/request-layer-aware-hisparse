@@ -1,0 +1,196 @@
+{
+  "schema": "issue3-b8-performance-progress-v1",
+  "candidate": "calibrated_t40_stock_layout",
+  "original_scope_feasible": false,
+  "capacity_infeasible": [
+    {
+      "point": "16-32Ki",
+      "pair": "stock->calibrated_t40_stock_layout",
+      "arms": [
+        "calibrated_t40_stock_layout"
+      ]
+    },
+    {
+      "point": "16-32Ki",
+      "pair": "stock->calibrated_t40_stock_layout",
+      "arms": [
+        "calibrated_t40_stock_layout"
+      ]
+    },
+    {
+      "point": "16-32Ki",
+      "pair": "stock->calibrated_t40_stock_layout",
+      "arms": [
+        "calibrated_t40_stock_layout"
+      ]
+    }
+  ],
+  "min_pairs": 3,
+  "min_pressure_points": 2,
+  "matched_comparisons": 1,
+  "blocks": [
+    {
+      "point": "32-64Ki",
+      "repeat": 0,
+      "kind": "stock_aa",
+      "order": [
+        "stock",
+        "stock"
+      ],
+      "status": "complete",
+      "slots": [
+        {
+          "slot": "a",
+          "arm": "stock",
+          "steps": 165,
+          "graph_samples": 21,
+          "tokens_per_s": 218.5654110262185,
+          "tpot_ms": {
+            "p50": 36.4605931304113,
+            "p95": 36.47199314247525,
+            "p99": 36.47220574176298
+          },
+          "ttft_s": {
+            "p50": 15.257219749473734,
+            "p95": 25.106449394664377,
+            "p99": 25.880146033352357
+          },
+          "completed_output_tokens": 2933,
+          "completed_output_tokens_per_s": 68.67573042861962,
+          "natural_eos": 4
+        },
+        {
+          "slot": "b",
+          "arm": "stock",
+          "steps": 156,
+          "graph_samples": 20,
+          "tokens_per_s": 224.2257110631845,
+          "tpot_ms": {
+            "p50": 35.56042035024281,
+            "p95": 35.56676604707168,
+            "p99": 35.56700712528857
+          },
+          "ttft_s": {
+            "p50": 15.227705692494055,
+            "p95": 25.048464278291792,
+            "p99": 25.81835210524907
+          },
+          "completed_output_tokens": 2779,
+          "completed_output_tokens_per_s": 66.22741222632104,
+          "natural_eos": 5
+        }
+      ],
+      "output_mismatch": 1.0
+    },
+    {
+      "point": "32-64Ki",
+      "repeat": 1,
+      "kind": "stock_aa",
+      "order": [
+        "stock",
+        "stock"
+      ],
+      "status": "short_window",
+      "window_steps": 29,
+      "required_window_steps": 128
+    },
+    {
+      "point": "32-64Ki",
+      "repeat": 2,
+      "kind": "stock_aa",
+      "order": [
+        "stock",
+        "stock"
+      ],
+      "status": "short_window",
+      "window_steps": 67,
+      "required_window_steps": 128
+    },
+    {
+      "point": "32-64Ki",
+      "repeat": 0,
+      "kind": "candidate",
+      "order": [
+        "stock",
+        "calibrated_t40_stock_layout"
+      ],
+      "status": "complete",
+      "slots": [
+        {
+          "slot": "a",
+          "arm": "stock",
+          "steps": 155,
+          "graph_samples": 20,
+          "tokens_per_s": 224.58585583415123,
+          "tpot_ms": {
+            "p50": 35.43170564507525,
+            "p95": 35.44058611255041,
+            "p99": 35.44220615055908
+          },
+          "ttft_s": {
+            "p50": 15.167050849064253,
+            "p95": 24.957738548493943,
+            "p99": 25.727047915379515
+          },
+          "completed_output_tokens": 2958,
+          "completed_output_tokens_per_s": 69.94356908828782,
+          "natural_eos": 4
+        },
+        {
+          "slot": "b",
+          "arm": "calibrated_t40_stock_layout",
+          "steps": 133,
+          "graph_samples": 17,
+          "tokens_per_s": 280.0023834707249,
+          "tpot_ms": {
+            "p50": 28.4329656545682,
+            "p95": 28.45282695319594,
+            "p99": 28.45325209566135
+          },
+          "ttft_s": {
+            "p50": 15.61550979007734,
+            "p95": 25.671708347834645,
+            "p99": 26.464238550346344
+          },
+          "completed_output_tokens": 2989,
+          "completed_output_tokens_per_s": 74.6058048403788,
+          "natural_eos": 5
+        }
+      ],
+      "output_mismatch": 1.0
+    },
+    {
+      "point": "32-64Ki",
+      "repeat": 1,
+      "kind": "candidate",
+      "order": [
+        "calibrated_t40_stock_layout",
+        "stock"
+      ],
+      "status": "missing"
+    },
+    {
+      "point": "32-64Ki",
+      "repeat": 2,
+      "kind": "candidate",
+      "order": [
+        "stock",
+        "calibrated_t40_stock_layout"
+      ],
+      "status": "missing"
+    }
+  ],
+  "comparisons": [
+    {
+      "point": "32-64Ki",
+      "repeat": 0,
+      "throughput_gain": 0.24674985622200918,
+      "tpot_p50_change": -0.19752760594182184,
+      "tpot_p95_change": -0.19716827304049378,
+      "output_mismatch": 1.0,
+      "stock_aa_mismatch": 1.0,
+      "matched_stock_aa": true,
+      "quality_within_tolerance": true
+    }
+  ]
+}

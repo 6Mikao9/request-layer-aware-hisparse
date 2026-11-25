@@ -1,0 +1,355 @@
+{
+  "scope": "Three repeated natural waves per arm, same B48 cohort, steady decode steps 17\u201324",
+  "arms": {
+    "stock": {
+      "gpu_pool_rows": 396800,
+      "wave_results": [
+        {
+          "wave": 0,
+          "first_decode_ordinal": 17,
+          "last_decode_ordinal": 24,
+          "output_token_s": 474.83563070923736,
+          "output_tokens": 384,
+          "state": "steady_decode_token_events",
+          "tpot_p50_ms": 100.78212799271569,
+          "tpot_p95_ms": 105.72287372197025,
+          "tpot_p99_ms": 106.93029969930649,
+          "wall_s": 0.8087008959846571,
+          "end_to_end_tokens_s": 19.16056717564384,
+          "median_ttft_ms": 79944.01510353782,
+          "median_generation_tokens": 64.0,
+          "natural_eos": 0
+        },
+        {
+          "wave": 1,
+          "first_decode_ordinal": 17,
+          "last_decode_ordinal": 24,
+          "output_token_s": 480.3248580923956,
+          "output_tokens": 384,
+          "state": "steady_decode_token_events",
+          "tpot_p50_ms": 99.95897900080308,
+          "tpot_p95_ms": 103.85100010316819,
+          "tpot_p99_ms": 104.81954763527028,
+          "wall_s": 0.7994589360314421,
+          "end_to_end_tokens_s": 19.472112967080985,
+          "median_ttft_ms": 79944.83357103309,
+          "median_generation_tokens": 64.0,
+          "natural_eos": 0
+        },
+        {
+          "wave": 2,
+          "first_decode_ordinal": 17,
+          "last_decode_ordinal": 24,
+          "output_token_s": 484.9306726273521,
+          "output_tokens": 384,
+          "state": "steady_decode_token_events",
+          "tpot_p50_ms": 98.85149999172427,
+          "tpot_p95_ms": 102.87300560157746,
+          "tpot_p99_ms": 104.01220977248158,
+          "wall_s": 0.7918657690170221,
+          "end_to_end_tokens_s": 19.497995056624386,
+          "median_ttft_ms": 79760.97689499147,
+          "median_generation_tokens": 64.0,
+          "natural_eos": 0
+        }
+      ],
+      "nvml": {
+        "one_second_peak_mib_by_gpu": {
+          "0": 73848,
+          "1": 74424,
+          "2": 74424,
+          "3": 74424,
+          "4": 74424,
+          "5": 74424,
+          "6": 74424,
+          "7": 73848
+        },
+        "most_sampled_mib": 74424,
+        "samples_per_gpu": {
+          "0": 1200,
+          "1": 1200,
+          "2": 1200,
+          "3": 1200,
+          "4": 1200,
+          "5": 1200,
+          "6": 1200,
+          "7": 1200
+        }
+      },
+      "repeat_output_agreement": [
+        {
+          "waves": [
+            0,
+            1
+          ],
+          "first_24_tokens_equal_of_48": 19,
+          "full_output_equal_of_48": 7
+        },
+        {
+          "waves": [
+            0,
+            2
+          ],
+          "first_24_tokens_equal_of_48": 20,
+          "full_output_equal_of_48": 6
+        },
+        {
+          "waves": [
+            1,
+            2
+          ],
+          "first_24_tokens_equal_of_48": 21,
+          "full_output_equal_of_48": 8
+        }
+      ]
+    },
+    "isolated_arena": {
+      "gpu_pool_rows": 396800,
+      "wave_results": [
+        {
+          "wave": 0,
+          "first_decode_ordinal": 17,
+          "last_decode_ordinal": 24,
+          "output_token_s": 461.9983019941463,
+          "output_tokens": 384,
+          "state": "steady_decode_token_events",
+          "tpot_p50_ms": 103.08001699740998,
+          "tpot_p95_ms": 111.82575579732656,
+          "tpot_p99_ms": 113.02198254677933,
+          "wall_s": 0.8311718860059045,
+          "end_to_end_tokens_s": 18.84767475143987,
+          "median_ttft_ms": 82000.2310614509,
+          "median_generation_tokens": 64.0,
+          "natural_eos": 0
+        },
+        {
+          "wave": 1,
+          "first_decode_ordinal": 17,
+          "last_decode_ordinal": 24,
+          "output_token_s": 468.09908342181274,
+          "output_tokens": 384,
+          "state": "steady_decode_token_events",
+          "tpot_p50_ms": 102.09623302216642,
+          "tpot_p95_ms": 108.02768783469219,
+          "tpot_p99_ms": 110.00879889877979,
+          "wall_s": 0.8203391410061158,
+          "end_to_end_tokens_s": 19.82203057803932,
+          "median_ttft_ms": 78302.19428252894,
+          "median_generation_tokens": 64.0,
+          "natural_eos": 0
+        },
+        {
+          "wave": 2,
+          "first_decode_ordinal": 17,
+          "last_decode_ordinal": 24,
+          "output_token_s": 464.4648676678253,
+          "output_tokens": 384,
+          "state": "steady_decode_token_events",
+          "tpot_p50_ms": 103.01315601100214,
+          "tpot_p95_ms": 107.11831600929145,
+          "tpot_p99_ms": 108.51433705713134,
+          "wall_s": 0.8267579029779881,
+          "end_to_end_tokens_s": 19.814145975724358,
+          "median_ttft_ms": 78406.22575150337,
+          "median_generation_tokens": 64.0,
+          "natural_eos": 0
+        }
+      ],
+      "nvml": {
+        "one_second_peak_mib_by_gpu": {
+          "0": 73814,
+          "1": 74390,
+          "2": 74390,
+          "3": 74390,
+          "4": 74390,
+          "5": 74390,
+          "6": 74390,
+          "7": 73814
+        },
+        "most_sampled_mib": 74390,
+        "samples_per_gpu": {
+          "0": 1474,
+          "1": 1474,
+          "2": 1474,
+          "3": 1474,
+          "4": 1474,
+          "5": 1474,
+          "6": 1474,
+          "7": 1474
+        }
+      },
+      "repeat_output_agreement": [
+        {
+          "waves": [
+            0,
+            1
+          ],
+          "first_24_tokens_equal_of_48": 17,
+          "full_output_equal_of_48": 6
+        },
+        {
+          "waves": [
+            0,
+            2
+          ],
+          "first_24_tokens_equal_of_48": 17,
+          "full_output_equal_of_48": 7
+        },
+        {
+          "waves": [
+            1,
+            2
+          ],
+          "first_24_tokens_equal_of_48": 17,
+          "full_output_equal_of_48": 10
+        }
+      ]
+    },
+    "shared_arena": {
+      "gpu_pool_rows": 396800,
+      "wave_results": [
+        {
+          "wave": 0,
+          "first_decode_ordinal": 17,
+          "last_decode_ordinal": 24,
+          "output_token_s": 340.83441628333566,
+          "output_tokens": 384,
+          "state": "steady_decode_token_events",
+          "tpot_p50_ms": 140.48225551960059,
+          "tpot_p95_ms": 148.24777092435397,
+          "tpot_p99_ms": 150.29162620659918,
+          "wall_s": 1.1266467869863845,
+          "end_to_end_tokens_s": 18.873562137218453,
+          "median_ttft_ms": 80014.99192349729,
+          "median_generation_tokens": 64.0,
+          "natural_eos": 0
+        },
+        {
+          "wave": 1,
+          "first_decode_ordinal": 17,
+          "last_decode_ordinal": 24,
+          "output_token_s": 349.40101138370176,
+          "output_tokens": 384,
+          "state": "steady_decode_token_events",
+          "tpot_p50_ms": 137.56423100130633,
+          "tpot_p95_ms": 141.59586414170917,
+          "tpot_p99_ms": 142.65657414507587,
+          "wall_s": 1.0990237219957635,
+          "end_to_end_tokens_s": 19.140611826739423,
+          "median_ttft_ms": 80025.49661451485,
+          "median_generation_tokens": 64.0,
+          "natural_eos": 0
+        },
+        {
+          "wave": 2,
+          "first_decode_ordinal": 17,
+          "last_decode_ordinal": 24,
+          "output_token_s": 343.68356405210386,
+          "output_tokens": 384,
+          "state": "steady_decode_token_events",
+          "tpot_p50_ms": 139.3801555095706,
+          "tpot_p95_ms": 145.58216456207447,
+          "tpot_p99_ms": 147.42357676033862,
+          "wall_s": 1.117306848987937,
+          "end_to_end_tokens_s": 19.129537236482673,
+          "median_ttft_ms": 80073.53176150355,
+          "median_generation_tokens": 64.0,
+          "natural_eos": 0
+        }
+      ],
+      "nvml": {
+        "one_second_peak_mib_by_gpu": {
+          "0": 73814,
+          "1": 74390,
+          "2": 74390,
+          "3": 74390,
+          "4": 74390,
+          "5": 74390,
+          "6": 74390,
+          "7": 73814
+        },
+        "most_sampled_mib": 74390,
+        "samples_per_gpu": {
+          "0": 1082,
+          "1": 1082,
+          "2": 1082,
+          "3": 1082,
+          "4": 1082,
+          "5": 1082,
+          "6": 1082,
+          "7": 1082
+        }
+      },
+      "repeat_output_agreement": [
+        {
+          "waves": [
+            0,
+            1
+          ],
+          "first_24_tokens_equal_of_48": 16,
+          "full_output_equal_of_48": 9
+        },
+        {
+          "waves": [
+            0,
+            2
+          ],
+          "first_24_tokens_equal_of_48": 17,
+          "full_output_equal_of_48": 8
+        },
+        {
+          "waves": [
+            1,
+            2
+          ],
+          "first_24_tokens_equal_of_48": 15,
+          "full_output_equal_of_48": 7
+        }
+      ]
+    }
+  },
+  "comparisons": {
+    "isolated_arena": {
+      "per_wave_ratio_vs_stock": [
+        {
+          "tpot_p50_ms": 1.0228005604809256,
+          "tpot_p95_ms": 1.05772527609688,
+          "output_token_s": 0.9729646894949382
+        },
+        {
+          "tpot_p50_ms": 1.0213813110410637,
+          "tpot_p95_ms": 1.0402180790495497,
+          "output_token_s": 0.9745468624731659
+        },
+        {
+          "tpot_p50_ms": 1.0421000796105904,
+          "tpot_p95_ms": 1.0412674868677978,
+          "output_token_s": 0.9577964312947185
+        }
+      ],
+      "matched_prefixes_of_144": 55,
+      "matched_full_of_144": 20
+    },
+    "shared_arena": {
+      "per_wave_ratio_vs_stock": [
+        {
+          "tpot_p50_ms": 1.3939203142223227,
+          "tpot_p95_ms": 1.402229864789862,
+          "output_token_s": 0.7177945256008884
+        },
+        {
+          "tpot_p50_ms": 1.376206843811411,
+          "tpot_p95_ms": 1.363452099652813,
+          "output_token_s": 0.7274264604404271
+        },
+        {
+          "tpot_p50_ms": 1.4099953518281398,
+          "tpot_p95_ms": 1.4151639072927222,
+          "output_token_s": 0.7087272128818495
+        }
+      ],
+      "matched_prefixes_of_144": 51,
+      "matched_full_of_144": 26
+    }
+  }
+}
