@@ -40,6 +40,7 @@ __device__ unsigned __reduce_or_sync(unsigned mask, unsigned value);
 __device__ int __popc(unsigned value);
 __device__ int __ffs(int value);
 __device__ int atomicCAS(int* address, int compare, int value);
+__device__ unsigned long long atomicExch(unsigned long long* address, unsigned long long value);
 __device__ int atomicMin(int* address, int value);
 __device__ int atomicMax(int* address, int value);
 __device__ int atomicAdd(int* address, int value);

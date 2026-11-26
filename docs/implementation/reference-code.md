@@ -145,7 +145,7 @@ dry-run 输出每个层的精确启动参数，包括模板参数、整型参数
 2. 两个正确性门，覆盖全部开关组，包括 eager 和 Graph。
 3. 不挂 profiler 的计时：原生、隔离、旧共享和优化共享四臂，miss 块数为 0、2、4（0%、12.5%、25%），并单独测每个开关和环重建调用。
 4. Nsight Compute 采集核时、DRAM 读写字节和占用率。
-5. Nsight Systems 带 `--cuda-graph-trace=node` 采集，由 `benchmarks.nsys_graph_summary` 汇总图节点、流内次序和暴露等待。
+5. Nsight Systems 带 `--cuda-graph-trace=node` 采集，由 `benchmarks.nsys_graph_summary` 汇总图节点、流内次序，以及图提交返回到首个 GPU 节点的排队时间。
 
 整模服务按计划里新增的配对运行：每个开关单独、三者合并、isolated 与 shared 同为 indexed、以及 stock 对 shared_lru_indexed。这一步以及全部 GPU 数据都属于 `pending_hardware`。
 

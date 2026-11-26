@@ -307,7 +307,7 @@ def capabilities(config):
     hit_search = recency_update = owner_tags = None
     if arena:
         if config.feature("hit_index"):
-            hit_search = "hit_index: two-choice 32-way buckets keyed by (plane, token), probed per selected key"
+            hit_search = "hit_index: two-choice 16-way buckets keyed by (plane, token), probed per selected key"
         elif config.feature("owner_summary"):
             hit_search = "owner_summary: physical 32-row blocks whose owner-plane bits include the layer"
         else:

@@ -58,7 +58,7 @@ for misses in 0 2 4; do
     done
 done
 
-# 5. Nsight Systems: graph nodes, stream order and exposed wait of every replay.
+# 5. Nsight Systems: graph nodes, stream order and launch queue delay of every replay.
 for misses in 0 2 4; do
     for item in "${cases[@]}"; do
         read -r arm features <<< "$item"

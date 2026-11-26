@@ -279,6 +279,14 @@ __host__ __device__ __forceinline__ IndexKey index_key(const Params& p, int32_t 
                   static_cast<int32_t>((static_cast<uint32_t>(x >> 32) & mask) << p.row_bits)};
 }
 
+// Bucket entries can change concurrently during maintenance. Use a relaxed global load
+// there; the lookup phase is separate and still uses vector loads.
+__device__ __forceinline__ int32_t load_index_entry_relaxed(const int32_t* entry) {
+  int32_t value;
+  asm volatile("ld.global.relaxed.gpu.b32 %0, [%1];" : "=r"(value) : "l"(entry) : "memory");
+  return value;
+}
+
 // incremental_lru: stable compaction of the live ring entries [head, tail) to [0, live), new
 // positions for every moved row, all dead bits cleared. Chunks of kCompactUnroll entries per thread
 // as in the touched_bitmap compaction: every write goes to an index <= the entry's own and every
@@ -782,9 +790,9 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_kernel(const Params p) 
         for (int side = 0; side < 2 && !removed; ++side) {
           int32_t* bucket = index + static_cast<int64_t>(side ? key.right : key.left) * kIndexWays;
           for (int w = 0; w < kIndexWays && !removed; ++w) {
-            if (bucket[w] == (key.fp | row)) {
-              bucket[w] = kIndexEmpty;
-              removed = true;
+            const int32_t entry = key.fp | row;
+            if (load_index_entry_relaxed(&bucket[w]) == entry) {
+              removed = atomicCAS(&bucket[w], entry, kIndexEmpty) == entry;
             }
           }
         }
@@ -799,14 +807,15 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_kernel(const Params p) 
         int load_left = 0;
         int load_right = 0;
         for (int w = 0; w < kIndexWays; ++w) {
-          load_left += left[w] != kIndexEmpty ? 1 : 0;
-          load_right += right[w] != kIndexEmpty ? 1 : 0;
+          load_left += load_index_entry_relaxed(&left[w]) != kIndexEmpty ? 1 : 0;
+          load_right += load_index_entry_relaxed(&right[w]) != kIndexEmpty ? 1 : 0;
         }
         bool placed = false;
         for (int side = 0; side < 2 && !placed; ++side) {
           int32_t* bucket = (side == 0) == (load_left <= load_right) ? left : right;
           for (int w = 0; w < kIndexWays && !placed; ++w) {
-            placed = bucket[w] == kIndexEmpty && atomicCAS(&bucket[w], kIndexEmpty, key.fp | s_uid_row[u]) == kIndexEmpty;
+            placed = load_index_entry_relaxed(&bucket[w]) == kIndexEmpty &&
+                     atomicCAS(&bucket[w], kIndexEmpty, key.fp | s_uid_row[u]) == kIndexEmpty;
           }
         }
         if (!placed) atomicOr(&p.index_flags[rid], 1);
@@ -849,7 +858,8 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void resolve_kernel(const Params p) 
       const int o = r < p.arena_rows ? owner_index(owner[r]) : kFreeOwner;
       const unsigned low = __reduce_or_sync(FULL_WARP_MASK, o < 32 ? 1u << o : 0u);
       const unsigned high = __reduce_or_sync(FULL_WARP_MASK, o >= 32 && o < kMaxPlanes ? 1u << (o - 32) : 0u);
-      if (lane == 0) summary[b] = (static_cast<unsigned long long>(high) << 32) | low;
+      // Victims in the same block can be processed by different warps.
+      if (lane == 0) atomicExch(&summary[b], (static_cast<unsigned long long>(high) << 32) | low);
     }
   }
 

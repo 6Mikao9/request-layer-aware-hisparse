@@ -14,6 +14,7 @@ check, not a benchmark.
     python -m runtime.cuda_shared_lru_correctness --allow-cuda-test --output /tmp/gate.json
 """
 import argparse
+from collections import defaultdict
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -73,8 +74,9 @@ def slot_differences(runtime, row_token, mirror, slot):
     """Tables where the device differs from the mirror. Index placement may differ (concurrent CUDA
     inserts); the index must then still hold every live key once, in one of its two buckets."""
     got, want = device_state(runtime, row_token, slot), mirror.slots[slot]
-    diffs = [name for name in ("owner", "token", "occ", "order", "ring", "dead", "pos", "meta", "summary",
-                               "index_flag") if name in want and got.get(name) != want[name]]
+    # Valid concurrent bucket placement can park the GPU index at a different call than the mirror.
+    diffs = [name for name in ("owner", "token", "occ", "order", "ring", "dead", "pos", "meta", "summary")
+             if name in want and got.get(name) != want[name]]
     if "summary" in want and want["summary"] != mirror.live_summary(slot):
         diffs.append("summary differs from the owner tags")
     if "index" in want and not got["index_flag"]:
@@ -277,6 +279,59 @@ def run_case(torch, pool, *, counters, seq_dtype, rpi_dtype, graph, seed, steps,
     return launches
 
 
+def run_index_parking(torch, *, graph, seed):
+    """Fill one bucket pair with single inserts, then check a fallback hit after parking."""
+    geometry = Geometry(blocks=32, block=1)
+    config = study_config(ARMS["shared"], FEATURE_SETS["indexed"], counters=True)
+    bench = Bench(torch, config, seed, geometry=geometry)
+    bench.admit(0, geometry.context - 2)
+    runtime = bench.runtime
+    keys = defaultdict(list)
+    for token in range(geometry.hot, bench.seq[0] - 1):
+        pair = reference.index_slots(0, token, runtime.index_half, runtime.row_bits)[:2]
+        keys[pair].append(token)
+    colliding = max(keys.values(), key=len)
+    assert len(colliding) > 2 * reference.INDEX_WAYS
+    static = bench.tensors([(0, [-1] * geometry.blocks)], torch.int32, torch.int64, BUCKET)
+    if graph:
+        bench.coordinator.num_real_reqs.zero_()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            runtime.resolve(bench.coordinator, *static, 0, geometry.block)
+        torch.cuda.current_stream().wait_stream(side)
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            runtime.resolve(bench.coordinator, *static, 0, geometry.block)
+    bench.coordinator.num_real_reqs.fill_(1)
+
+    def launch(token):
+        blocks = [token] + [-1] * (geometry.blocks - 1)
+        rows = [(0, blocks)]
+        expected = [bench.expect(0, 0, blocks)]
+        for target, value in zip(static, bench.tensors(rows, torch.int32, torch.int64, BUCKET)):
+            target.copy_(value)
+        if graph:
+            captured.replay()
+        else:
+            runtime.resolve(bench.coordinator, *static, 0, geometry.block)
+        bench.check(0, rows, expected, BUCKET)
+        parked = int(runtime.index_flags[0])
+        assert parked == bench.mirror.slots[0]["index_flag"], "single-insert parking diverged"
+        return parked
+
+    for launches, token in enumerate(colliding, 1):
+        if launch(token):
+            break
+    else:
+        raise AssertionError("The colliding keys did not park the index")
+    hits = bench.counters[0]["hits"]
+    assert launch(colliding[0]) == 1
+    assert bench.counters[0]["hits"] == hits + 1
+    bench.check_counters()
+    return launches + 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--allow-cuda-test", action="store_true")
@@ -309,6 +364,11 @@ def main():
                                             steps=args.steps, features=FEATURE_SETS[feature_set])
                         results.append(dict(arm=name, features=feature_set, seq_dtype=str(seq_dtype),
                                             rpi_dtype=str(rpi_dtype), graph=graph, launches=launches, status="pass"))
+    if "indexed" in args.features:
+        for graph in (False, True):
+            launches = run_index_parking(torch, graph=graph, seed=args.seed)
+            results.append(dict(arm="forced_index_parking", features="indexed", graph=graph,
+                                launches=launches, status="pass"))
     summary = dict(event="hisparse_shared_lru_cuda_gate", status="pass", cases=len(results),
                    launches=sum(r["launches"] for r in results), device=torch.cuda.get_device_name(),
                    torch=torch.__version__, results=results)
