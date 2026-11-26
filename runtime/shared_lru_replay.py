@@ -96,7 +96,8 @@ class _Arm:
             self.plan = s.plan_arena(config, layers, H, fixture["blocks"] * fixture["block_size"])
             self.engine = s.SharedLRUReference(self.plan, page=page, item_bytes=fixture["item_bytes"],
                                                rank=rank, total_locs=self.total_locs)
-            self.mirror = s.KernelMirror(self.plan, plane_rows=self.total_locs)
+            self.mirror = s.KernelMirror(self.plan, plane_rows=self.total_locs,
+                                         features=[name for name, _ in config.features])
         else:
             self.engine = s.NativeLayerLRU(layers, H, page=page, item_bytes=fixture["item_bytes"], rank=rank,
                                            total_locs=self.total_locs)
@@ -209,7 +210,8 @@ def replay(fixture, config):
         per_rank[str(rank)] = {str(layer): counts for layer, counts in layers.items()}
         ledger = s.byte_ledger(layers=fixture["layers"], hot_rows=fixture["hot_rows"], page=fixture["page"],
                                item_bytes=fixture["item_bytes"], slots=len(fixture["requests"]) + 1,
-                               pool_rows=arm.total_locs, plan=arm.plan, counters=config.diagnostics == "counters")
+                               pool_rows=arm.total_locs, plan=arm.plan, counters=config.diagnostics == "counters",
+                               features=[name for name, _ in config.features])
         ledger["fake_allocator"] = dict(peak_physical_rows_allocated=arm.peak_allocated,
                                         peak_logical_rows_valid=arm.peak_logical if arm.plan is not None else None)
         ledgers[str(rank)] = ledger

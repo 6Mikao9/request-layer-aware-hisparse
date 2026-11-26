@@ -60,6 +60,47 @@ class ReplayCli(unittest.TestCase):
             counters = run(Path(tmp) / "shared_bypass.json", Path(tmp) / "bypass2.json")[1]["counters"]["total"]
             self.assertGreater(counters["bypassed"], 0)
 
+    def test_resolver_switches_replay_identical_rows_and_bytes(self):
+        """Resolver switches change how rows are found, stored and ordered, never which rows."""
+        same = ("selection_sha256", "output_sha256", "device_bytes_sha256", "counters", "history_hit_rate")
+        pr8 = {"owner_summary": True, "touched_bitmap": True, "hit_index": False, "incremental_lru": False,
+               "compact_owner": False}
+        issue6 = {"owner_summary": False, "touched_bitmap": False, "hit_index": True, "incremental_lru": True,
+                  "compact_owner": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            for plain, optimized, features in (("shared_arena", "shared_arena_optimized", pr8),
+                                               ("isolated_arena", "isolated_arena_optimized", pr8),
+                                               ("shared_arena", "shared_arena_indexed", issue6),
+                                               ("isolated_arena", "isolated_arena_indexed", issue6)):
+                with self.subTest(arm=optimized):
+                    _, a = run(ARMS / f"{plain}.json", Path(tmp) / f"{optimized}.plain.json")
+                    code, b = run(ARMS / f"{optimized}.json", Path(tmp) / f"{optimized}.json")
+                    self.assertEqual(code, 0)
+                    self.assertEqual({k: a[k] for k in same}, {k: b[k] for k in same})
+                    self.assertNotEqual(a["config_sha256"], b["config_sha256"])
+                    self.assertEqual(b["capabilities"]["features"], features)
+                    fixture = json.loads(FIXTURE.read_text())
+                    rows, slots = len(fixture["layers"]) * fixture["hot_rows"], len(fixture["requests"]) + 1
+                    rank = next(iter(b["ledger"]))
+                    extra = b["ledger"][rank]["arena_metadata_bytes"] - a["ledger"][rank]["arena_metadata_bytes"]
+                    if features is pr8:
+                        self.assertEqual(extra, (slots + 1) * -(-rows // 32) * 8)   # one 64-bit word per 32 rows
+                    else:
+                        self.assertEqual(b["ledger"][rank]["arena_metadata_breakdown"]["row_owner"], slots * rows)
+                        self.assertIn("ring", b["ledger"][rank]["arena_metadata_breakdown"])
+            for name, pool in EXTRA_ARMS.items():                                 # every policy with both sets
+                plain = Path(tmp) / f"{name}.json"
+                plain.write_text(json.dumps({"schema": sc.SCHEMA, "hot_pool": pool}))
+                _, a = run(plain, Path(tmp) / f"{name}.plain.out.json")
+                for label, features in (("pr8", pr8), ("issue6", issue6)):
+                    path = Path(tmp) / f"{name}_{label}.json"
+                    path.write_text(json.dumps({"schema": sc.SCHEMA, "hot_pool": pool,
+                                                "features": {k: v for k, v in features.items() if v}}))
+                    with self.subTest(arm=name, features=label):
+                        code, b = run(path, Path(tmp) / f"{name}.{label}.out.json")
+                        self.assertEqual(code, 0)
+                        self.assertEqual({k: a[k] for k in same}, {k: b[k] for k in same})
+
     def test_invalid_unsupported_and_existing_outputs_exit_nonzero(self):
         with tempfile.TemporaryDirectory() as tmp:
             bad = {"typo": {"schema": sc.SCHEMA, "hot_pool": {"mode": "shared"}},

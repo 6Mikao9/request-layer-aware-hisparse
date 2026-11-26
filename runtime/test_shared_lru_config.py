@@ -123,6 +123,52 @@ class StudyConfigParser(unittest.TestCase):
         self.assertTrue(sc.unsupported_reasons(counters))
         self.assertEqual(sc.unsupported_reasons(parse(dict(SHARED, diagnostics={"mode": "counters"}))), [])
 
+    def test_resolver_switches_are_arena_only_and_canonical_when_enabled(self):
+        self.assertEqual(sc.FEATURES, ("owner_summary", "touched_bitmap", "hit_index", "incremental_lru",
+                                       "compact_owner"))
+        phase = dict(owner_summary="hit_search", hit_index="hit_search", touched_bitmap="recency_update",
+                     incremental_lru="recency_update", compact_owner="owner_tags")
+        for name in sc.FEATURES:
+            on = parse(dict(SHARED, features={name: True}))
+            with self.subTest(feature=name):
+                self.assertTrue(on.feature(name))
+                self.assertEqual(sc.unsupported_reasons(on), [])
+                self.assertEqual(on.as_dict()["features"], {name: True})
+                self.assertNotEqual(on.digest, parse(SHARED).digest)
+                caps = sc.capabilities(on)
+                self.assertEqual(caps["features"], {n: n == name for n in sc.FEATURES})
+                self.assertTrue(caps[phase[name]].startswith(name))
+                for value in (with_pool(), with_pool(mode="isolated", layout="native")):
+                    with self.assertRaisesRegex(ValueError, "layout=native"):
+                        parse(dict(value, features={name: True}))
+                with self.assertRaises(ValueError):
+                    parse(dict(SHARED, features={name: 1}))
+        # false and absent are one configuration, including the all-default stock arm
+        self.assertEqual(parse(dict(SHARED, features={"owner_summary": False})).digest, parse(SHARED).digest)
+        stock = parse({"schema": sc.SCHEMA, "features": {"touched_bitmap": False}})
+        self.assertTrue(stock.is_native)
+        self.assertEqual(sc.capabilities(stock)["features"], {})
+        both = parse(dict(SHARED, features={"touched_bitmap": True, "owner_summary": True}))
+        self.assertEqual(both.features, (("owner_summary", True), ("touched_bitmap", True)))
+        self.assertEqual(parse(both.canonical()), both)
+        isolated = parse(dict(with_pool(mode="isolated", layout="arena"), features={"owner_summary": True}))
+        self.assertTrue(isolated.feature("owner_summary") and not isolated.feature("touched_bitmap"))
+        with self.assertRaises(KeyError):
+            both.feature("zero_miss_fast_path")
+
+    def test_alternatives_for_one_phase_are_exclusive(self):
+        """One ablation measures one technique: the two hit searches or the two recency updates never stack."""
+        for pair in sc.EXCLUSIVE_FEATURES:
+            with self.subTest(pair=pair), self.assertRaisesRegex(ValueError, "same resolver phase"):
+                parse(dict(SHARED, features=dict.fromkeys(pair, True)))
+        indexed = parse(dict(SHARED, features={"hit_index": True, "incremental_lru": True, "compact_owner": True}))
+        self.assertEqual([name for name, _ in indexed.features], ["compact_owner", "hit_index", "incremental_lru"])
+        caps = sc.capabilities(indexed)
+        self.assertTrue(caps["hit_search"].startswith("hit_index") and caps["recency_update"].startswith("incremental"))
+        self.assertTrue(caps["owner_tags"].startswith("compact_owner"))
+        cross = parse(dict(SHARED, features={"hit_index": True, "touched_bitmap": True}))
+        self.assertTrue(cross.feature("hit_index") and cross.feature("touched_bitmap"))
+
     def test_canonical_digest_and_file_pin(self):
         a = parse(json.dumps({"hot_pool": {"layout": "arena", "mode": "shared"}, "schema": sc.SCHEMA}, indent=3))
         b = parse(SHARED)

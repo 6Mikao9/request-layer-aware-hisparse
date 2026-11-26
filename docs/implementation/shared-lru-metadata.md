@@ -17,7 +17,7 @@
 
 ## 候选优化与独立开关
 
-以下均为待实现和验证的设计；当前配置解析器尚未注册这些开关，不应把表内名称直接传给服务。
+以下除 `compact_owner` 外均为待实现和验证的设计，当前配置解析器尚未注册其余开关，不应把表内名称直接传给服务。`compact_owner` 已由 [issue #6](https://github.com/6Mikao9/request-layer-aware-hisparse/issues/6) 实现，实现说明见[参考代码](reference-code.md)。
 
 | 优先级 / 建议开关 | 可减少的显存，每卡 | 实现边界与代价 |
 | --- | ---: | --- |

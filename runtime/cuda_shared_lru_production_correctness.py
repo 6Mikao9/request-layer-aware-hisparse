@@ -4,15 +4,16 @@
 
 The default exercises the two boundary planes. --all-planes adds a checked
 pass over every plane in both eager and graph modes. Always allocates all
-60 planes. The synthetic input is only for byte and table comparisons.
+60 planes. Every resolver switch set (--features) runs the same sequence
+against the mirror. The synthetic input is only for byte and table comparisons.
 """
 import argparse
 import json
 from dataclasses import asdict
 from pathlib import Path
 
-from runtime import study_config as sc
-from runtime.cuda_shared_lru_correctness import ARMS, Bench, Geometry
+from runtime import shared_lru as reference
+from runtime.cuda_shared_lru_correctness import ARMS, FEATURE_SETS, Bench, Geometry, study_config
 
 GEOMETRY = Geometry(layers=60, hot=4096, page=128, slots=2, blocks=16, block=128, dim=128, context=6400)
 
@@ -25,16 +26,16 @@ def selections(g):
     return hot, cold, mixed
 
 
-def run(torch, *, graph, all_planes, seed):
+def run(torch, *, graph, all_planes, seed, features=()):
     g = GEOMETRY
-    bench = Bench(torch, sc.parse({"schema": sc.SCHEMA, "hot_pool": ARMS["shared"],
-                                   "diagnostics": {"mode": "counters"}}), seed, geometry=g)
+    bench = Bench(torch, study_config(ARMS["shared"], features, counters=True), seed, geometry=g)
     slot, bucket = 0, g.slots
     hot, cold, mixed = selections(g)
     prompt = (cold[-1] + 1) * g.block + 3
     bench.admit(slot, prompt)
     last = g.layers - 1
-    steps = [(last, cold), (0, hot), (last, cold), (last, mixed)]
+    # The closing plane-0 call finds the ring tail past D + K and rebuilds before its victim scan.
+    steps = [(last, cold), (0, hot), (last, cold), (last, mixed), (0, mixed)]
     if all_planes:
         steps.extend((plane, mixed) for plane in range(g.layers))
     static = bench.tensors([(slot, hot)], torch.int32, torch.int64, bucket)
@@ -67,6 +68,8 @@ def run(torch, *, graph, all_planes, seed):
 
     for plane, blocks in steps:
         launch(plane, blocks)
+    if bench.runtime.ring.numel():   # bench.check compared the ring; the closing plane-0 call rebuilt it
+        assert bench.mirror.slots[slot]["meta"][0][2] >= 1
     # Distinguish the new request at the same slot and host addresses while
     # keeping the pinned host pointers captured in the original graph valid.
     bench.runtime.reset_slot(slot)
@@ -80,13 +83,24 @@ def run(torch, *, graph, all_planes, seed):
     for blocks in (cold, mixed):
         launch(last, blocks)
     bench.check_counters()
-    padded_slot = bucket - 1
-    assert int(bench.runtime.generation[padded_slot]) == 0
-    assert bool(torch.all(bench.runtime.row_owner[padded_slot] == -1))
-    assert torch.equal(bench.runtime.order[padded_slot], bench.runtime._order_template)
-    assert not bool(torch.any(bench.runtime.occupancy[padded_slot]))
+    padded_slot, runtime = bucket - 1, bench.runtime
+    assert int(runtime.generation[padded_slot]) == 0
+    free = reference.COMPACT_FREE if "compact_owner" in features else reference.FREE_TAG
+    assert bool(torch.all(runtime.row_owner[padded_slot] == free))
+    if runtime.ring.numel():
+        assert torch.equal(runtime.ring[padded_slot], runtime._ring_template)
+        assert torch.equal(runtime.ring_meta[padded_slot], runtime._meta_template)
+        assert not bool(torch.any(runtime.ring_dead[padded_slot]))
+    else:
+        assert torch.equal(runtime.order[padded_slot], runtime._order_template)
+    assert not bool(torch.any(runtime.occupancy[padded_slot]))
+    if runtime.owner_summary.numel():
+        assert not bool(torch.any(runtime.owner_summary[padded_slot]))
+    if runtime.index.numel():
+        assert bool(torch.all(runtime.index[padded_slot] == reference.INDEX_EMPTY))
+        assert not bool(torch.any(runtime.index_flags))
     assert bool(torch.all(bench.coordinator.req_device_buffer_tokens[:, padded_slot] == -1))
-    return dict(mode="graph" if graph else "eager", planes=sorted({p for p, _ in steps}),
+    return dict(mode="graph" if graph else "eager", features=list(features), planes=sorted({p for p, _ in steps}),
                 launches=len(steps) + 2, generations=2, status="pass")
 
 
@@ -94,6 +108,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-cuda-test", action="store_true")
     parser.add_argument("--all-planes", action="store_true")
+    parser.add_argument("--features", nargs="+", choices=tuple(FEATURE_SETS), default=list(FEATURE_SETS))
     parser.add_argument("--seed", type=int, default=20261124)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -111,7 +126,8 @@ def main(argv=None):
     bad = {k: v for k, v in verify_digests(Path(sglang.__file__).resolve().parent).items() if v != "ok"}
     if bad:
         raise RuntimeError(f"Pinned SGLang source mismatch: {bad}")
-    results = [run(torch, graph=graph, all_planes=args.all_planes, seed=args.seed) for graph in (False, True)]
+    results = [run(torch, graph=graph, all_planes=args.all_planes, seed=args.seed, features=FEATURE_SETS[name])
+               for name in args.features for graph in (False, True)]
     summary = dict(event="hisparse_shared_lru_production_cuda_gate", geometry=asdict(GEOMETRY),
                    seed=args.seed, status="pass", torch=str(torch.__version__),
                    device=torch.cuda.get_device_name(), results=results)

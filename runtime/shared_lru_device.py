@@ -10,7 +10,8 @@ pinned symbols below. The stock and all-default configurations install nothing.
 * ``HiSparseCoordinator.__init__``: compatibility gate, TP identity agreement,
   arena tables allocated before graph capture, startup receipt.
 * ``alloc_device_buffer`` / ``request_finished``: per-slot generation, owner
-  tags, recency lists and occupancy; native tables stay authoritative.
+  tags, recency lists, occupancy and (``features.owner_summary``) owner-plane
+  bits per 32-row block; native tables stay authoritative.
 * ``admit_request_direct``: rejected; disaggregated direct admission is unsupported.
 * ``swap_in_selected_blocks``: ``rlh_shared_lru::resolve`` replaces the native
   layer-local kernel; output shape, dtype and the -1 sentinel are unchanged.
@@ -35,6 +36,18 @@ JIT_NAME = "request_layer_hisparse_shared_lru_v1"
 BLOCK_SIZE = 1024
 MAX_DEVICE_PLANES = 64
 MAX_DEVICE_SELECTION = 2048
+SM80_MAX_SHARED_MEMORY = 166_912  # cudaDevAttrMaxSharedMemoryPerBlockOptin on A100 (sm_80)
+# Resolver switches in the order of the kernel's template arguments after kCounters.
+RESOLVER_SWITCHES = ("owner_summary", "touched_bitmap", "hit_index", "incremental_lru", "compact_owner")
+# Tensor arguments of rlh_shared_lru::resolve, in order; the integers follow (launch_arguments).
+RESOLVE_TENSORS = ("top_k", "req_pool_indices", "seq_lens", "num_real_reqs", "row_token", "row_owner", "order",
+                   "occupancy", "floors", "generation", "device_locs", "host_locs", "host_k", "host_v", "arena_k",
+                   "arena_v", "out", "status", "counters", "owner_summary", "index", "index_flags", "ring",
+                   "ring_dead", "ring_pos", "ring_meta")
+RESOLVE_INTS = ("plane", "num_planes", "hot_rows", "plane_rows", "order_offset", "order_size", "scratch_offset",
+                "scratch_size", "item_size_bytes", "index_half", "row_bits", "ring_offset", "ring_capacity",
+                "dead_offset", "meta_offset", "rebuild_tail")
+INT32_MAX = 2**31 - 1
 COORDINATOR = "srt/managers/hisparse_coordinator.py"
 # (pinned file, qualified symbol, required leading parameters or None)
 SYMBOLS = (
@@ -139,30 +152,96 @@ def validate_device_geometry(planes, selected):
         raise ValueError(f"The SM80 selection width must be a power of two up to {MAX_DEVICE_SELECTION}")
 
 
+def resolver_shared_memory(selected, domain_rows, touched_bitmap, block_size=BLOCK_SIZE):
+    """Dynamic shared memory of one launch, as ``SmemLayout`` in shared_lru_kernel.cuh computes it."""
+    warps, owners = block_size // 32, MAX_DEVICE_PLANES + 1
+    words = 6 * selected + 2 * (2 * selected) + (warps + 1) + 8 + owners + warps * owners
+    fixed = words * 4 + 2 * selected * 2 + selected
+    if not touched_bitmap:
+        return fixed
+    return (fixed + 15) // 16 * 16 + -(-domain_rows // 32) * 4
+
+
+def check_shared_memory(config, plan):
+    """Largest launch of this arm; touched_bitmap needs one bit per domain row next to the fixed layout."""
+    largest = max(resolver_shared_memory(plan.selected, size, config.feature("touched_bitmap"))
+                  for _, size in plan.domains)
+    if largest > SM80_MAX_SHARED_MEMORY:
+        raise ValueError(f"Resolver needs {largest} B of shared memory per CTA; sm_80 allows "
+                         f"{SM80_MAX_SHARED_MEMORY} B (touched_bitmap grows with the domain)")
+    return largest
+
+
 def kernel_variants(config, plan, top_k_blocks, block_size):
     """JIT template arguments a worker will build for this arm (one or two variants)."""
     pool = config.hot_pool
     common = (BLOCK_SIZE, top_k_blocks, block_size, pool.eviction == "fifo", pool.quota == "soft_floor")
+    switches = tuple(config.feature(name) for name in RESOLVER_SWITCHES)
     bypass = sorted({plane in plan.bypass for plane in range(len(plan.layers))})
-    return [common + (b, config.diagnostics == "counters") for b in bypass]
+    return [common + (b, config.diagnostics == "counters") + switches for b in bypass]
 
 
-def tensor_contracts(geo, plan):
+def ring_launch_args(plan, plane, incremental):
+    """(ring offset, capacity, dead-word offset, meta offset, rebuild tail) of one plane's launch."""
+    if not incremental:
+        return 0, 0, 0, 0, INT32_MAX
+    domain = reference.ring_domain(plan, plane)
+    offset, capacity, dead_offset, first = reference.ring_domains(plan)[domain]
+    rebuild = plan.domains[domain][1] + plan.selected if plane == first else INT32_MAX
+    return offset, capacity, dead_offset, 4 * domain, rebuild
+
+
+def launch_arguments(config, plan, geo):
+    """Grid, block, dynamic shared memory, template and integer arguments of every plane's launch."""
+    pool = config.hot_pool
+    half, bits = reference.index_geometry(plan) if config.feature("hit_index") else (0, 0)
+    planes = []
+    for plane in range(len(plan.layers)):
+        offset, size = plan.domain(plane)
+        values = (plane, len(plan.layers), plan.hot_rows, geo["plane_rows"], offset, size, plan.scratch[0],
+                  plan.scratch[1], geo["item_size_bytes"], half, bits,
+                  *ring_launch_args(plan, plane, config.feature("incremental_lru")))
+        template = [BLOCK_SIZE, geo["top_k_blocks"], geo["block_size"], pool.eviction == "fifo",
+                    pool.quota == "soft_floor", plane in plan.bypass, config.diagnostics == "counters",
+                    *(config.feature(name) for name in RESOLVER_SWITCHES)]
+        planes.append(dict(template_args=template, int_args=dict(zip(RESOLVE_INTS, values))))
+    return dict(kernel="rlh_shared_lru::resolve_kernel", grid="[B, 1, 1]: one CTA per graph row",
+                block=[BLOCK_SIZE, 1, 1], dynamic_shared_memory_bytes=check_shared_memory(config, plan),
+                tensor_args=list(RESOLVE_TENSORS), planes=planes)
+
+
+def tensor_contracts(geo, plan, features=()):
     L, H, page, rows = len(geo["layers"]), geo["hot_rows"], geo["page"], geo["plane_rows"]
-    return {
+    contracts = {
         "top_k_blocks": f"[B, {geo['top_k_blocks']}] int32 selector blocks; -1 is invalid",
         "req_pool_indices, seq_lens": "[B] int32 or int64 graph inputs; num_real_reqs [1] int32",
         "row_token": f"native req_device_buffer_tokens [{L}, slots, {H + page}] int32; "
                      f"row r -> [r // {H}, slot, r % {H}]",
-        "row_owner": f"[slots, {plan.rows}] int32: generation << 16 | plane, -1 free",
-        "order": f"[slots, {plan.rows}] int32 recency regions {list(plan.domains)}",
+        "row_owner": (f"[slots, {plan.rows}] uint8 plane, 254 taken, 255 free (features.compact_owner)"
+                      if "compact_owner" in features else f"[slots, {plan.rows}] int32: generation << 16 | plane, -1 free"),
+        "order": (f"[slots, {sum(size for _, size in plan.domains)}] int32 recency regions {list(plan.domains)}; "
+                  "bypass scratch rows have no entry (features.incremental_lru: [0, 0])"),
         "occupancy, floors, generation": f"[slots, {L}] int32, [{L}] int32, [slots] int32",
+        "owner_summary": (f"[slots, {reference.summary_blocks(plan.rows)}] int64 owner-plane bits per "
+                          f"{reference.SUMMARY_ROWS}-row block (features.owner_summary; else [0, 0])"),
         "device_locs": f"req_device_buffer_token_locs[plane] [slots, {H + page}] int32; column {H} is the tail",
         "host_k, host_v": f"mem_pool_host.k_buffer[plane] / v_buffer[plane], {geo['item_size_bytes']} B per row",
         "arena_k, arena_v": f"contiguous [{L}, {rows}, {geo['kv_heads_per_rank']}, {geo['head_dim']}]; "
                             f"consumer view [{L * rows}, heads, dim]",
         "output": f"top_k_device_locs_buffer[:B, :{geo['selected']}] int32 = plane * {rows} + loc; -1 invalid",
     }
+    if "hit_index" in features:
+        half, bits = reference.index_geometry(plan)
+        contracts["index, index_flags"] = (f"[slots, {2 * half * reference.INDEX_WAYS}] int32 = fingerprint << {bits} | row, "
+                                           f"-1 empty; buckets of {reference.INDEX_WAYS}, left < {half} <= right; "
+                                           "[slots] int32 sticky overflow flag")
+    if "incremental_lru" in features:
+        rings = reference.ring_domains(plan)
+        contracts["ring, ring_dead, ring_pos, ring_meta"] = (
+            f"[slots, {sum(c for _, c, _, _ in rings)}] int32 entries, [slots, "
+            f"{sum(-(-c // 32) for _, c, _, _ in rings)}] dead-bit words, [slots, {plan.rows}] ring index per row, "
+            f"[slots, {4 * len(rings)}] head/tail/rebuilds per domain; capacities {[c for _, c, _, _ in rings][:4]}")
+    return contracts
 
 
 def dry_run(root, config, geo):
@@ -171,10 +250,12 @@ def dry_run(root, config, geo):
     if len(plan.layers) * geo["plane_rows"] > 2**31 - 1:
         raise ValueError("Flat consumer index would exceed int32")
     validate_device_geometry(len(plan.layers), geo["selected"])
+    shared_memory = check_shared_memory(config, plan)
     digests, symbols = verify_digests(root), resolve_symbols(root)
     ledger = reference.byte_ledger(layers=geo["layers"], hot_rows=geo["hot_rows"], page=geo["page"],
                                    item_bytes=geo["item_size_bytes"], slots=geo["slots"], pool_rows=geo["plane_rows"],
-                                   plan=plan, counters=config.diagnostics == "counters")
+                                   plan=plan, counters=config.diagnostics == "counters",
+                                   features=[name for name, _ in config.features])
     ok = all(v == "ok" for v in digests.values()) and all(s["status"] == "ok" for s in symbols)
     return dict(status="pass" if ok else "fail", config_sha256=config.digest, resolved_config=config.as_dict(),
                 capabilities=sc.capabilities(config), digests=digests, symbols=symbols,
@@ -182,10 +263,13 @@ def dry_run(root, config, geo):
                                     kernel_source_sha256=hashlib.sha256(KERNEL_SOURCE.read_bytes()).hexdigest(),
                                     template_args=[list(v) for v in kernel_variants(
                                         config, plan, geo["top_k_blocks"], geo["block_size"])],
+                                    max_shared_memory_bytes_per_cta=shared_memory,
                                     consumer=f"{CONSUMER_MODULE}.{CONSUMER}"),
                 plan=dict(rows=plan.rows, domains=list(plan.domains), scratch=list(plan.scratch),
                           bypass_planes=list(plan.bypass), floors=list(plan.floors)),
-                geometry=geo, tensor_contracts=tensor_contracts(geo, plan), budget_units=ledger,
+                geometry=geo, tensor_contracts=tensor_contracts(geo, plan, [name for name, _ in config.features]),
+                budget_units=ledger,
+                launch=launch_arguments(config, plan, geo),
                 pending_hardware=["sm80_jit_build", "cuda_graph_capture_replay", "physical_memory_receipt",
                                   "serving_tpot_throughput"])
 def contiguous_create_buffers(self):
@@ -264,10 +348,12 @@ def check_coordinator(coordinator, *, torch, context):
         raise RuntimeError("Shared arena incompatible: " + "; ".join(errors))
     return layers
 @functools.cache
-def _jit_module(block_size, num_top_k, sparse_block_size, fifo, soft_floor, bypass, counters):
+def _jit_module(block_size, num_top_k, sparse_block_size, fifo, soft_floor, bypass, counters, owner_summary,
+                touched_bitmap, hit_index, incremental_lru, compact_owner):
     from sglang.kernels.jit.utils import load_jit, make_cpp_args
     from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
-    args = make_cpp_args(block_size, num_top_k, sparse_block_size, fifo, soft_floor, bypass, counters)
+    args = make_cpp_args(block_size, num_top_k, sparse_block_size, fifo, soft_floor, bypass, counters, owner_summary,
+                         touched_bitmap, hit_index, incremental_lru, compact_owner)
     return load_jit(JIT_NAME, *args, cuda_files=[str(KERNEL_SOURCE)],
                     cuda_wrappers=[("resolve", f"rlh_shared_lru::resolve<{args}>")],
                     extra_include_paths=[str(KERNEL_PATH / "csrc")])
@@ -288,32 +374,87 @@ class ArenaRuntime:
         if planes * self.plane_rows > 2**31 - 1:
             raise RuntimeError("Flat consumer index would exceed int32")
         validate_device_geometry(planes, self.plan.selected)
+        try:
+            self.shared_memory = check_shared_memory(config, self.plan)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from None
         if self.k_all.stride(1) * self.k_all.element_size() != self.item_size_bytes:
             raise RuntimeError("Main-KV row stride differs from the coordinator item size")
         tokens = coordinator.req_device_buffer_tokens
         slots, device, i32 = tokens.shape[1], tokens.device, torch.int32
+        feature = config.feature
+        self._switches = tuple(feature(name) for name in RESOLVER_SWITCHES)
         owners = self.plan.owner_template()
-        self._owner_base = torch.tensor([-1 if o is None else o for o in owners], dtype=i32, device=device)
-        self._owned = torch.tensor([0 if o is None else 1 for o in owners], dtype=i32, device=device)
-        self._order_template = torch.tensor(self.plan.order_template(), dtype=i32, device=device)
+        empty = torch.zeros((0, 0), dtype=i32, device=device)
+        if feature("compact_owner"):  # one byte per row: the plane, 254 taken, 255 free; no generation
+            free, u8 = reference.COMPACT_FREE, torch.uint8
+            self._owner_base = torch.tensor([free if o is None else o for o in owners], dtype=u8, device=device)
+            self._owned = None
+            self.row_owner = torch.full((slots, rows), free, dtype=u8, device=device)
+        else:
+            self._owner_base = torch.tensor([-1 if o is None else o for o in owners], dtype=i32, device=device)
+            self._owned = torch.tensor([0 if o is None else 1 for o in owners], dtype=i32, device=device)
+            self.row_owner = torch.full((slots, rows), reference.FREE_TAG, dtype=i32, device=device)
+        self._plane_args = [(0, 0, 0, 0, INT32_MAX)] * planes   # ring offset, capacity, dead offset, meta, rebuild
+        if feature("incremental_lru"):
+            rings = reference.ring_domains(self.plan)
+            ring, positions = reference.ring_templates(self.plan)
+            self._ring_template = torch.tensor(ring, dtype=i32, device=device)
+            self._pos_template = torch.tensor(positions, dtype=i32, device=device)
+            self._meta_template = torch.tensor([[0, size, 0, 0] for _, size in self.plan.domains], dtype=i32,
+                                               device=device).reshape(-1)
+            self.ring = self._ring_template.repeat(slots, 1)
+            self.ring_dead = torch.zeros((slots, sum(-(-c // 32) for _, c, _, _ in rings)), dtype=i32, device=device)
+            self.ring_pos = self._pos_template.repeat(slots, 1)
+            self.ring_meta = self._meta_template.repeat(slots, 1)
+            self._order_template, self.order = None, empty
+            self._plane_args = [ring_launch_args(self.plan, plane, True) for plane in range(planes)]
+        else:
+            self._order_template = torch.tensor(self.plan.order_template(), dtype=i32, device=device)
+            self.order = self._order_template.repeat(slots, 1)
+            self.ring = self.ring_dead = self.ring_pos = self.ring_meta = empty
+        if feature("hit_index"):
+            self.index_half, self.row_bits = reference.index_geometry(self.plan)
+            entries = [entry for bucket in reference.build_index(self.plan) for entry in bucket]
+            self._index_template = torch.tensor(entries, dtype=i32, device=device)
+            self.index = torch.full((slots, len(entries)), reference.INDEX_EMPTY, dtype=i32, device=device)
+            self.index_flags = torch.zeros(slots, dtype=i32, device=device)
+        else:
+            self.index_half = self.row_bits = 0
+            self.index, self.index_flags = empty, torch.zeros(0, dtype=i32, device=device)
         self._occupancy_template = torch.tensor([owners.count(p) for p in range(planes)], dtype=i32, device=device)
-        self.row_owner = torch.full((slots, rows), reference.FREE_TAG, dtype=i32, device=device)
-        self.order = self._order_template.repeat(slots, 1)
         self.occupancy = torch.zeros((slots, planes), dtype=i32, device=device)
         self.floors = torch.tensor(self.plan.floors, dtype=i32, device=device)
         self.generation = torch.zeros(slots, dtype=i32, device=device)
         self.status = torch.zeros(1, dtype=i32, device=device)
         width = len(reference.COUNTER_FIELDS) if config.diagnostics == "counters" else 0
         self.counters = torch.zeros((planes if width else 0, width), dtype=torch.int64, device=device)
+        # owner_summary: int64 words carry the 64 plane bits (plane 63 is the sign bit).
+        blocks = reference.summary_blocks(rows) if config.feature("owner_summary") else 0
+        words = [w - (1 << 64) if w >> 63 else w for w in reference.owner_summary(owners)][:blocks]
+        self._summary_template = torch.tensor(words, dtype=torch.int64, device=device)
+        self.owner_summary = torch.zeros((slots if blocks else 0, blocks), dtype=torch.int64, device=device)
         self.flat_k = self.k_all.view(planes * self.plane_rows, *self.k_all.shape[2:])
         self.flat_v = self.v_all.view(planes * self.plane_rows, *self.v_all.shape[2:])
         self._allocations = [0] * slots
 
     def tables(self):
-        return dict(row_owner=self.row_owner, order=self.order, occupancy=self.occupancy, floors=self.floors,
-                    generation=self.generation, status=self.status, counters=self.counters,
-                    owner_template=self._owner_base, owned_template=self._owned,
-                    order_template=self._order_template, occupancy_template=self._occupancy_template)
+        tables = dict(row_owner=self.row_owner, occupancy=self.occupancy, floors=self.floors,
+                      generation=self.generation, status=self.status, counters=self.counters,
+                      owner_template=self._owner_base, occupancy_template=self._occupancy_template)
+        if self._owned is not None:
+            tables["owned_template"] = self._owned
+        if self._order_template is not None:
+            tables.update(order=self.order, order_template=self._order_template)
+        else:
+            tables.update(ring=self.ring, ring_dead=self.ring_dead, ring_pos=self.ring_pos, ring_meta=self.ring_meta,
+                          ring_template=self._ring_template, ring_pos_template=self._pos_template,
+                          ring_meta_template=self._meta_template)
+        if self.owner_summary.numel():
+            tables.update(owner_summary=self.owner_summary, owner_summary_template=self._summary_template)
+        if self.index.numel():
+            tables.update(index=self.index, index_flags=self.index_flags, index_template=self._index_template)
+        return tables
 
     def signature(self):
         kernel = hashlib.sha256(KERNEL_SOURCE.read_bytes()).hexdigest()
@@ -327,14 +468,31 @@ class ArenaRuntime:
         self._allocations[rid] += 1
         owner = self.row_owner[rid]
         owner.copy_(self._owner_base)
-        owner.add_(self._owned, alpha=generation << 16)
-        self.order[rid].copy_(self._order_template)
+        if self._owned is not None:
+            owner.add_(self._owned, alpha=generation << 16)
+        if self._order_template is not None:
+            self.order[rid].copy_(self._order_template)
+        else:
+            self.ring[rid].copy_(self._ring_template)
+            self.ring_dead[rid].zero_()
+            self.ring_pos[rid].copy_(self._pos_template)
+            self.ring_meta[rid].copy_(self._meta_template)
         self.occupancy[rid].copy_(self._occupancy_template)
+        if self.owner_summary.numel():
+            self.owner_summary[rid].copy_(self._summary_template)
+        if self.index.numel():
+            self.index[rid].copy_(self._index_template)
+            self.index_flags[rid] = 0
         self.generation[rid] = generation
         return generation
 
     def reset_slot(self, rid):
-        self.row_owner[rid].fill_(reference.FREE_TAG)
+        self.row_owner[rid].fill_(reference.COMPACT_FREE if self._owned is None else reference.FREE_TAG)
+        if self.owner_summary.numel():
+            self.owner_summary[rid].zero_()
+        if self.index.numel():
+            self.index[rid].fill_(reference.INDEX_EMPTY)
+            self.index_flags[rid] = 0
     def resolve(self, coordinator, req_pool_indices, seq_lens, top_k_blocks, layer_id, sparse_block_size):
         """Graph-safe swap-in: views, constants and one kernel launch; no sync, no allocation."""
         torch, plan = self.torch, self.plan
@@ -348,14 +506,17 @@ class ArenaRuntime:
         offset, size = plan.domain(plane)
         pool = self.config.hot_pool
         module = _jit_module(BLOCK_SIZE, num_blocks, sparse_block_size, pool.eviction == "fifo",
-                             pool.quota == "soft_floor", plane in plan.bypass, self.config.diagnostics == "counters")
+                             pool.quota == "soft_floor", plane in plan.bypass, self.config.diagnostics == "counters",
+                             *self._switches)
         host = coordinator.mem_pool_host
         args = (top_k_blocks, req_pool_indices, seq_lens, coordinator.num_real_reqs,
                 coordinator.req_device_buffer_tokens, self.row_owner, self.order, self.occupancy, self.floors,
                 self.generation, coordinator.req_device_buffer_token_locs[plane], coordinator.req_to_host_pool,
                 host.k_buffer[plane], host.v_buffer[plane], self.k_all, self.v_all, out, self.status, self.counters,
-                plane, len(self.layers), self.hot_rows, self.plane_rows, offset, size,
-                plan.scratch[0], plan.scratch[1], self.item_size_bytes)
+                self.owner_summary, self.index, self.index_flags, self.ring, self.ring_dead, self.ring_pos,
+                self.ring_meta, plane, len(self.layers), self.hot_rows, self.plane_rows, offset, size,
+                plan.scratch[0], plan.scratch[1], self.item_size_bytes, self.index_half, self.row_bits,
+                *self._plane_args[plane])
         if self.config.diagnostics == "nsys":
             with torch.cuda.nvtx.range(f"rlh_shared_lru.resolve L{layer_id}"):
                 module.resolve(*args)
@@ -375,11 +536,16 @@ class ArenaRuntime:
         return self.flat_k, self.flat_v
 
     def counter_snapshot(self):
-        """Diagnostics only (synchronizes): per-layer counters and sticky status bits."""
+        """Diagnostics only (synchronizes): per-layer counters, sticky status bits, index and ring events."""
         values = self.counters.cpu().tolist()
-        return dict(event="hisparse_shared_lru_counters", status=int(self.status.item()),
-                    layers={str(layer): dict(zip(reference.COUNTER_FIELDS, row))
-                            for layer, row in zip(self.layers, values)})
+        snapshot = dict(event="hisparse_shared_lru_counters", status=int(self.status.item()),
+                        layers={str(layer): dict(zip(reference.COUNTER_FIELDS, row))
+                                for layer, row in zip(self.layers, values)})
+        if self.index.numel():
+            snapshot["index_parked_slots"] = int(self.index_flags.sum().item())
+        if self.ring.numel():
+            snapshot["ring_rebuilds"] = int(self.ring_meta.view(self.ring_meta.shape[0], -1, 4)[:, :, 2].sum().item())
+        return snapshot
 
     def receipt(self, coordinator, rank, tp_size):
         torch = self.torch
@@ -401,6 +567,7 @@ class ArenaRuntime:
                     resolved_config=self.config.as_dict(), capabilities=sc.capabilities(self.config),
                     signature=self.signature(), plan=dict(bypass_planes=list(self.plan.bypass),
                                                           floors=list(self.plan.floors)),
+                    resolver_shared_memory_bytes_per_cta=self.shared_memory,
                     bytes=dict(main_kv_k=size(self.k_all), main_kv_v=size(self.v_all),
                                arena_tables={k: size(v) for k, v in self.tables().items()}, native_tables=native,
                                host_pinned=sum(size(t) for t in (*host.k_buffer, *host.v_buffer))),
