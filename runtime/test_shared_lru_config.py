@@ -118,17 +118,62 @@ class StudyConfigParser(unittest.TestCase):
                                                           "calibration": {"training_sha256": "a" * 64,
                                                                           "list_sha256": "b" * 64}}})
         self.assertEqual(fixed.placement.offload_layers, (3, 7))
-        self.assertIn("not implemented", sc.unsupported_reasons(fixed)[0])
+        self.assertEqual(sc.unsupported_reasons(fixed), [])
+        self.assertEqual(sc.capabilities(fixed)["runtime"], "fixed_layers_stock_paths")
+        fixed_arena = parse({"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": [3]},
+                             "hot_pool": {"mode": "shared", "layout": "arena"}})
+        self.assertIn("combined effort", sc.unsupported_reasons(fixed_arena)[0])
+        self.assertIn("without --enable-hisparse",
+                      sc.unsupported_reasons(parse({"schema": sc.SCHEMA, "placement": {"mode": "full_resident"}}))[0])
         counters = parse({"schema": sc.SCHEMA, "diagnostics": {"mode": "counters"}})
         self.assertTrue(sc.unsupported_reasons(counters))
         self.assertEqual(sc.unsupported_reasons(parse(dict(SHARED, diagnostics={"mode": "counters"}))), [])
 
+    def test_dynamic_offload_switches_and_registered_lists(self):
+        def fixed(features=None, alternates=None, **pool):
+            placement = {"mode": "fixed_layers", "offload_layers": [4, 2]}
+            if alternates is not None:
+                placement["alternate_offload_layers"] = alternates
+            return {"schema": sc.SCHEMA, "placement": placement, "features": features or {},
+                    **({"hot_pool": pool} if pool else {})}
+        rejected = [
+            (fixed({"dynamic_offload": True}, [[2, 6]]), "needs features.route_indirect"),
+            (fixed({"route_indirect": True, "dynamic_offload": True}), "alternate_offload_layers to switch"),
+            (fixed({"route_indirect": True, "host_shadow": True}, [[2, 6]]), "needs features.dynamic_offload"),
+            (fixed(alternates=[[2, 6]]), "needs features.route_indirect"),
+            (fixed({"route_indirect": True}, [[2, 6, 8]]), "as many layers"),
+            (fixed({"route_indirect": True}, [[6, 2], [2, 6]]), "repeats"),
+            (fixed({"route_indirect": True}, [[2, 4]]), "repeats"),
+            (fixed({"route_indirect": True}, []), "non-empty"),
+            (fixed({"route_indirect": True}, [[2, 2]]), "repeats a layer"),
+            (fixed({"route_indirect": True}, mode="shared", layout="arena"), "layout=native"),
+            ({"schema": sc.SCHEMA, "features": {"route_indirect": True}}, "fixed_layers"),
+            ({"schema": sc.SCHEMA, "placement": {"mode": "native", "alternate_offload_layers": [[1]]}}, "fixed_layers"),
+        ]
+        for value, pattern in rejected:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, pattern):
+                parse(value)
+        dynamic = parse(fixed({"route_indirect": True, "dynamic_offload": True, "host_shadow": True},
+                              [[2, 6], [8, 4]]))
+        self.assertEqual(dynamic.offload_lists, ((2, 4), (2, 6), (4, 8)))
+        self.assertEqual(dynamic.as_dict()["placement"]["alternate_offload_layers"], [[2, 6], [4, 8]])
+        self.assertEqual(parse(dynamic.canonical()), dynamic)
+        caps = sc.capabilities(dynamic)
+        self.assertEqual((caps["runtime"], caps["placement"]["switchable_layers"]), ("dynamic_layer_offload",
+                                                                                     [2, 4, 6, 8]))
+        self.assertEqual(caps["features"], dict(route_indirect=True, dynamic_offload=True, host_shadow=True))
+        indirect = parse(fixed({"route_indirect": True}, [[2, 6]]))
+        self.assertEqual(sc.capabilities(indirect)["runtime"], "fixed_layers_route_indirect")
+        self.assertIsNone(sc.capabilities(indirect)["switching"])
+        self.assertNotEqual(indirect.digest, parse(fixed({"route_indirect": True})).digest)
+        self.assertEqual(sc.unsupported_reasons(dynamic), [])
+
     def test_resolver_switches_are_arena_only_and_canonical_when_enabled(self):
-        self.assertEqual(sc.FEATURES, ("owner_summary", "touched_bitmap", "hit_index", "incremental_lru",
-                                       "compact_owner"))
+        self.assertEqual(sc.ARENA_FEATURES, ("owner_summary", "touched_bitmap", "hit_index", "incremental_lru",
+                                             "compact_owner"))
         phase = dict(owner_summary="hit_search", hit_index="hit_search", touched_bitmap="recency_update",
                      incremental_lru="recency_update", compact_owner="owner_tags")
-        for name in sc.FEATURES:
+        for name in sc.ARENA_FEATURES:
             on = parse(dict(SHARED, features={name: True}))
             with self.subTest(feature=name):
                 self.assertTrue(on.feature(name))
@@ -136,7 +181,7 @@ class StudyConfigParser(unittest.TestCase):
                 self.assertEqual(on.as_dict()["features"], {name: True})
                 self.assertNotEqual(on.digest, parse(SHARED).digest)
                 caps = sc.capabilities(on)
-                self.assertEqual(caps["features"], {n: n == name for n in sc.FEATURES})
+                self.assertEqual(caps["features"], {n: n == name for n in sc.ARENA_FEATURES})
                 self.assertTrue(caps[phase[name]].startswith(name))
                 for value in (with_pool(), with_pool(mode="isolated", layout="native")):
                     with self.assertRaisesRegex(ValueError, "layout=native"):

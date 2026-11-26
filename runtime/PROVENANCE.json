@@ -51,5 +51,29 @@
     "kernels/jit/utils/arch.py": "5679722e62ed99f2008f04e7239f003d7a2a772ba535f9a912e318573c2b9eea",
     "kernels/jit/include/sgl_kernel/runtime.cuh": "1f989a2dee7a32ab519eeb49adf407c5e4054195faa77aa92ce4211343973213",
     "kernels/jit/include/sgl_kernel/utils.cuh": "18b0bb2e27dccc20d7509e8b6b6c16e2b57a5ce98be648865fb75059be8a13db"
+  },
+  "dynamic_offload_dependency_source": "Public sgl-project/sglang@e7399a46f420d5903c3f2eddee74f0f9cfe68e11 (raw files, 2026-11-27); files the issue #11 layer-offload adapter patches or relies on beyond the sections above. Confirm on the pinned image before the first GPU run.",
+  "dynamic_offload_dependency_sha256": {
+    "srt/mem_cache/pool_host/hisparse.py": "0f94fd23d74613556ac5dbca59d8399fd3c5f6cbfc8758775bedb5fb5b8f9e01",
+    "srt/model_executor/pool_configurator.py": "82491f3441e44bbf6471aa7f7eb4540d687f898b370b675b6f19b15cd0c6e6d5",
+    "srt/managers/scheduler_components/internal_state.py": "3879413625ca0991e3a64ca6a969a67afd1209aeb5c5760c4ab4ba7f46e98184",
+    "srt/mem_cache/deepseek_v4_memory_pool.py": "334188ac59d7d95bf3201c52c62defbb6576f71273b85a89a53798b0b979c5fb",
+    "srt/mem_cache/memory_pool_host.py": "9552593790773ab0049a7574a748d36d39d98a0aeec3dc2bb8278eebf47322c4",
+    "srt/mem_cache/device_pool_info.py": "8885e676e798a75d6f7d47d121b74e39b2c132c2e5ef126759c3d1d1a3104d31",
+    "srt/layers/attention/deepseek_v4_backend.py": "3f2629233ccf5de8db282884ecaa1939fa254b2b5305b30d9e4f83451c45af2a",
+    "srt/layers/attention/dsv4/indexer.py": "4d0da92df2d73c9100ff9a235bb8312a02b412f457ea976a14fbd01825b0b9f6",
+    "srt/layers/attention/dsv4/compressor_v2.py": "561ea9236fdb105a233e010f50ddea069d0da83a0d84c2088807992f7112954c",
+    "srt/models/deepseek_v4.py": "07294f0cf909a515289fab6bf07d2076a3eb50284b9f873f38b2f1339793d674",
+    "kernels/jit/include/sgl_kernel/deepseek_v4/kvcacheio.cuh": "be8387ed456d64f9fe707a02708d541ac7793723619af63d36d2206f0ebc16bc",
+    "kernels/ops/attention/dsv4/kv_layout.py": "e68c2e0143751ebabf9718d0fea9657d047e8c62a70f4a16ded1d1c2f166ee93",
+    "kernels/ops/attention/dsv4/metadata_kernel.py": "167df2f718c9c567cdcca2fe05c344af428e3d8b639839fa7cce96bc95018029",
+    "srt/managers/schedule_batch.py": "628d01c3fa14a669230d5413ca17144ec9c6ae33008f95f021ec1c3b882b633f",
+    "srt/managers/scheduler.py": "fc96ed4b680fdf55621a5397f844cfd4cbd30213f44eec8a888b7cce75cafe60",
+    "srt/managers/scheduler_components/batch_result_processor.py": "4867c24b439c9a26718edafdfc7ab0fa682b1597a91c0033f4facfbea896ad80",
+    "srt/configs/model_config.py": "9606b3b4f63f332df734c116d0840dd7149fd856549e8eddfaf2906a816b3959",
+    "srt/mem_cache/sparsity/factory.py": "be8068d45f9422e5a6c7a6a122980011e67a08adb36753269dbe0ec87ee89bf3"
+  },
+  "dynamic_offload_generated_sha256": {
+    "hisparse_route.cuh": "0aa4fcfb507ba180d8f7a9595c0d10d926425e1a699e52c22a5a01d4f05d1fb7"
   }
 }

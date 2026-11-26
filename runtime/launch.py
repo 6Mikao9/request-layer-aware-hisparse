@@ -153,6 +153,23 @@ def check_study_execution(argv):
             raise ValueError("Shared-arena decode must be eager or full CUDA Graph")
 
 
+def check_offload_execution(argv, study_config):
+    """Fixed offload sets share the arena's single-stream rules; route_indirect also needs eager prefill, whose
+    stores and reads are routed in Python at call time."""
+    check_study_execution(argv)
+    if not study_config.feature("route_indirect"):
+        return
+    if "--enable-mixed-chunk" in argv:
+        raise ValueError("features.route_indirect routes decode stores to tail rows; mixed chunks would send decode "
+                         "tokens through the prefill path")
+    raw_graph = flag_value(argv, "--cuda-graph-config")
+    prefill = parse_object(raw_graph).get("prefill", {}) if raw_graph is not None else None
+    if "--disable-prefill-cuda-graph" not in argv and (type(prefill) is not dict
+                                                       or prefill.get("backend") != "disabled"):
+        raise ValueError("features.route_indirect requires eager prefill: pass --disable-prefill-cuda-graph or a "
+                         "--cuda-graph-config prefill backend 'disabled'")
+
+
 def check_plan(plan, policy, request_config=None, study_config=None):
     if type(plan.tp_size) is not int or plan.tp_size not in (4, 8):
         raise ValueError("The launcher requires explicit TP4 or TP8")
@@ -280,6 +297,8 @@ def resolve(argv):
             study_config, study_digest = read_study_config(study_path)
             if study_config.uses_arena:
                 check_study_execution(sglang_argv)
+            elif study_config.uses_fixed_layers:
+                check_offload_execution(sglang_argv, study_config)
         if options.six_layer_timing:
             required = {"--disable-cuda-graph", "--disable-prefill-cuda-graph",
                         "--disable-overlap-schedule", "--disable-radix-cache"}
@@ -338,6 +357,9 @@ def install_for_process(plan):
         install(**request_config.install_kwargs())
     elif study_config is not None and study_config.uses_arena:
         from .shared_lru_device import install
+        install(study_config, plan.study_config_sha256)
+    elif study_config is not None and study_config.uses_fixed_layers:
+        from .dynamic_offload_device import install
         install(study_config, plan.study_config_sha256)
     elif plan.shadow_identity_directory is not None:
         from .shadow import install

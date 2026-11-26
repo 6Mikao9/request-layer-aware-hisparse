@@ -60,9 +60,10 @@ class StudyConfigLauncher(unittest.TestCase):
 
     def test_rejections_happen_before_any_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
-            fixed = Path(tmp) / "fixed.json"
+            fixed = Path(tmp) / "fixed.json"         # route_indirect without eager prefill
             fixed.write_text(json.dumps({"schema": "hisparse-study-config-v1",
-                                         "placement": {"mode": "fixed_layers", "offload_layers": [3]}}))
+                                         "placement": {"mode": "fixed_layers", "offload_layers": [3]},
+                                         "features": {"route_indirect": True}}))
             typo = Path(tmp) / "typo.json"
             typo.write_text('{"schema": "hisparse-study-config-v1", "hot_pool": {"mode": "shared"}}')
             shared = str(ARMS / "shared_arena.json")
