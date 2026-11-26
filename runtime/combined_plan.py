@@ -13,19 +13,25 @@ Arms (docs/implementation/combined.md, "固定物理预算的稳态比较"):
   ``features.resident_direct``: C ``L_stock_layout`` (per-layer offload alone, stock
   kernel) and ``L_isolated_arena`` (same addressing as E, borrowing off); D
   ``L_static_quota`` (training-frozen static quota); E ``L_shared_arena`` (borrowing among
-  S only). Lists in ``resident_direct_lists`` add ``L_shared_resident_resolver``: E with
-  the resident resolver instead of the direct read.
+  S only). Lists in ``resident_direct_lists`` add ``L_stock_resident_resolver`` and
+  ``L_shared_resident_resolver``: C and E with the resident resolver instead of the direct
+  read. Lists in ``split_copy_lists`` add ``L_stock_split_copy``: C with
+  ``features.split_copy``. ``layouts: ["native"]`` compiles A and the stock-layout arms only
+  (the fixed-layer study, ``fixtures/fixed_layer_plan_spec.example.json``).
 
 Pairs change exactly their declared fields, except acceptance pairs, which compare the
 preregistered candidate with each declared baseline at the one HBM budget. E–C and E–D
 separate the sharing gain; B1→C2 and B2→E isolate the placement effect with borrowing
 off and on, so the four arena arms form the 2x2 placement x borrowing interaction;
-stock→stock records native repeat noise. Capacity per arm is re-derived at the stock
-HBM budget (resident planes cost logical rows); a pair runs at a pressure point only
-when both arms reach its real batch. The schedule lists AB/BA rounds in priority order
-(noise, acceptance, mechanisms, selection, resident path); round r of every pair reads
-input batch r. Placeholders are reported, not filled. A compiled plan is not a resource
-grant or a result; ``runtime.combined_run`` executes it.
+random→calibrated pairs of one layout and size isolate the selection; stock→stock records
+native repeat noise. Capacity per arm is re-derived at the stock HBM budget (resident planes
+cost logical rows); a pair runs at a pressure point only when both arms reach its real batch.
+The schedule lists AB/BA rounds in priority order (noise, acceptance, mechanisms, selection,
+resident path, split copy) for every workload of ``measurement.workloads``: ``fixed`` sends
+``ignore_eos`` so every request makes ``max_new_tokens`` tokens, ``natural`` lets EOS end
+requests; round r of every pair and workload reads input batch r. Placeholders are reported,
+not filled. A compiled plan is not a resource grant or a result; ``runtime.combined_run``
+executes it.
 """
 import argparse
 import hashlib
@@ -44,22 +50,25 @@ from .shared_lru_plan import PlanError, _check_launch, changed_fields
 SPEC_SCHEMA = "combined-plan-spec-v1"
 PLAN_SCHEMA = "combined-paired-plan-v1"
 SPEC_KEYS = {"schema", "seed", "split", "geometry", "offload_lists", "static_quota_rows", "resident_direct_lists",
-             "pressure_points", "repeats", "measurement", "acceptance", "upstream_args", "sm80_bf16_projections"}
+             "split_copy_lists", "layouts", "pressure_points", "repeats", "measurement", "acceptance", "upstream_args",
+             "sm80_bf16_projections"}
 GEOMETRY_KEYS = {"tp_size", "first_layer", "layers", "dense_layers", "hot_rows", "page", "top_k_blocks",
                  "block_size", "head_dim", "dtype_bytes", "kv_heads_per_rank", "slots", "plane_rows",
                  "host_to_device_ratio", "index_bytes_per_token"}
 MEASUREMENT_KEYS = {"max_new_tokens", "warmup_requests", "warmup_steps", "min_window_steps", "min_decode_log_samples",
                     "functional_requests", "functional_max_new_tokens", "ttft_slo_s", "tpot_slo_s",
-                    "server_start_timeout_s", "request_timeout_s"}
+                    "server_start_timeout_s", "request_timeout_s", "workloads"}
 ACCEPTANCE_KEYS = {"candidate", "baselines", "min_gain", "tpot_p95_regression_max", "ci_level", "min_pressure_points",
                    "min_pairs", "quality_mismatch_over_stock_max"}
 LIST_KEYS = {"name", "selection", "offload_layers", "seed", "calibration"}
+LAYOUTS = ("native", "arena")
+WORKLOADS = ("fixed", "natural")     # fixed: ignore_eos, every request runs to max_new_tokens; natural: EOS ends it
 ISOLATED = {"mode": "isolated", "layout": "arena"}
 SHARED = {"mode": "shared", "layout": "arena"}
 DIRECT = {"resident_direct": True}
-PRIORITY = ("aa_noise", "acceptance", "sharing", "sharing_vs_static", "static_quota", "placement", "addressing",
-            "placement_borrowing_off", "placement_borrowing_on", "selection_isolated_arena", "selection_shared_arena",
-            "resident_direct")
+PRIORITY = ("aa_noise", "acceptance", "sharing", "sharing_vs_static", "static_quota", "placement",
+            "selection_stock_layout", "addressing", "placement_borrowing_off", "placement_borrowing_on",
+            "selection_isolated_arena", "selection_shared_arena", "resident_direct", "split_copy")
 PENDING = ("sm80_jit_build", "cuda_graph_capture_replay", "split_pool_receipt_per_rank",
            "real_batch_from_server_info", "physical_memory_receipt", "serving_tpot_throughput", "nsys_rank_timeline")
 
@@ -86,6 +95,10 @@ def _measurement(m, upstream):
     _int(m["warmup_requests"], "measurement.warmup_requests")
     for key in ("ttft_slo_s", "tpot_slo_s", "server_start_timeout_s", "request_timeout_s"):
         _number(m[key], f"measurement.{key}")
+    workloads = m["workloads"]
+    if (type(workloads) is not list or not workloads or len(set(workloads)) != len(workloads)
+            or not set(workloads) <= set(WORKLOADS)):
+        raise ValueError(f"measurement.workloads lists distinct workloads of {list(WORKLOADS)}")
     if m["max_new_tokens"] <= m["warmup_steps"] + m["min_window_steps"]:
         raise ValueError("measurement.max_new_tokens must exceed warmup_steps + min_window_steps")
     interval = flag_value(upstream, "--decode-log-interval")
@@ -157,12 +170,17 @@ def read_spec(path):
         if item["calibration"]["training_sha256"] != split["training_sha256"]:
             raise ValueError(f"Calibrated list {item['name']} was frozen from another source than "
                              "split.training_sha256; calibration reads the training split only")
+    layouts = spec["layouts"]
+    if type(layouts) is not list or "native" not in layouts or not set(layouts) <= set(LAYOUTS) \
+            or len(set(layouts)) != len(layouts):
+        raise ValueError("layouts lists the hot-pool layouts to compile: native, optionally arena")
     quotas = spec["static_quota_rows"]
-    if quotas is not None and (type(quotas) is not dict or set(quotas) - names):
-        raise ValueError("static_quota_rows must be null or keyed by offload list name")
-    direct = spec["resident_direct_lists"]
-    if type(direct) is not list or set(direct) - names or len(set(direct)) != len(direct):
-        raise ValueError("resident_direct_lists must name offload lists, each once")
+    if quotas is not None and (type(quotas) is not dict or set(quotas) - names or "arena" not in layouts):
+        raise ValueError("static_quota_rows must be null or keyed by offload list name, with the arena layout")
+    for key in ("resident_direct_lists", "split_copy_lists"):
+        named = spec[key]
+        if type(named) is not list or set(named) - names or len(set(named)) != len(named):
+            raise ValueError(f"{key} must name offload lists, each once")
     points = spec["pressure_points"]
     if type(points) is not list or len(points) < 2 or any(
             type(p) is not dict or set(p) != {"name", "input_tokens", "real_batch"} or type(p["real_batch"]) is not int
@@ -203,12 +221,23 @@ def arm_configs(spec):
 
     add("stock", None, None, None, (), None)
     pairs.append(dict(control="stock", candidate="stock", expected=(), kind="aa_noise"))
-    add("all_isolated_arena", None, ISOLATED, "stock", ("hot_pool.layout",), "addressing")
-    add("all_shared_arena", None, SHARED, "all_isolated_arena", ("hot_pool.mode",), "sharing")
+    arena_layout = "arena" in spec["layouts"]
+    if arena_layout:
+        add("all_isolated_arena", None, ISOLATED, "stock", ("hot_pool.layout",), "addressing")
+        add("all_shared_arena", None, SHARED, "all_isolated_arena", ("hot_pool.mode",), "sharing")
     for item in spec["offload_lists"]:
         name, placed = item["name"], _placed_fields(item)
         placement = dict({k: v for k, v in item.items() if k != "name"}, mode="fixed_layers")
         add(f"{name}_stock_layout", placement, None, "stock", placed, "placement", DIRECT)
+        if name in spec["resident_direct_lists"]:
+            add(f"{name}_stock_resident_resolver", placement, None, None, (), None)
+            pairs.append(dict(control=f"{name}_stock_resident_resolver", candidate=f"{name}_stock_layout",
+                              expected=("features.resident_direct",), kind="resident_direct"))
+        if name in spec["split_copy_lists"]:
+            add(f"{name}_stock_split_copy", placement, None, f"{name}_stock_layout", ("features.split_copy",),
+                "split_copy", dict(DIRECT, split_copy=True))
+        if not arena_layout:
+            continue
         add(f"{name}_isolated_arena", placement, ISOLATED, f"{name}_stock_layout", ("hot_pool.layout",), "addressing",
             DIRECT)
         add(f"{name}_shared_arena", placement, SHARED, f"{name}_isolated_arena", ("hot_pool.mode",), "sharing", DIRECT)
@@ -237,7 +266,7 @@ def arm_configs(spec):
             if other["selection"] == "random" and len(other["offload_layers"]) == len(item["offload_layers"]):
                 fields = tuple(sorted((set(_placed_fields(item)) | set(_placed_fields(other)))
                                       - {"placement.mode", "features.resident_direct"}))
-                for pool in ("isolated_arena", "shared_arena"):
+                for pool in ("stock_layout",) + (("isolated_arena", "shared_arena") if arena_layout else ()):
                     pairs.append(dict(control=f"{other['name']}_{pool}", candidate=f"{item['name']}_{pool}",
                                       expected=fields, kind=f"selection_{pool}"))
     if not any(item["selection"] == "calibrated" for item in spec["offload_lists"]):
@@ -356,13 +385,14 @@ def compile_plan(spec, spec_digest, output_dir):
                 infeasible.append(dict(point=point["name"], pair=f"{names[0]}->{names[1]}",
                                        reason="estimated capacity below the real batch for at least one arm"))
                 continue
-            for repeat in range(spec["repeats"]):
-                schedule.append(dict(point=point["name"], pair=f"{names[0]}->{names[1]}", control=names[0],
-                                     candidate=names[1], kind=pair["kind"], acceptance=pair["acceptance"],
-                                     priority=pair["priority"], repeat=repeat, input_batch=repeat,
-                                     order=list(names[::1 if repeat % 2 == 0 else -1]),
-                                     real_batch=point["real_batch"], input_tokens=point["input_tokens"]))
-    lists = [item["name"] for item in spec["offload_lists"]]
+            for workload in spec["measurement"]["workloads"]:
+                for repeat in range(spec["repeats"]):
+                    schedule.append(dict(point=point["name"], pair=f"{names[0]}->{names[1]}", control=names[0],
+                                         candidate=names[1], kind=pair["kind"], acceptance=pair["acceptance"],
+                                         priority=pair["priority"], workload=workload, repeat=repeat,
+                                         input_batch=repeat, order=list(names[::1 if repeat % 2 == 0 else -1]),
+                                         real_batch=point["real_batch"], input_tokens=point["input_tokens"]))
+    lists = [item["name"] for item in spec["offload_lists"]] if "arena" in spec["layouts"] else []
     placeholder = "0" * 64 in spec["split"].values()
     plan = dict(
         schema=PLAN_SCHEMA, spec_sha256=spec_digest, seed=spec["seed"], split=spec["split"], geometry=dict(geo, **g),
@@ -374,7 +404,8 @@ def compile_plan(spec, spec_digest, output_dir):
                                 estimate="(E - C_arena) - (B_shared - B_isolated) on matched real B")
                      for name in lists},
         pressure_points=spec["pressure_points"], repeats=spec["repeats"], measurement=spec["measurement"],
-        acceptance=accept, resident_direct_lists=spec["resident_direct_lists"], priority=list(PRIORITY),
+        acceptance=accept, resident_direct_lists=spec["resident_direct_lists"],
+        split_copy_lists=spec["split_copy_lists"], layouts=spec["layouts"], priority=list(PRIORITY),
         infeasible=infeasible, schedule=schedule, launch=launches,
         real_batch_requirement="every window's decode log samples show the planned B on a CUDA graph, and every "
                                "request of the batch stays in the window; otherwise the run is rejected, not rescaled",

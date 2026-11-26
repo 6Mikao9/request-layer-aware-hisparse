@@ -26,7 +26,11 @@ DIAGNOSTICS = ("none", "counters", "nsys")
 # enabled switches enter the canonical form, so false and absent are one config.
 # resident_direct: resident layers of a fixed offload set skip the resident
 # resolver and the stock consumer reads req_to_token itself (combined.md).
-FEATURES = ("resident_direct",)
+# split_copy: offloaded layers of a fixed offload set with the native hot pool
+# swap in with two pinned launches: the fused kernel plans hits, LRU and slots
+# without copying, then copy_cache_planned spreads every miss of the rank over
+# a fixed grid instead of one CTA per request (layer_placement_device.py).
+FEATURES = ("resident_direct", "split_copy")
 
 _TOP = {"schema", "placement", "hot_pool", "features", "diagnostics"}
 _PLACEMENT = {"mode", "selection", "offload_layers", "seed", "calibration"}
@@ -186,6 +190,11 @@ class StudyConfig:
         """Resident layers read req_to_token in the consumer instead of through the resident resolver."""
         return dict(self.features).get("resident_direct", False)
 
+    @property
+    def uses_split_copy(self):
+        """Offloaded layers plan the native swap without copying, then copy every miss over a fixed grid."""
+        return dict(self.features).get("split_copy", False)
+
 
 def parse(data):
     if type(data) is not dict:
@@ -261,6 +270,9 @@ def parse(data):
     if "resident_direct" in raw and mode != "fixed_layers":
         raise ValueError("features.resident_direct applies only to placement.mode=fixed_layers; other placements "
                          "have no resident layers")
+    if "split_copy" in raw and (mode != "fixed_layers" or layout != "native"):
+        raise ValueError("features.split_copy changes the native swap of placement.mode=fixed_layers with "
+                         "hot_pool.layout=native; the arena resolver copies its own misses")
     features = tuple(sorted((name, True) for name, enabled in raw.items() if enabled))
 
     raw = _section(data, "diagnostics", {"mode"})
@@ -322,6 +334,7 @@ def capabilities(config):
         admission=pool.admission,
         diagnostics=config.diagnostics,
         registered_features=list(FEATURES),
-        features=dict(resident_direct=config.uses_resident_direct) if fixed else {},
+        features=dict(resident_direct=config.uses_resident_direct,
+                      split_copy=config.uses_split_copy) if fixed else {},
         unsupported=unsupported_reasons(config),
     )

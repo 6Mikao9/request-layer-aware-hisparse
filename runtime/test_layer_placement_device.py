@@ -34,10 +34,10 @@ COORDINATOR = "sglang.srt.managers.hisparse_coordinator"
 DENSE, SPARSE = (0,), (1, 2, 3, 4, 5)
 
 
-def fixed(offload, direct=True, **pool):
+def fixed(offload, direct=True, split_copy=False, **pool):
     """Fixed offload set; resident layers read directly unless ``direct=False`` selects the resolver."""
     data = {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": list(offload)},
-            "features": {"resident_direct": direct}}
+            "features": {"resident_direct": direct, **({"split_copy": True} if split_copy else {})}}
     if pool:
         data["hot_pool"] = pool
     return sc.parse(data)
@@ -555,7 +555,93 @@ class ResidentResolver(Harness):
         self.assertEqual(receipt["signature"]["resident_kernel_sha256"], device.kernel_sha256())
         self.assertEqual(receipt["resident_resolver"]["output"], "coordinator.top_k_device_locs_buffer")
         self.assertTrue(receipt["capabilities"]["resident_path"].startswith("resolver"))
-        self.assertEqual(receipt["capabilities"]["features"], {"resident_direct": False})
+        self.assertEqual(receipt["capabilities"]["features"], {"resident_direct": False, "split_copy": False})
+        self.assertEqual((receipt["signature"]["native_swap"], receipt["split_copy"]), ("fused", None))
+
+
+class SplitCopy(Harness):
+    """features.split_copy: an S plane swaps in through the pinned planner, then the pinned copier."""
+    CONFIG = fixed((2, 4), split_copy=True)
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(device.install(self.CONFIG, "d" * 64))
+        self.pool, self.allocator = build_pool(self.h)
+        self.coordinator_, self.receipts = self.coordinator(self.allocator)
+        host = self.coordinator_.mem_pool_host
+        host.k_buffer, host.v_buffer = ([torch.zeros((64, 1, 4), dtype=torch.bfloat16) for _ in range(2)]
+                                        for _ in "kv")
+        self.calls = []
+        ops = types.ModuleType("sglang.kernels.ops.kvcache.hisparse")
+        ops._jit_sparse_module = lambda *a, **kw: types.SimpleNamespace(
+            load_cache_to_device_buffer=lambda *args: self.calls.append(("plan", a, kw, args)))
+        ops._jit_copy_planned_module = lambda *a: types.SimpleNamespace(
+            copy_cache_planned=lambda *args: self.calls.append(("copy", a, args)))
+        parents = {name: types.ModuleType(name) for name in ("sglang.kernels", "sglang.kernels.ops",
+                                                             "sglang.kernels.ops.kvcache")}
+        patcher = patch.dict(sys.modules, {**parents, ops.__name__: ops})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_plan_then_copy_on_the_s_plane_into_the_native_output_buffer(self):
+        c = self.coordinator_
+        rpi, seq = torch.tensor([2, 0, 1]), torch.tensor([9, 5, 7], dtype=torch.int32)
+        blocks = torch.zeros((3, 2), dtype=torch.int32)
+        out = c.swap_in_selected_blocks(rpi, seq, blocks, 4, 2)
+        self.assertEqual((tuple(out.shape), out.data_ptr()), ((3, 4), c.top_k_device_locs_buffer.data_ptr()))
+        self.assertEqual(self.h.log["swap"], [], "the fused pinned method is not called")
+        (_, template, flags, plan), (_, copier, copy) = self.calls
+        self.assertEqual((template, flags), ((8, 960, 2, 8), dict(
+            is_mla=False, is_dsv4_layout=False, top_k_block_size=2, top_k_is_blocks=True, record_miss_plan=True,
+            skip_io=True)))
+        main, host = self.pool.main_pool, c.mem_pool_host
+        expected = (blocks, c.req_device_buffer_tokens[1], c.req_to_host_pool, c.req_device_buffer_token_locs[1],
+                    host.k_buffer[1], host.v_buffer[1], main.k_buffer[1], main.v_buffer[1], out, rpi, seq,
+                    c.lru_slots[1], c.num_real_reqs)
+        self.assertEqual([a.data_ptr() for a in plan[:13]], [a.data_ptr() for a in expected], "layer 4 is plane 1")
+        self.assertEqual(plan[13:15], (1, 8))
+        src, dst, count = (t[:3] for t in device._STATE["binding"].split)
+        for got, want in zip((*plan[15:], *copy[:3]), (src, dst, count) * 2):
+            self.assertEqual((got.data_ptr(), tuple(got.shape)), (want.data_ptr(), tuple(want.shape)))
+        self.assertEqual(copier, (device.SPLIT_COPY_THREADS, False, False, False))
+        self.assertIs(copy[3], c.num_real_reqs)
+        self.assertEqual(copy[8:], (device.SPLIT_COPY_CTAS, 8))
+        with self.assertRaisesRegex(RuntimeError, "complete GPU main KV"):
+            c.swap_in_selected_blocks(rpi, seq, blocks, 3, 2)
+        with self.assertRaisesRegex(ValueError, "split-copy contract"):
+            c.swap_in_selected_blocks(rpi, seq, torch.zeros((3, 5), dtype=torch.int32), 4, 2)    # 10 > H rows
+        host.k_buffer[1] = torch.zeros((64, 1, 4))
+        with self.assertRaisesRegex(ValueError, "split-copy contract"):
+            c.swap_in_selected_blocks(rpi, seq, blocks, 4, 2)                                   # FP32 host rows
+
+    def test_receipt_names_the_split_swap_and_its_plan_bytes(self):
+        receipt = self.receipts[0]
+        self.assertEqual(receipt["signature"]["native_swap"], "split")
+        self.assertEqual(receipt["split_copy"]["ctas"], device.SPLIT_COPY_CTAS)
+        self.assertEqual(receipt["bytes"]["split_copy_plan"], 4 * 8 * (8 + 4) + 4 * 4)
+        self.assertEqual(receipt["capabilities"]["features"], {"resident_direct": True, "split_copy": True})
+
+    @unittest.skipUnless("SGLANG_SRC" in os.environ, "set SGLANG_SRC to a pinned checkout")
+    def test_planner_takes_the_pinned_fused_arguments_plus_the_plan(self):
+        root = Path(os.environ["SGLANG_SRC"])
+        root = root / "python" / "sglang" if (root / "python" / "sglang").is_dir() else root
+        fused = []
+        wrapper = load_pinned(root, device.SWAP_OPS, "load_blocks_to_device_buffer_mha", dict(
+            torch=torch, _jit_sparse_module=lambda *a, **kw: types.SimpleNamespace(
+                load_cache_to_device_buffer=lambda *args: fused.append((a, kw, args)))))
+        method = load_pinned(root, arena.COORDINATOR, "HiSparseCoordinator.swap_in_selected_blocks",
+                             dict(torch=torch, load_blocks_to_device_buffer_mha=wrapper))
+        c, blocks = self.coordinator_, torch.zeros((3, 2), dtype=torch.int32)
+        rpi, seq = torch.tensor([2, 0, 1]), torch.tensor([9, 5, 7], dtype=torch.int32)
+        method(c, rpi, seq, blocks, 1, 2)                      # what the fused adapter passes for layer 4
+        c.swap_in_selected_blocks(rpi, seq, blocks, 4, 2)
+        (template, flags, stock), (_, split_template, split_flags, split) = fused[0], self.calls[0]
+        self.assertEqual((split_template, split_flags), (template, dict(flags, record_miss_plan=True, skip_io=True)))
+
+        def key(value):
+            return (value.data_ptr(), tuple(value.shape), value.dtype) if torch.is_tensor(value) else value
+        self.assertEqual([key(a) for a in split[:15]], [key(a) for a in stock[:15]])
+        self.assertEqual([tuple(t.shape) for t in stock[15:]], [(0,)] * 3, "the fused call records no plan")
 
 
 class ArenaOverTheOffloadSet(Harness):

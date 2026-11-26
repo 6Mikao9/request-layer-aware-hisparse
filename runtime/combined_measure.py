@@ -10,7 +10,10 @@ on synthetic traces. Nothing here launches a process or reads private inputs.
   (so prefill, the prefill barrier and warmup lie before it) and ends at the first request's
   last token, after which the batch is no longer full. Per-request TPOT is the mean interval
   between in-window tokens; throughput is all in-window tokens over the window's wall time.
-* ``real_batch``: decode log samples inside the window must all show the planned B on a graph.
+  The fixed workload (``ignore_eos``, every request runs to its budget) is measured this way.
+* ``natural_window``: the natural-load decode phase, from the prefill barrier to the last token.
+* ``real_batch``: decode log samples inside the window must all show the planned B on a graph;
+  under natural load they must reach B and never exceed it.
 * ``paired``: per block (one AB/BA round with its own input batch, the independent unit)
   the relative output-throughput gain and p95-TPOT change; a two-sided t interval over
   blocks; ``pass`` when the interval excludes zero, the mean gain reaches the preregistered
@@ -88,15 +91,47 @@ def steady_window(requests, *, batch, warmup_steps, min_steps):
                 finish_reasons=finishes), []
 
 
-def real_batch(samples, *, batch, start, end, graph=True, min_samples=3):
-    """Decode log samples [(time, parsed line)] inside [start, end]: all at B, on a CUDA graph."""
+def natural_window(requests, *, batch):
+    """Natural-load decode phase of one run (EOS ends requests); returns (window or None, rejection reasons).
+
+    It runs from the prefill barrier (every request has its first token) to the last token. The batch
+    shrinks as requests stop, so throughput is every token after the barrier over that time and
+    per-request TPOT is the mean interval after its first token; ``steps`` counts the full-batch steps
+    before the first request ends.
+    """
+    good = [r for r in requests if r["successful"] and r["events"]]
+    if len(requests) != batch or len(good) != batch:
+        return None, [f"{batch - len(good)} of {batch} planned requests failed, are missing or made no token"]
+    origin = min(r["start"] for r in good)
+    start, end = max(r["events"][0][0] for r in good), max(r["events"][-1][0] for r in good)
+    first_end = min(r["events"][-1][0] for r in good)
+    if end <= start:
+        return None, ["no request decoded after the prefill barrier"]
+    tokens = [sum(n for _, n in r["events"]) for r in good]
+    tpot = [(r["events"][-1][0] - r["events"][0][0]) / (count - 1) for r, count in zip(good, tokens) if count > 1]
+    delivered = sum(n for r in good for t, n in r["events"] if t > start)
+    finishes = {}
+    for r in good:
+        finishes[r["finish_reason"]] = finishes.get(r["finish_reason"], 0) + 1
+    return dict(start_s=start - origin, end_s=end - origin, full_batch_end_s=first_end - origin, seconds=end - start,
+                barrier_s=start - origin, steps=min(sum(n for t, n in r["events"] if start < t <= first_end)
+                                                    for r in good),
+                requests=batch, delivered_tokens=delivered, tokens_per_s=delivered / (end - start),
+                tpot_ms=_percentiles(tpot, 1000.0), ttft_s=_percentiles([r["events"][0][0] - r["start"] for r in good]),
+                output_tokens=_percentiles(tokens), finish_reasons=finishes,
+                natural_eos_fraction=finishes.get("stop", 0) / batch), []
+
+
+def real_batch(samples, *, batch, start, end, graph=True, min_samples=3, shrinking=False):
+    """Decode log samples [(time, parsed line)] inside [start, end]: all at B, on a CUDA graph. With
+    ``shrinking`` (natural load, where EOS shrinks the batch) they must reach B and never exceed it."""
     inside = [line for time, line in samples if start <= time <= end]
     running = sorted({line["running"] for line in inside})
     reasons = []
     if len(inside) < min_samples:
         reasons.append(f"{len(inside)} decode log samples in the window; need {min_samples} "
                        "(lower --decode-log-interval or lengthen the window)")
-    if running and running != [batch]:
+    if running and (running[-1] != batch if shrinking else running != [batch]):
         reasons.append(f"decode log shows running batch {running}; the plan needs {batch}")
     if graph and not all(line["graph"] for line in inside):
         reasons.append("some window steps ran without CUDA graph replay")

@@ -422,7 +422,7 @@ class UserSwitchesAndRejections(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires hot_pool.layout=arena"):
             config((1,), mode="shared")
 
-    def test_resident_direct_is_a_fixed_layers_switch_whose_off_value_is_the_default(self):
+    def test_fixed_layers_switches_whose_off_value_is_the_default(self):
         def fixed(**extra):
             return sc.parse(dict({"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers",
                                                                        "offload_layers": [1, 3]}}, **extra))
@@ -430,7 +430,11 @@ class UserSwitchesAndRejections(unittest.TestCase):
         self.assertEqual(fixed(features={"resident_direct": False}).digest, default.digest)
         self.assertEqual(plan.changed_fields(default, direct), ("features.resident_direct",))
         self.assertEqual((direct.uses_resident_direct, default.uses_resident_direct), (True, False))
-        self.assertEqual(sc.capabilities(direct)["features"], {"resident_direct": True})
+        self.assertEqual(sc.capabilities(direct)["features"], {"resident_direct": True, "split_copy": False})
+        split = fixed(features={"resident_direct": True, "split_copy": True})
+        self.assertEqual(fixed(features={"resident_direct": True, "split_copy": False}).digest, direct.digest)
+        self.assertEqual(plan.changed_fields(direct, split), ("features.split_copy",))
+        self.assertEqual((split.uses_split_copy, direct.uses_split_copy), (True, False))
         self.assertTrue(sc.capabilities(direct)["resident_path"].startswith("direct"))
         self.assertTrue(sc.capabilities(default)["resident_path"].startswith("resolver"))
         self.assertEqual(sc.unsupported_reasons(direct), [])
@@ -439,6 +443,11 @@ class UserSwitchesAndRejections(unittest.TestCase):
                     {"schema": sc.SCHEMA, "placement": {"mode": "full_resident"},
                      "features": {"resident_direct": True}}):
             with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, "applies only to placement.mode"):
+                sc.parse(raw)
+        for raw in ({"schema": sc.SCHEMA, "features": {"split_copy": True}},
+                    {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": [1]},
+                     "hot_pool": {"mode": "isolated", "layout": "arena"}, "features": {"split_copy": True}}):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, "split_copy changes the native swap"):
                 sc.parse(raw)
         with self.assertRaisesRegex(ValueError, "boolean"):
             fixed(features={"resident_direct": 1})

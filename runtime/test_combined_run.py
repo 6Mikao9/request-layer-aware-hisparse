@@ -96,11 +96,14 @@ def handler(engine, info):
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             ids, budget = request["input_ids"], request["sampling_params"]["max_new_tokens"]
-            state = engine.submit(request["rid"], ids, budget)
+            natural = request["stream"] and not request["sampling_params"]["ignore_eos"]
+            stop = max(1, budget - sum(ids) % 5) if natural else budget      # emulated EOS of streamed requests
+            state = engine.submit(request["rid"], ids, stop)
 
             def meta(count):
                 return dict(id=request["rid"], prompt_tokens=len(ids), completion_tokens=count,
-                            finish_reason=dict(type="length", length=count) if count == budget else None)
+                            finish_reason=None if count != stop else dict(type="length", length=count)
+                            if stop == budget else dict(type="stop", matched=2))
 
             if not request["stream"]:
                 with engine.cond:
@@ -114,7 +117,7 @@ def handler(engine, info):
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
             sent = 0
-            while sent < budget and not engine.stopped:
+            while sent < stop and not engine.stopped:
                 with engine.cond:
                     engine.cond.wait_for(lambda: len(state["tokens"]) > sent or engine.stopped)
                     fresh = state["tokens"][sent:]
@@ -179,7 +182,9 @@ class FakeLauncher:
     def receipts(config, directory):
         offload = list(config.placement.offload_layers) if config.uses_fixed_layers else [0, 1, 2, 3]
         placement = dict(signature=dict(offload_layers=offload, hot_plane_rows=2308,
-                                        resident_path="direct" if config.uses_resident_direct else "resolver"),
+                                        resident_path="direct" if config.uses_resident_direct else "resolver",
+                                        native_swap=None if config.uses_arena else
+                                        "split" if config.uses_split_copy else "fused"),
                          bytes=dict(hot_main_kv=1, resident_main_kv=2, host_pinned=3))
         for rank in range(TP):
             if config.uses_arena:
@@ -229,7 +234,7 @@ def tiny_spec(heldout):
                          {"name": "p2", "input_tokens": [16, 32], "real_batch": 3}],
         measurement=dict(max_new_tokens=64, warmup_requests=1, warmup_steps=4, min_window_steps=16,
                          min_decode_log_samples=3, functional_requests=3, functional_max_new_tokens=6, ttft_slo_s=5,
-                         tpot_slo_s=1, server_start_timeout_s=5, request_timeout_s=30),
+                         tpot_slo_s=1, server_start_timeout_s=5, request_timeout_s=30, workloads=["fixed", "natural"]),
         acceptance=dict(candidate="fixed_shared_arena", baselines=["stock", "fixed_static_quota"], min_gain=0.05,
                         tpot_p95_regression_max=0.05, ci_level=0.95, min_pressure_points=2, min_pairs=3,
                         quality_mismatch_over_stock_max=0.0))
@@ -301,22 +306,31 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(set(capacity["arms"]), {"stock", "fixed_shared_arena", "fixed_static_quota"})
             self.assertEqual(capacity["infeasible"], [])
             runs = sorted((out / "runs").rglob("metrics.json"))
-            self.assertEqual(len(runs), 3 * 2 * 3 * 2, "three priority-0/1 pairs x two points x three AB/BA rounds")
+            self.assertEqual(len(runs), 3 * 2 * 2 * 3 * 2, "three priority-0/1 pairs x two points x two workloads x "
+                                                           "three AB/BA rounds")
             metrics = [json.loads(p.read_text()) for p in runs]
             self.assertTrue(all(m["status"] == "valid" for m in metrics), [m["reasons"] for m in metrics])
-            first = metrics[0]
+            first, natural = metrics[0], metrics[2]
+            self.assertEqual((first["workload"], natural["workload"]), ("fixed", "natural"))
             self.assertGreaterEqual(first["window"]["steps"], 16)
+            self.assertEqual(first["window"]["finish_reasons"], {"length": 4})
+            self.assertEqual(natural["window"]["finish_reasons"].get("stop", 0) + natural["window"]["finish_reasons"]
+                             .get("length", 0), 4)
+            self.assertGreater(natural["window"]["natural_eos_fraction"], 0)
             self.assertEqual(first["real_batch"]["running"], [json.loads((runs[0].parent / "run_config.json")
                                                                          .read_text())["real_batch"]])
             for name in ("run_config.json", "admission.json", "correctness.json"):
                 self.assertTrue((runs[0].parent / name).is_file())
             verdict = json.loads(next(out.glob("verdict-*.json")).read_text())
-            self.assertEqual(verdict["acceptance"]["overall"], "pass", json.dumps(verdict["acceptance"]))
-            results = {(r["point"], r["control"], r["candidate"]): r for r in verdict["results"]}
-            noise = results[("p1", "stock", "stock")]
+            self.assertEqual({w: a["overall"] for w, a in verdict["acceptance"].items()},
+                             dict(fixed="pass", natural="pass"), json.dumps(verdict["acceptance"]))
+            results = {(r["point"], r["workload"], r["control"], r["candidate"]): r for r in verdict["results"]}
+            noise = results[("p1", "fixed", "stock", "stock")]
             self.assertEqual((noise["blocks"], noise["quality_ok"]), (3, True), "native A/A repeat noise")
-            win = results[("p2", "stock", "fixed_shared_arena")]
+            win = results[("p2", "natural", "stock", "fixed_shared_arena")]
             self.assertEqual((win["verdict"], win["blocks"], win["orders"]), ("pass", 3, ["AB", "BA"]))
+            gates = sorted(p.name for p in (out / "gate").glob("*.json"))
+            self.assertEqual(gates, ["combined-gate.json", "fixed-layer-gate-production.json", "fixed-layer-gate.json"])
             with (out / "diagnostics" / "diagnostic_summary.csv").open() as handle:
                 rows = handle.read().splitlines()
             self.assertEqual(len(rows), 1 + 2 * TP * 2 + 1, "header, two arena arms x ranks x layers, stock note")
@@ -328,16 +342,18 @@ class EndToEnd(unittest.TestCase):
             launcher = FakeLauncher(plan_dir, speeds={"fixed_shared_arena": 0.005}, caps={"fixed_static_quota": 3})
             code, stages, out = main(tmp, launcher, "--points", "p1", "--stages",
                                      "identity,build,gate,functional,capacity,performance,verdict")
-            self.assertEqual(stages["performance"]["rejected"], 3, "the capped arm never holds B=4")
+            self.assertEqual(stages["performance"]["rejected"], 6, "the capped arm never holds B=4 in either workload")
             verdict = json.loads(next(out.glob("verdict-*.json")).read_text())
-            results = {(r["point"], r["control"], r["candidate"]): r for r in verdict["results"]}
-            self.assertEqual(results[("p1", "stock", "fixed_shared_arena")]["verdict"], "fail")
-            self.assertNotIn(("p1", "fixed_static_quota", "fixed_shared_arena"), results)
-            self.assertEqual(len(verdict["rejected_rounds"]), 3)
+            results = {(r["point"], r["workload"], r["control"], r["candidate"]): r for r in verdict["results"]}
+            for workload in ("fixed", "natural"):
+                self.assertEqual(results[("p1", workload, "stock", "fixed_shared_arena")]["verdict"], "fail")
+                self.assertNotIn(("p1", workload, "fixed_static_quota", "fixed_shared_arena"), results)
+            self.assertEqual(len(verdict["rejected_rounds"]), 6)
             reasons = verdict["rejected_rounds"][0]["runs"]
             capped = [run for run in reasons.values() if run["status"] == "rejected"][0]["reasons"]
             self.assertTrue(any("full-batch" in reason or "running batch" in reason for reason in capped), capped)
-            self.assertEqual(verdict["acceptance"]["overall"], "fail")
+            self.assertEqual({w: a["overall"] for w, a in verdict["acceptance"].items()},
+                             dict(fixed="fail", natural="fail"))
             self.assertEqual(code, 0)
 
     def test_wrong_outputs_stop_the_study_before_capacity(self):
@@ -360,13 +376,13 @@ class EndToEnd(unittest.TestCase):
             stages_arg = ("--stages", "identity,build,gate,functional,capacity,performance", "--points", "p1",
                           "--max-priority", "0")
             code, stages, out = main(tmp, launcher, *stages_arg, "--deadline", past)
-            self.assertEqual((code, stages["performance"]["not_run"], stages["performance"]["status"]), (1, 6, "fail"))
+            self.assertEqual((code, stages["performance"]["not_run"], stages["performance"]["status"]), (1, 12, "fail"))
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 main(tmp, launcher, *stages_arg)                       # the output directory is never reused
             code, stages, out = main(tmp, launcher, *stages_arg, "--resume")
-            self.assertEqual((code, stages["performance"]["valid"]), (0, 6))
+            self.assertEqual((code, stages["performance"]["valid"]), (0, 12))
             code, stages, out = main(tmp, launcher, *stages_arg, "--resume")
-            self.assertEqual((stages["performance"]["kept"], stages["performance"]["valid"]), (6, 0))
+            self.assertEqual((stages["performance"]["kept"], stages["performance"]["valid"]), (12, 0))
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 runner.main(["--plan-dir", str(plan_dir), "--manifest", "m", "--model-dir", "d", "--devices", "0",
                              "--output-dir", str(Path(tmp) / "new"), "--image-id", "x"])     # no --allow-gpu
@@ -385,7 +401,7 @@ class EndToEnd(unittest.TestCase):
                                      command=busy)
             performance = stages["performance"]
             self.assertEqual((code, performance["status"], performance["valid"]), (1, "fail", 0))
-            self.assertEqual(performance["not_run"], 3 * 3 * 2)
+            self.assertEqual(performance["not_run"], 3 * 3 * 2 * 2)
             self.assertIn("yielded the devices: 1 foreign compute processes appeared", performance["reasons"])
 
     def test_placeholder_holdout_digest_blocks_every_workload_stage(self):
@@ -410,12 +426,17 @@ class EndToEnd(unittest.TestCase):
             with (out / "diagnostics" / "diagnostic_summary.csv").open() as handle:
                 rows = [row for row in csv.DictReader(handle) if row["arm"] == arm and row["source"] == "nsys"]
             steps = [row for row in rows if row["layer"] == "step"]
-            self.assertEqual([row["rank"] for row in steps], [*map(str, range(TP)), "bottleneck"])
-            self.assertEqual([row["bottleneck_steps"] for row in steps], ["0", "5", "0", "0", "5"])
-            self.assertEqual(float(steps[-1]["whole_step_us_p50"]), 346)
+            self.assertEqual([row["rank"] for row in steps], [*map(str, range(TP)), "bottleneck", "critical"])
+            self.assertEqual([row["bottleneck_steps"] for row in steps], ["0", "5", "0", "0", "5", ""])
+            self.assertEqual([row["critical_steps"] for row in steps], ["5", "0", "0", "0", "", "5"],
+                             "equal TP waits: the lowest rank")
+            self.assertEqual(float(steps[-2]["whole_step_us_p50"]), 346)
             layers = [(row["layer"], float(row["read_path_us"])) for row in rows
                       if row["rank"] == "bottleneck" and row["layer"] != "step"]
             self.assertEqual(layers, [("0", 0), ("1", 20), ("2", 0), ("3", 50)])
+            critical = [json.loads(row["critical_ranks"]) for row in rows
+                        if row["rank"] == "critical" and row["layer"] != "step"]
+            self.assertEqual(critical, [{}, {"0": 5}, {"0": 5}, {"0": 5}])
             identity = json.loads((out / "identity.json").read_text())
             self.assertIn("nsys", identity["toolchain"])
 

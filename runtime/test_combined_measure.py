@@ -37,6 +37,8 @@ class DecodeLog(unittest.TestCase):
         info, reasons = m.real_batch(samples, batch=4, start=1.0, end=2.5)
         self.assertEqual((info["samples"], info["running"], info["graph"], reasons), (4, [4], True, []))
         self.assertTrue(m.real_batch(samples, batch=4, start=1.0, end=9.0)[1])            # batch shrank
+        self.assertEqual(m.real_batch(samples, batch=4, start=1.0, end=9.0, shrinking=True)[1], [], "natural EOS")
+        self.assertTrue(m.real_batch(samples[-1:] * 3, batch=4, start=0, end=9.0, shrinking=True)[1])
         self.assertTrue(m.real_batch([(1.0, line(4, False))] * 3, batch=4, start=0, end=2)[1])
         self.assertIn("decode log samples", m.real_batch(samples, batch=4, start=1.0, end=1.4)[1][0])
 
@@ -59,6 +61,20 @@ class SteadyWindow(unittest.TestCase):
         window, reasons = m.steady_window(failed, batch=4, warmup_steps=5, min_steps=1)
         self.assertIsNone(window)
         self.assertIn("1 of 4", reasons[0])
+
+
+class NaturalWindow(unittest.TestCase):
+    def test_natural_load_runs_from_the_prefill_barrier_to_the_last_token(self):
+        requests = trace()
+        requests[3]["finish_reason"] = "stop"                   # the 50-token request ended at EOS
+        window, reasons = m.natural_window(requests, batch=4)
+        self.assertEqual(reasons, [])
+        self.assertEqual((window["start_s"], window["full_batch_end_s"], window["end_s"]), (1.375, 2.140625, 2.796875))
+        self.assertEqual((window["steps"], window["delivered_tokens"]), (49, 75 + 83 + 91 + 49))
+        self.assertAlmostEqual(window["tokens_per_s"], 298 / 1.421875)
+        self.assertEqual((window["tpot_ms"]["p50"], window["output_tokens"]["p50"]), (15.625, 100))
+        self.assertEqual((window["finish_reasons"], window["natural_eos_fraction"]), ({"length": 3, "stop": 1}, 0.25))
+        self.assertIn("1 of 5", m.natural_window(requests, batch=5)[1][0])
 
     def test_output_mismatch_counts_missing_and_differing_hashes(self):
         a = {"x": "1", "y": "2"}

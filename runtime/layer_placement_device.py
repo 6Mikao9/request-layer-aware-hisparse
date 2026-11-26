@@ -24,8 +24,12 @@ and all-default configurations install nothing.
   read without the HiSparse location mapping.
 * Stock hot-pool layout only: ``HiSparseCoordinator.__init__`` (gate, TP agreement,
   receipt), ``swap_in_selected_blocks`` (absolute layer to S plane for the native
-  kernel) and ``admit_request_direct`` (rejected). Arena layouts bind through
-  ``shared_lru_device``, whose resolver addresses the planes of S.
+  kernel) and ``admit_request_direct`` (rejected). With ``features.split_copy`` the
+  swap is two pinned launches on the same stream: the fused kernel instantiated with
+  ``RecordMissPlan`` and ``SkipIO`` updates hits, LRU order and slots and records the
+  miss plan, then ``copy_cache_planned`` copies every miss of the rank over
+  ``SPLIT_COPY_CTAS`` blocks instead of one block per request. Arena layouts bind
+  through ``shared_lru_device``, whose resolver addresses the planes of S.
 """
 import argparse
 import ast
@@ -46,6 +50,7 @@ MEMORY_POOL = "srt/mem_cache/memory_pool.py"
 BACKEND = "srt/layers/attention/minimax_sparse_backend.py"
 OPS = "srt/layers/attention/minimax_sparse_ops/minimax_sparse.py"
 OPS_MODULE = arena.CONSUMER_MODULE
+SWAP_OPS = "kernels/ops/kvcache/hisparse.py"
 PREFILL = "minimax_sparse_prefill"
 MAIN_POOL_MODULE = "sglang.srt.mem_cache.hisparse_memory_pool"
 # (pinned file, qualified symbol, required leading parameters or None)
@@ -75,12 +80,17 @@ SYMBOLS = (
     (OPS, PREFILL, ("q", "k_cache", "v_cache")),
     (arena.COORDINATOR, "HiSparseCoordinator.swap_in_selected_blocks",
      ("self", "req_pool_indices", "seq_lens", "top_k_blocks", "layer_id", "sparse_block_size")),
+    (SWAP_OPS, "_jit_sparse_module", ("item_size_bytes", "block_size", "num_top_k", "hot_buffer_size", "is_mla",
+                                      "is_dsv4_layout", "top_k_block_size", "top_k_is_blocks", "record_miss_plan",
+                                      "skip_io")),
+    (SWAP_OPS, "_jit_copy_planned_module", ("block_size", "is_mla", "is_dsv4_layout", "skip_io")),
 )
 PENDING_HARDWARE = ("sm80_build", "cuda_graph_capture_replay", "tp8_split_pool_receipt", "physical_memory_receipt",
                     "serving_tpot_throughput")
 KERNEL_SOURCE = Path(__file__).with_name("layer_placement_kernel.cuh")
 JIT_NAME = "rlh_layer_placement_resident"
 RESIDENT_BLOCK_SIZE = 256      # threads per graph row; one CTA writes K * block slots
+SPLIT_COPY_CTAS, SPLIT_COPY_THREADS = 128, 256    # features.split_copy: one fixed copy grid of 1024 warps
 
 
 @functools.cache
@@ -244,12 +254,43 @@ class PlacementBinding:
         self.hot_rows, self.page = coordinator.device_buffer_size, self.main.page_size
         self.logical_tokens = coordinator.token_to_kv_pool_allocator.size_full
         self.resident_direct = config.uses_resident_direct
+        self.split = None
+        if config.uses_split_copy:      # miss plan of the layer in flight; allocated before any graph capture
+            out = coordinator.top_k_device_locs_buffer
+            self.split = tuple(torch.zeros(shape, dtype=dtype, device=out.device) for shape, dtype in (
+                (out.shape, torch.int64), (out.shape, torch.int32), (out.shape[:1], torch.int32)))
 
     def plane(self, layer_id):
         plane = self.plane_of.get(layer_id)
         if plane is None:
             raise RuntimeError(f"Layer {layer_id} keeps complete GPU main KV; it never reaches the HiSparse swap")
         return plane
+
+    def split_copy(self, coordinator, req_pool_indices, seq_lens, top_k_blocks, layer_id, sparse_block_size):
+        """``features.split_copy``: the native swap of one S plane as plan, then copy. Same arguments and output
+        buffer as the pinned method; stream order puts the copy before attention and the next layer's plan."""
+        from sglang.kernels.ops.kvcache.hisparse import _jit_copy_planned_module, _jit_sparse_module
+        c, plane, batch, (src, dst, count) = coordinator, self.plane(layer_id), req_pool_indices.size(0), self.split
+        width = top_k_blocks.size(1) * sparse_block_size
+        host_k, host_v = c.mem_pool_host.k_buffer[plane], c.mem_pool_host.v_buffer[plane]
+        device_k, device_v = c.mem_pool_device.get_key_buffer(plane), c.mem_pool_device.get_value_buffer(plane)
+        rows = (host_k, host_v, device_k, device_v)
+        if (width > c.device_buffer_size or batch > src.shape[0]
+                or any(t.stride(0) * t.element_size() != c.item_size_bytes for t in rows)):
+            raise ValueError("Selection, batch or K/V row stride differs from the bound split-copy contract")
+        out = c.top_k_device_locs_buffer[:batch, :width]
+        planner = _jit_sparse_module(c.item_size_bytes, c.swap_in_block_size, top_k_blocks.size(1),
+                                     c.device_buffer_size, is_mla=False, is_dsv4_layout=False,
+                                     top_k_block_size=sparse_block_size, top_k_is_blocks=True, record_miss_plan=True,
+                                     skip_io=True)
+        planner.load_cache_to_device_buffer(top_k_blocks, c.req_device_buffer_tokens[plane], c.req_to_host_pool,
+                                            c.req_device_buffer_token_locs[plane], host_k, host_v, device_k, device_v,
+                                            out, req_pool_indices, seq_lens, c.lru_slots[plane], c.num_real_reqs, 1,
+                                            c.item_size_bytes, src[:batch], dst[:batch], count[:batch])
+        _jit_copy_planned_module(SPLIT_COPY_THREADS, False, False, False).copy_cache_planned(
+            src[:batch], dst[:batch], count[:batch], c.num_real_reqs, host_k, host_v, device_k, device_v,
+            SPLIT_COPY_CTAS, c.item_size_bytes)
+        return out
 
     def resolve_resident(self, coordinator, req_pool_indices, seq_lens, top_k_blocks, req_to_token, block_size):
         """Resident resolver (``resident_direct=false``): one launch into the native output buffer, no sync."""
@@ -271,14 +312,16 @@ class PlacementBinding:
                     row_shape=[int(x) for x in self.main.k_buffer[0].shape[1:]], dtype=str(self.main.dtype),
                     logical_tokens=int(self.logical_tokens),
                     resident_path="direct" if self.resident_direct else "resolver",
-                    resident_kernel_sha256=None if self.resident_direct else kernel_sha256())
+                    resident_kernel_sha256=None if self.resident_direct else kernel_sha256(),
+                    native_swap=None if self.config.uses_arena else "split" if self.split else "fused")
 
     def receipt(self, coordinator):
         torch, resident, host = self.torch, self.resident_pool, coordinator.mem_pool_host
         memory = None
         if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
             memory = dict(allocated=torch.cuda.memory_allocated(), reserved=torch.cuda.memory_reserved(),
-                          max_allocated=torch.cuda.max_memory_allocated())
+                          max_allocated=torch.cuda.max_memory_allocated(), device_used=total - free, device_total=total)
         tables = dict(req_device_buffer_tokens=_nbytes(coordinator.req_device_buffer_tokens),
                       req_device_buffer_token_locs=_nbytes(coordinator.req_device_buffer_token_locs),
                       lru_slots=_nbytes(coordinator.lru_slots))
@@ -288,10 +331,14 @@ class PlacementBinding:
                     resident_resolver=None if self.resident_direct else dict(
                         kernel="rlh_layer_placement::resolve_resident", kernel_sha256=kernel_sha256(),
                         block_size=RESIDENT_BLOCK_SIZE, output="coordinator.top_k_device_locs_buffer"),
+                    split_copy=None if self.split is None else dict(
+                        planner="load_cache_to_device_buffer<RecordMissPlan=true, SkipIO=true>",
+                        copier="copy_cache_planned", ctas=SPLIT_COPY_CTAS, threads=SPLIT_COPY_THREADS),
                     bytes=dict(hot_main_kv=_nbytes(self.main.k_buffer) + _nbytes(self.main.v_buffer),
                                resident_main_kv=0 if resident is None else _nbytes(resident.k_buffer)
                                + _nbytes(resident.v_buffer),
-                               host_pinned=_nbytes(host.k_buffer) + _nbytes(host.v_buffer), native_tables=tables),
+                               host_pinned=_nbytes(host.k_buffer) + _nbytes(host.v_buffer), native_tables=tables,
+                               split_copy_plan=0 if self.split is None else _nbytes(self.split)),
                     device_memory_at_bind=memory,
                     unavailable=dict(weights="not attributed at bind", graph_workspace="after capture",
                                      index_kv="identical in every arm; see the pool allocation log"),
@@ -496,6 +543,8 @@ def install(config, config_sha256):
         binding = getattr(self, "_request_layer_hisparse_placement", None)
         if binding is None:
             raise RuntimeError("Coordinator was not bound to the fixed offload set; install before construction")
+        if binding.split is not None:
+            return binding.split_copy(self, req_pool_indices, seq_lens, top_k_blocks, layer_id, sparse_block_size)
         return originals["coordinator"]["swap_in_selected_blocks"](
             self, req_pool_indices, seq_lens, top_k_blocks, binding.plane(layer_id), sparse_block_size)
 
@@ -603,6 +652,9 @@ def dry_run(root, config, geo, *, dense_layers=0, ratio=2, index_bytes=0):
     ok = (all(v == "ok" for v in digests.values()) and all(s["status"] == "ok" for s in symbols)
           and (arena_report is None or arena_report["status"] == "pass"))
     hot_pool = "native load_blocks_to_device_buffer_mha on S planes" if plan is None else arena_report["implementation"]
+    if config.uses_split_copy:
+        hot_pool = ("native swap on S planes in two pinned launches: load_cache_to_device_buffer<RecordMissPlan, "
+                    f"SkipIO>, then copy_cache_planned over {SPLIT_COPY_CTAS} x {SPLIT_COPY_THREADS} threads")
     resident = ("stock flash_decode_with_gqa_share_sparse / flash_prefill_with_gqa_share_sparse over req_to_token rows"
                 + ("" if config.uses_resident_direct else
                    f"; decode slots from rlh_layer_placement::resolve_resident (kernel sha256 {kernel_sha256()})"))
@@ -617,7 +669,8 @@ def dry_run(root, config, geo, *, dense_layers=0, ratio=2, index_bytes=0):
 
 
 def build_receipt(config, geo, output):
-    """GPU-only: JIT-build the resident resolver of this arm and record toolchain and artifact identity."""
+    """GPU-only: JIT-build what this arm adds (resident resolver, split-copy specializations of the pinned swap)
+    and record toolchain and artifact identity."""
     import platform
     import shutil
     import subprocess
@@ -627,10 +680,21 @@ def build_receipt(config, geo, output):
     bad = {k: v for k, v in verify_digests(Path(sglang.__file__).resolve().parent).items() if v != "ok"}
     if bad or torch.cuda.get_device_capability() != (8, 0):
         raise RuntimeError(f"Build receipt requires the pinned source on sm_80; mismatches: {bad}")
-    if config.uses_resident_direct:
-        raise RuntimeError("features.resident_direct launches no resident resolver; pass the resolver arm config")
-    variant = (geo["top_k_blocks"], geo["block_size"])
-    _resident_module(*variant)
+    if config.uses_resident_direct and not config.uses_split_copy:
+        raise RuntimeError("features.resident_direct with the fused swap builds nothing; pass the resolver or "
+                           "split_copy arm config")
+    variant, names, split = (geo["top_k_blocks"], geo["block_size"]), [], None
+    if not config.uses_resident_direct:
+        _resident_module(*variant)
+        names.append(JIT_NAME)
+    if config.uses_split_copy:      # template arguments the binding passes: pinned swap_in_block_size default 960
+        from sglang.kernels.ops.kvcache.hisparse import _jit_copy_planned_module, _jit_sparse_module
+        planner = [geo["item_size_bytes"], 960, geo["top_k_blocks"], geo["hot_rows"]]
+        _jit_sparse_module(*planner, is_mla=False, is_dsv4_layout=False, top_k_block_size=geo["block_size"],
+                           top_k_is_blocks=True, record_miss_plan=True, skip_io=True)
+        _jit_copy_planned_module(SPLIT_COPY_THREADS, False, False, False)
+        names += ["sparse_cache", "sparse_copy_planned"]
+        split = dict(planner_args=planner, copier_threads=SPLIT_COPY_THREADS, ctas=SPLIT_COPY_CTAS)
 
     def run(*command):
         if shutil.which(command[0]) is None:
@@ -639,9 +703,10 @@ def build_receipt(config, geo, output):
 
     artifacts = [dict(name=path.name, sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                       cuobjdump_list_elf=run("cuobjdump", "--list-elf", str(path)))
-                 for path in sorted(cache_root().rglob(f"*{JIT_NAME}*.so"))]
+                 for name in names for path in sorted(cache_root().rglob(f"*{name}*.so"))]
     receipt = dict(event="hisparse_layer_placement_build", config_sha256=config.digest,
-                   template_args=[RESIDENT_BLOCK_SIZE, *variant], kernel_source_sha256=kernel_sha256(),
+                   template_args=None if config.uses_resident_direct else [RESIDENT_BLOCK_SIZE, *variant],
+                   kernel_source_sha256=kernel_sha256(), split_copy=split,
                    python=platform.python_version(), torch=torch.__version__, torch_cuda=torch.version.cuda,
                    cxx11_abi=bool(torch._C._GLIBCXX_USE_CXX11_ABI), nccl=list(torch.cuda.nccl.version()),
                    device=torch.cuda.get_device_name(), capability=list(torch.cuda.get_device_capability()),
@@ -653,7 +718,7 @@ def build_receipt(config, geo, output):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Fixed offload set adapter: CPU dry-run against pinned SGLang, "
-                                                 "or the GPU build receipt of the resident resolver.")
+                                                 "or the GPU build receipt of an arm's kernels.")
     commands = parser.add_subparsers(dest="command", required=True)
     dry = commands.add_parser("dry-run", help="resolve pinned symbols, split pools and contracts; CPU only")
     dry.add_argument("--sglang-src", type=Path, required=True, help="pinned checkout or its python/sglang package")
@@ -665,8 +730,10 @@ def main(argv=None):
     sizing.add_argument("--host-to-device-ratio", type=int, default=2)
     sizing.add_argument("--index-bytes-per-token", type=int, default=0,
                         help="index K(+V) bytes per logical token over all sparse layers; 0 leaves it out")
-    build = commands.add_parser("build-receipt", help="GPU only: JIT build of the resident resolver and toolchain")
-    build.add_argument("--config", type=Path, required=True, help="fixed_layers config without resident_direct")
+    build = commands.add_parser("build-receipt", help="GPU only: JIT build of the resident resolver or the split-copy "
+                                                      "specializations, and toolchain")
+    build.add_argument("--config", type=Path, required=True,
+                       help="fixed_layers config without resident_direct or with split_copy")
     build.add_argument("--output", type=Path, required=True)
     build.add_argument("--allow-cuda-build", action="store_true")
     arena._geometry_args(build)

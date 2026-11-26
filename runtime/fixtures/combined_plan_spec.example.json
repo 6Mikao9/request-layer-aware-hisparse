@@ -73,6 +73,8 @@
       "52": 4276, "54": 4377, "55": 4158, "58": 3941, "59": 4092}
   },
   "resident_direct_lists": ["calibrated_t40"],
+  "split_copy_lists": [],
+  "layouts": ["native", "arena"],
   "pressure_points": [
     {
       "name": "8-16Ki",
@@ -91,9 +93,20 @@
     }
   ],
   "repeats": 3,
-  "measurement": {"max_new_tokens": 512, "warmup_requests": 2, "warmup_steps": 32, "min_window_steps": 128,
-    "min_decode_log_samples": 8, "functional_requests": 8, "functional_max_new_tokens": 64, "ttft_slo_s": 60,
-    "tpot_slo_s": 0.2, "server_start_timeout_s": 3600, "request_timeout_s": 1800},
+  "measurement": {
+    "max_new_tokens": 512,
+    "warmup_requests": 2,
+    "warmup_steps": 32,
+    "min_window_steps": 128,
+    "min_decode_log_samples": 8,
+    "functional_requests": 8,
+    "functional_max_new_tokens": 64,
+    "ttft_slo_s": 60,
+    "tpot_slo_s": 0.2,
+    "server_start_timeout_s": 3600,
+    "request_timeout_s": 1800,
+    "workloads": ["fixed", "natural"]
+  },
   "acceptance": {
     "candidate": "calibrated_t40_shared_arena",
     "baselines": ["stock", "all_shared_arena", "calibrated_t40_stock_layout", "calibrated_t40_isolated_arena",

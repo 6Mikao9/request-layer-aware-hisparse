@@ -13,19 +13,23 @@ did not pass) or not_run, each with its reasons.
 
 identity     identity.json: selected GPUs (UUID, clocks, foreign processes), topology, image ID,
              pinned SGLang digests and symbols, weights, host memlock/memory, disk, toolchain
-build        build/{shared_lru,layer_placement}.json: sm_80 JIT build receipts with artifacts
-gate         gate/combined-gate.json: A100 correctness gate, eager and CUDA Graph
+build        build/{shared_lru,layer_placement,split_copy}.json: sm_80 JIT build receipts with artifacts
+gate         gate/{combined-gate,fixed-layer-gate,fixed-layer-gate-production}.json: the A100 correctness
+             gates of the arms' mechanisms, eager and CUDA Graph
 functional   functional/correctness.json: real-model outputs of no config, the all-default config and
              every arm against stock (stock A/A gives the repeat rate), sequential and concurrent;
              per-rank receipts of every arm
 capacity     capacity/admission.json: auto-sized pools (/server_info), receipts, GPU memory per arm,
              and which planned batches each arm can hold
-performance  runs/<point>/<pair>/r<k>/<a|b>-<arm>/{run_config,admission,correctness,metrics}.json:
-             fresh server per run, warmup, one full batch; steady window, real-batch evidence
+performance  runs/<point>/<pair>/r<k>-<workload>/<a|b>-<arm>/{run_config,admission,correctness,metrics}.json:
+             fresh server per run, warmup, one full batch; fixed work (ignore_eos) is judged on its steady
+             full-batch window, natural load (EOS) on its whole decode phase
 diagnostics  diagnostics/diagnostic_summary.csv: counter waves of arena arms; with --nsys a captured run
-             per arm whose steady decode graph gives per-rank whole steps, each step's bottleneck rank
-             and that rank's per-layer read path, exposed wait and layer time (<arm>/nsys/timeline.json)
-verdict      verdict-<UTC>.json: paired intervals per point and pair, native A/A noise, acceptance
+             per arm whose steady decode graph gives per-rank whole steps and TP waits, each step's
+             bottleneck and critical rank and their per-layer split into swap, resolver, attention,
+             collective, other and idle (<arm>/nsys/timeline.json keeps every step of every rank)
+verdict      verdict-<UTC>.json: paired intervals per point, workload and pair, native A/A noise, and the
+             acceptance of each workload side by side
 
 Logs, token-ID ledgers and host details stay in the output directory, the maintainer's
 private workspace; only code, synthetic fixtures and anonymous summaries enter the PR.
@@ -65,8 +69,8 @@ MANIFEST_SCHEMA = "combined-workload-manifest-v1"
 NATIVE = "native_no_config"          # runtime.launch without --hisparse-study-config
 GPU_FIELDS = ("index", "uuid", "name", "memory_total", "memory_used", "utilization", "clock_sm", "clock_sm_max",
               "driver")
-TIMELINE_FIELDS = ("steps", "whole_step_us_p50", "whole_step_us_p95", "bottleneck_steps", "collective_us_p50",
-                   *timeline.LAYER_FIELDS)
+TIMELINE_FIELDS = ("steps", "whole_step_us_p50", "whole_step_us_p95", "bottleneck_steps", "critical_steps",
+                   "collective_us_p50", "tp_wait_us_p50", *timeline.LAYER_FIELDS, "critical_ranks")
 OPENER = build_opener(ProxyHandler({}))
 
 
@@ -206,18 +210,27 @@ def geometry_args(geo):
 
 
 def timeline_rows(arm, point, summary):
-    """CSV rows of one Nsight timeline: whole step per rank and of each step's bottleneck rank, then that
-    rank's own layers (medians over steps)."""
+    """CSV rows of one Nsight timeline: whole step and TP wait per rank and of each step's bottleneck rank (longest
+    whole step) and critical rank (least TP wait), then those ranks' own layers (medians over steps)."""
     if summary is None:
         return []
-    bottleneck = dict(summary["bottleneck"], rank="bottleneck", bottleneck_steps=summary["steps"], collective_us=None)
-    rows = [dict(arm=arm, point=point, rank=row["rank"], layer="step", source="nsys", steps=summary["steps"],
-                 whole_step_us_p50=(row["whole_step_us"] or {}).get("p50"),
-                 whole_step_us_p95=(row["whole_step_us"] or {}).get("p95"), bottleneck_steps=row["bottleneck_steps"],
-                 collective_us_p50=(row["collective_us"] or {}).get("p50"))
-            for row in [*summary["ranks"], bottleneck]]
-    return rows + [dict(arm=arm, point=point, rank="bottleneck", source="nsys", steps=summary["steps"], **layer)
-                   for layer in summary["bottleneck"]["layers"] or []]
+    steps, rows = summary["steps"], []
+    picked = dict(bottleneck=dict(summary["bottleneck"], bottleneck_steps=steps))
+    if summary["critical"] is not None:
+        picked["critical"] = dict(summary["critical"], critical_steps=steps)
+    for rank, row in [*((row["rank"], row) for row in summary["ranks"]), *picked.items()]:
+        rows.append(dict(arm=arm, point=point, rank=rank, layer="step", source="nsys", steps=steps,
+                         whole_step_us_p50=(row["whole_step_us"] or {}).get("p50"),
+                         whole_step_us_p95=(row["whole_step_us"] or {}).get("p95"),
+                         bottleneck_steps=row.get("bottleneck_steps"), critical_steps=row.get("critical_steps"),
+                         collective_us_p50=(row.get("collective_us") or {}).get("p50"),
+                         tp_wait_us_p50=(row.get("tp_wait_us") or {}).get("p50")))
+    for rank, part in picked.items():
+        rows += [dict(arm=arm, point=point, rank=rank, source="nsys", steps=steps,
+                      **dict(layer, critical_ranks=json.dumps(layer["critical_ranks"]) if "critical_ranks" in layer
+                             else None))
+                 for layer in part["layers"] or []]
+    return rows
 
 
 def info_excerpt(info):
@@ -345,6 +358,9 @@ class Runner:
                     reasons.append(f"rank {r.get('rank')}: bound offload layers differ from S")
                 if signature.get("resident_path") != ("direct" if config.uses_resident_direct else "resolver"):
                     reasons.append(f"rank {r.get('rank')}: bound resident path differs from the config")
+                if not config.uses_arena and signature.get("native_swap") != (
+                        "split" if config.uses_split_copy else "fused"):
+                    reasons.append(f"rank {r.get('rank')}: bound native swap differs from the config")
         counters = [r for r in records if r.get("event") == "hisparse_shared_lru_counters"]
         return dict(reasons=sorted(set(reasons)), bound=bound, counters=counters)
 
@@ -391,16 +407,19 @@ class Runner:
         return sum(stream.generate(server.url + "/generate", row, self.m["request_timeout_s"])["successful"]
                    for row in rows)
 
-    def batch_rows(self, point, input_batch):
+    def batch_rows(self, point, input_batch, workload):
         size = self.points[point]["real_batch"]
         rows = self.rows[point][input_batch * size:(input_batch + 1) * size]
-        return [dict(row, max_new_tokens=self.m["max_new_tokens"]) for row in rows]
+        return [dict(row, max_new_tokens=self.m["max_new_tokens"], ignore_eos=workload == "fixed") for row in rows]
 
     def measure(self, entry, slot, arm, run_dir, *, config_path=None, wrapper=()):
-        """One fresh server, warmup and one full batch; writes the four result files of the run."""
-        m, point, batch = self.m, entry["point"], entry["real_batch"]
+        """One fresh server, warmup and one full batch; writes the four result files of the run.
+
+        The fixed workload is judged on its steady full-batch window, natural load on its decode phase.
+        """
+        m, point, batch, workload = self.m, entry["point"], entry["real_batch"], entry["workload"]
         config = sc.read(config_path)[0] if config_path is not None else self.configs[arm]
-        rows = self.batch_rows(point, entry["input_batch"])
+        rows = self.batch_rows(point, entry["input_batch"], workload)
         started = datetime.datetime.now(datetime.timezone.utc).isoformat()
         server, argv = self.launcher.start(arm, run_dir, config_path=config_path, wrapper=wrapper)
         records, requests, makespan, info, memory, warm = [], [], None, None, None, None
@@ -418,17 +437,24 @@ class Runner:
             exit_code = server.stop(grace=1800 if wrapper else 120)     # nsys writes its report after the workers
         receipts = self.check_receipts(arm, run_dir / "receipts", config)
         reasons = ([problem] if problem else []) + receipts["reasons"]
-        window, more = measure.steady_window(requests, batch=batch, warmup_steps=m["warmup_steps"],
-                                             min_steps=m["min_window_steps"]) if requests else (None, [])
+        window, more = (None, [])
+        if requests and workload == "fixed":
+            window, more = measure.steady_window(requests, batch=batch, warmup_steps=m["warmup_steps"],
+                                                 min_steps=m["min_window_steps"])
+            if window is not None and set(window["finish_reasons"]) != {"length"}:
+                more.append(f"fixed work ended by {window['finish_reasons']}; every request must reach its budget")
+        elif requests:
+            window, more = measure.natural_window(requests, batch=batch)
         reasons += more
         real = None
         if window is not None:
             origin = min(r["start"] for r in requests)
             real, more = measure.real_batch(server.samples, batch=batch, start=origin + window["start_s"],
-                                            end=origin + window["end_s"], min_samples=m["min_decode_log_samples"])
+                                            end=origin + window["end_s"], min_samples=m["min_decode_log_samples"],
+                                            shrinking=workload == "natural")
             reasons += more
         run = dict(run_id=str(run_dir.relative_to(self.out)), point=point, pair=entry.get("pair"),
-                   repeat=entry.get("repeat"), slot=slot, arm=arm)
+                   repeat=entry.get("repeat"), workload=workload, slot=slot, arm=arm)
         write_new(run_dir / "run_config.json", dict(
             run, config_sha256=config.digest, resolved_config=config.as_dict(), capabilities=sc.capabilities(config),
             argv=argv, devices=self.args.devices, plan_sha256=sha256(Path(self.args.plan_dir) / "plan.json"),
@@ -505,8 +531,10 @@ class Runner:
         arms, geo = self.configs.items(), geometry_args(self.plan["geometry"])
         jobs = {"shared_lru": next((a for a, c in arms if c.uses_arena and c.hot_pool.quota == "none"), None),
                 "layer_placement": next((a for a, c in arms if c.uses_fixed_layers and not c.uses_resident_direct),
-                                        None)}
-        modules = dict(shared_lru="runtime.shared_lru_device", layer_placement="runtime.layer_placement_device")
+                                        None),
+                "split_copy": next((a for a, c in arms if c.uses_split_copy), None)}
+        modules = dict(shared_lru="runtime.shared_lru_device", layer_placement="runtime.layer_placement_device",
+                       split_copy="runtime.layer_placement_device")
         results, reasons = {}, []
         for name, arm in jobs.items():
             if arm is None:
@@ -522,11 +550,21 @@ class Runner:
         return dict(status="fail" if reasons else "pass", reasons=reasons)
 
     def stage_gate(self):
-        output = self.out / "gate" / "combined-gate.json"
-        ok, job = self._jobs("gate", ["-m", "runtime.cuda_combined_correctness", "--allow-cuda-test",
-                                      "--output", str(output)], output)
-        ok = ok and json.loads(output.read_text()).get("status") == "pass"
-        return dict(status="pass" if ok else "fail", reasons=[] if ok else [f"combined gate failed: {job}"])
+        """A100 gates of the mechanisms the plan launches: the combined gate (arena over S, resident reads) and
+        the fixed-layer gate (stock layout, fused and split swaps) at the small and the production geometry."""
+        jobs = []
+        if any(c.uses_arena for c in self.configs.values()):
+            jobs.append(("combined-gate", ["runtime.cuda_combined_correctness"]))
+        if any(c.uses_fixed_layers and not c.uses_arena for c in self.configs.values()):
+            jobs += [("fixed-layer-gate", ["runtime.cuda_fixed_layer_correctness"]),
+                     ("fixed-layer-gate-production", ["runtime.cuda_fixed_layer_correctness", "--production"])]
+        reasons = []
+        for name, (module, *extra) in jobs:
+            output = self.out / "gate" / f"{name}.json"
+            ok, job = self._jobs("gate", ["-m", module, "--allow-cuda-test", *extra, "--output", str(output)], output)
+            if not (ok and json.loads(output.read_text()).get("status") == "pass"):
+                reasons.append(f"{name} failed: {job}")
+        return dict(status="fail" if reasons else "pass", reasons=reasons, gates=[name for name, _ in jobs])
 
     def scheduled_arms(self):
         return sorted({arm for entry in self.schedule for arm in entry["order"]})
@@ -610,8 +648,8 @@ class Runner:
             reasons += [f"{arm}: {p}" for p in problems]
             arms[arm] = dict(ready=problem, exit_code=exit_code, argv=argv, server_info=info_excerpt(info),
                              gpu_memory=memory, receipts=receipts["bound"], fits=fits)
-        infeasible = [dict(point=e["point"], pair=e["pair"], arms=[a for a in e["order"]
-                                                                   if not arms[a]["fits"][e["point"]]["fits"]])
+        infeasible = [dict(point=e["point"], workload=e["workload"], pair=e["pair"],
+                           arms=[a for a in e["order"] if not arms[a]["fits"][e["point"]]["fits"]])
                       for e in self.schedule if not all(arms[a]["fits"][e["point"]]["fits"] for a in e["order"])]
         write_new(self.out / "capacity" / "admission.json", dict(
             status="fail" if reasons else "pass", reasons=reasons, arms=arms, infeasible=infeasible,
@@ -619,8 +657,8 @@ class Runner:
         return dict(status="fail" if reasons else "pass", reasons=reasons)
 
     def run_dir(self, entry, slot, arm):
-        return (self.out / "runs" / entry["point"] / entry["pair"].replace("->", "__") / f"r{entry['repeat']}"
-                / f"{slot}-{arm}")
+        return (self.out / "runs" / entry["point"] / entry["pair"].replace("->", "__")
+                / f"r{entry['repeat']}-{entry['workload']}" / f"{slot}-{arm}")
 
     def stage_performance(self):
         """AB/BA rounds in plan priority order until the deadline; finished runs are kept on --resume."""
@@ -658,14 +696,16 @@ class Runner:
         return dict(status="pass" if counts["valid"] + counts["kept"] else "fail", reasons=reasons, **counts)
 
     def stage_diagnostics(self):
-        """Separate waves: arena counters per rank and layer; optional Nsight; never used for clean metrics."""
+        """Separate waves of the acceptance and split-copy arms: arena counters per rank and layer; optional
+        Nsight; never used for clean metrics."""
         if self.manifest_reasons:
             return dict(status="fail", reasons=self.manifest_reasons)
         point = self.args.diagnostics_point or self.plan["pressure_points"][0]["name"]
-        entry = dict(point=point, real_batch=self.points[point]["real_batch"], input_batch=0)
+        entry = dict(point=point, real_batch=self.points[point]["real_batch"], input_batch=0, workload="fixed")
         fields = ("arm", "point", "rank", "layer", "source", *arena.reference.COUNTER_FIELDS, *TIMELINE_FIELDS, "note")
         rows, reasons = [], []
-        for arm in [self.acceptance["candidate"], *self.acceptance["baselines"]]:
+        arms = [self.acceptance["candidate"], *self.acceptance["baselines"]]
+        for arm in arms + [a for a, c in self.configs.items() if c.uses_split_copy and a not in arms]:
             config, base = self.configs[arm], self.out / "diagnostics" / arm
             if config.uses_arena:
                 path = base / "counters_config.json"
@@ -717,30 +757,31 @@ class Runner:
         return summary, "; ".join(summary["reasons"]) or None
 
     def stage_verdict(self):
-        """Paired intervals per point and pair, native A/A noise and the preregistered acceptance."""
+        """Paired intervals per point, workload and pair, native A/A noise and the preregistered acceptance of
+        each workload, reported side by side."""
         acc, by_round = self.acceptance, {}
         for path in sorted((self.out / "runs").rglob("metrics.json")):
             metrics = json.loads(path.read_text())
             outputs = json.loads((path.parent / "correctness.json").read_text())["outputs"]
-            by_round.setdefault((metrics["point"], metrics["pair"], metrics["repeat"]), {})[metrics["slot"]] = (
-                metrics, {alias: value["output_ids_sha256"] for alias, value in outputs.items()})
-        entries = {(e["point"], e["pair"], e["repeat"]): e for e in self.plan["schedule"]}
+            by_round.setdefault((metrics["point"], metrics["workload"], metrics["pair"], metrics["repeat"]), {})[
+                metrics["slot"]] = (metrics, {alias: value["output_ids_sha256"] for alias, value in outputs.items()})
+        entries = {(e["point"], e["workload"], e["pair"], e["repeat"]): e for e in self.plan["schedule"]}
         blocks, rejected = {}, []
         for key, slots in sorted(by_round.items()):
             entry = entries[key]
             runs = [slots.get(slot) for slot in "ab"]
             if any(run is None or run[0]["status"] != "valid" for run in runs):
-                rejected.append(dict(point=key[0], pair=key[1], repeat=key[2], runs={
+                rejected.append(dict(point=key[0], workload=key[1], pair=key[2], repeat=key[3], runs={
                     slot: None if run is None else dict(status=run[0]["status"], reasons=run[0]["reasons"])
                     for slot, run in zip("ab", runs)}))
                 continue
             control, candidate = runs if entry["order"][0] == entry["control"] else runs[::-1]
-            blocks.setdefault((key[0], entry["control"], entry["candidate"]), []).append(dict(
-                round=key[2], order="AB" if entry["order"][0] == entry["control"] else "BA",
+            blocks.setdefault((key[0], key[1], entry["control"], entry["candidate"]), []).append(dict(
+                round=key[3], order="AB" if entry["order"][0] == entry["control"] else "BA",
                 control=control[0]["window"], candidate=candidate[0]["window"],
                 mismatch=measure.output_mismatch(control[1], candidate[1])))
-        noise = {(point, b["round"]): b["mismatch"] for (point, control, candidate), items in blocks.items()
-                 if control == candidate == "stock" for b in items}
+        noise = {(point, workload, b["round"]): b["mismatch"] for (point, workload, control, candidate), items
+                 in blocks.items() if control == candidate == "stock" for b in items}
         functional = self.out / "functional" / "correctness.json"
         fallback = json.loads(functional.read_text())["stock_repeat_mismatch"]["concurrent"] if functional.is_file() \
             else 0.0
@@ -748,27 +789,34 @@ class Runner:
                                   min_pairs=acc["min_pairs"])
         for key, items in blocks.items():
             for b in items:
-                b["quality_ok"] = b["mismatch"] <= noise.get((key[0], b["round"]), fallback) + \
+                b["quality_ok"] = b["mismatch"] <= noise.get((key[0], key[1], b["round"]), fallback) + \
                     acc["quality_mismatch_over_stock_max"]
             results[key] = measure.paired(items, **rules)
         capacity = self.out / "capacity" / "admission.json"
         for item in json.loads(capacity.read_text())["infeasible"] if capacity.is_file() else []:
             control, candidate = item["pair"].split("->")
-            results.setdefault((item["point"], control, candidate), dict(verdict="infeasible", arms=item["arms"]))
+            results.setdefault((item["point"], item["workload"], control, candidate),
+                               dict(verdict="infeasible", arms=item["arms"]))
         kinds = {(e["control"], e["candidate"]): (e["kind"], e["acceptance"]) for e in self.plan["schedule"]}
-        acceptance = measure.acceptance(results, candidate=acc["candidate"], baselines=acc["baselines"],
-                                        points=[p["name"] for p in self.plan["pressure_points"]],
-                                        min_points=acc["min_pressure_points"])
+        acceptance = {workload: measure.acceptance(
+            {(p, c, d): result for (p, w, c, d), result in results.items() if w == workload},
+            candidate=acc["candidate"], baselines=acc["baselines"],
+            points=[p["name"] for p in self.plan["pressure_points"]], min_points=acc["min_pressure_points"])
+            for workload in self.m["workloads"]}
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         write_new(self.out / f"verdict-{stamp}.json", dict(
             schema="combined-verdict-v1", plan_sha256=sha256(Path(self.args.plan_dir) / "plan.json"),
             manifest_sha256=self.manifest_sha256, rules=dict(rules, ci="two-sided 95% t over independent rounds",
-                                                             quality="output-hash mismatch <= stock A/A + tolerance"),
+                                                             quality="output-hash mismatch <= stock A/A + tolerance",
+                                                             workloads=dict(
+                                                                 fixed="ignore_eos; steady full-batch window",
+                                                                 natural="EOS ends requests; whole decode phase")),
             acceptance=acceptance, rejected_rounds=rejected,
-            results=[dict(point=p, control=c, candidate=d, kind=kinds.get((c, d), (None, False))[0],
+            results=[dict(point=p, workload=w, control=c, candidate=d, kind=kinds.get((c, d), (None, False))[0],
                           acceptance=kinds.get((c, d), (None, False))[1], **result)
-                     for (p, c, d), result in sorted(results.items())]))
-        return dict(status="pass", reasons=[], file=f"verdict-{stamp}.json", acceptance=acceptance["overall"])
+                     for (p, w, c, d), result in sorted(results.items())]))
+        return dict(status="pass", reasons=[], file=f"verdict-{stamp}.json",
+                    acceptance={workload: value["overall"] for workload, value in acceptance.items()})
 
 
 def parse_deadline(value):

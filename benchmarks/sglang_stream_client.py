@@ -1,6 +1,7 @@
 """Measure fixed tokenized workloads against SGLang's native /generate endpoint.
 
-Each JSONL row supplies request_alias, workload, input_ids and max_new_tokens.
+Each JSONL row supplies request_alias, workload, input_ids and max_new_tokens, and
+optionally ignore_eos: true for fixed output work (every request runs to its budget).
 Keep the source JSONL with raw IDs inside the private container. Results
 contain aliases, workload labels, hashes, timings and counts.
 The endpoint must already be running. Record its effective execution settings
@@ -56,7 +57,8 @@ def read_workload(raw):
             budget, ids = row["max_new_tokens"], row["input_ids"]
             if (not isinstance(alias, str) or not alias or alias in aliases
                     or not isinstance(workload, str) or not workload
-                    or type(budget) is not int or budget < 1 or not valid_ids(ids) or not ids):
+                    or type(budget) is not int or budget < 1 or not valid_ids(ids) or not ids
+                    or type(row.get("ignore_eos", False)) is not bool):
                 raise ValueError(f"Invalid workload record at line {number}")
             aliases.add(alias)
             requests.append(row)
@@ -201,12 +203,12 @@ def generate(endpoint, row, timeout, clock=time.perf_counter, *, on_start=None):
     Request construction is outside this interval and must be counted by an
     arrival-based caller. The original closed-loop record schema is unchanged.
     """
-    ids, budget = row["input_ids"], row["max_new_tokens"]
+    ids, budget, ignore_eos = row["input_ids"], row["max_new_tokens"], row.get("ignore_eos", False)
     generation = Generation(row["request_alias"], ids, budget)
     payload = {
         "rid": row["request_alias"], "input_ids": ids, "stream": True, "return_logprob": False,
         "sampling_params": {
-            "temperature": 0, "max_new_tokens": budget, "ignore_eos": False, "stream_interval": 1,
+            "temperature": 0, "max_new_tokens": budget, "ignore_eos": ignore_eos, "stream_interval": 1,
         },
     }
     request = Request(endpoint, data=json.dumps(payload).encode(), headers={
@@ -215,6 +217,7 @@ def generate(endpoint, row, timeout, clock=time.perf_counter, *, on_start=None):
     record = {
         "request_alias": row["request_alias"], "workload": row["workload"],
         "input_tokens": len(ids), "input_ids_sha256": digest_ids(ids), "max_new_tokens": budget,
+        "ignore_eos": ignore_eos,
     }
     started = clock()
     if on_start is not None:

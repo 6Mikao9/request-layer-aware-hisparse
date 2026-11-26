@@ -1,0 +1,92 @@
+{
+  "schema": "combined-plan-spec-v1",
+  "seed": 20261124,
+  "split": {"training_sha256": "3ca8e5d2a25bffa3f085a4e21377fe7218984b47df5dea684735f8bdec8af2d8",
+    "heldout_sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+  "geometry": {"tp_size": 8, "first_layer": 0, "layers": 60, "dense_layers": 0, "hot_rows": 4096, "page": 128,
+    "top_k_blocks": 16, "block_size": 128, "head_dim": 128, "dtype_bytes": 2, "kv_heads_per_rank": 1, "slots": 128,
+    "plane_rows": 396672, "host_to_device_ratio": 2, "index_bytes_per_token": 0},
+  "offload_lists": [
+    {
+      "name": "calibrated_t40",
+      "selection": "calibrated",
+      "offload_layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 34, 36, 37, 38, 39,
+        40, 41, 42, 43, 44, 45, 46, 47, 48, 50, 51, 55, 57, 58, 59],
+      "calibration": {"training_sha256": "3ca8e5d2a25bffa3f085a4e21377fe7218984b47df5dea684735f8bdec8af2d8",
+        "list_sha256": "d862e1eb85daf89baf6bf7ee0b66359ef396ef618604f825711f659f0282b644"}
+    },
+    {
+      "name": "random_t40_s13",
+      "selection": "random",
+      "offload_layers": [0, 1, 4, 5, 7, 8, 9, 11, 13, 14, 15, 16, 17, 18, 23, 25, 27, 28, 29, 34, 35, 37, 40, 41,
+        42, 43, 44, 45, 46, 47, 49, 51, 52, 53, 54, 55, 56, 57, 58, 59],
+      "seed": 13
+    },
+    {
+      "name": "random_t40_s37",
+      "selection": "random",
+      "offload_layers": [1, 2, 3, 4, 5, 6, 9, 11, 13, 18, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32, 33, 34, 38,
+        39, 40, 41, 42, 43, 44, 47, 48, 51, 52, 53, 54, 56, 57, 58, 59],
+      "seed": 37
+    },
+    {
+      "name": "random_t40_s71",
+      "selection": "random",
+      "offload_layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 16, 18, 20, 21, 22, 23, 24, 29, 32, 33, 35,
+        36, 38, 39, 41, 45, 46, 47, 48, 50, 51, 52, 54, 55, 58, 59],
+      "seed": 71
+    }
+  ],
+  "static_quota_rows": null,
+  "resident_direct_lists": ["calibrated_t40"],
+  "split_copy_lists": ["calibrated_t40"],
+  "layouts": ["native"],
+  "pressure_points": [
+    {
+      "name": "8-16Ki",
+      "input_tokens": [8192, 16384],
+      "real_batch": 48
+    },
+    {
+      "name": "16-32Ki",
+      "input_tokens": [16384, 32768],
+      "real_batch": 32
+    },
+    {
+      "name": "32-64Ki",
+      "input_tokens": [32768, 65536],
+      "real_batch": 8
+    }
+  ],
+  "repeats": 3,
+  "measurement": {
+    "max_new_tokens": 512,
+    "warmup_requests": 2,
+    "warmup_steps": 32,
+    "min_window_steps": 128,
+    "min_decode_log_samples": 8,
+    "functional_requests": 8,
+    "functional_max_new_tokens": 64,
+    "ttft_slo_s": 60,
+    "tpot_slo_s": 0.2,
+    "server_start_timeout_s": 3600,
+    "request_timeout_s": 1800,
+    "workloads": ["fixed", "natural"]
+  },
+  "acceptance": {
+    "candidate": "calibrated_t40_stock_layout",
+    "baselines": ["stock", "random_t40_s13_stock_layout", "random_t40_s37_stock_layout",
+      "random_t40_s71_stock_layout"],
+    "min_gain": 0.05,
+    "tpot_p95_regression_max": 0.02,
+    "ci_level": 0.95,
+    "min_pressure_points": 2,
+    "min_pairs": 3,
+    "quality_mismatch_over_stock_max": 0.0
+  },
+  "upstream_args": ["--model-path", "$MODEL_DIR", "--tp-size", "8", "--enable-hisparse", "--hisparse-config",
+    "{\"top_k\":2048,\"device_buffer_size\":4096}", "--page-size", "128", "--attention-backend", "triton",
+    "--disable-overlap-schedule", "--disable-radix-cache", "--mem-fraction-static", "0.84", "--decode-log-interval",
+    "8"],
+  "sm80_bf16_projections": true
+}
