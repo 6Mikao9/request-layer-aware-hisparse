@@ -3,11 +3,13 @@
 Requires the pinned SGLang image, an idle A100 (sm_80) and the repository root on
 PYTHONPATH; never run it on an active service. No model is loaded. Every launch
 is compared with ``runtime.shared_lru.KernelMirror`` on the same synthetic
-tables: flat consumer indices, owner tags, recency lists, occupancy, reverse
-tokens, owner summaries, counters, status bits and the K/V bytes behind every
-returned index. Eager launches and CUDA Graph replay (one bucket, changing real
-rows, padded rows) are both covered, for every resolver switch set
-(``--features``). This is a correctness check, not a benchmark.
+tables: flat consumer indices, owner tags, recency lists or rings (entries,
+dead bits, positions, head/tail/rebuilds), occupancy, reverse tokens, owner
+summaries, the hit index (every live key once in one of its buckets), counters,
+status bits and the K/V bytes behind every returned index. Eager launches and
+CUDA Graph replay (one bucket, changing real rows, padded rows) are both
+covered, for every resolver switch set (``--features``). This is a correctness
+check, not a benchmark.
 
     python -m runtime.cuda_shared_lru_correctness --allow-cuda-test --output /tmp/gate.json
 """
@@ -32,8 +34,11 @@ ARMS = {
     "shared_bypass": {"mode": "shared", "layout": "arena", "admission": "bypass_list", "bypass_layers": [1]},
 }
 # Resolver switches (study_config.FEATURES): every arm runs with each set and must match the same mirror.
+# "indexed" is the issue #6 set (hit_index + incremental_lru + compact_owner).
 FEATURE_SETS = {"none": (), "owner_summary": ("owner_summary",), "touched_bitmap": ("touched_bitmap",),
-                "both": ("owner_summary", "touched_bitmap")}
+                "both": ("owner_summary", "touched_bitmap"), "hit_index": ("hit_index",),
+                "incremental_lru": ("incremental_lru",), "compact_owner": ("compact_owner",),
+                "indexed": ("compact_owner", "hit_index", "incremental_lru")}
 L, H, PAGE, SLOTS, BLOCKS, BLOCK, DIM, BUCKET = 3, 64, 16, 4, 4, 8, 8, 4
 CONTEXT = 4096
 
@@ -41,6 +46,42 @@ CONTEXT = 4096
 def study_config(pool, features=(), counters=False):
     return sc.parse({"schema": sc.SCHEMA, "hot_pool": pool, "features": dict.fromkeys(features, True),
                      "diagnostics": {"mode": "counters" if counters else "none"}})
+
+
+def device_state(runtime, row_token, slot):
+    """One slot's device tables in ``KernelMirror`` form (CPU copies; synchronizes)."""
+    plan = runtime.plan
+    state = dict(gen=int(runtime.generation[slot]), owner=runtime.row_owner[slot].tolist(),
+                 token=row_token[:, slot, :runtime.hot_rows].reshape(-1).tolist(), occ=runtime.occupancy[slot].tolist())
+    if runtime.ring.numel():
+        rings, meta = reference.ring_domains(plan), runtime.ring_meta[slot].tolist()
+        state.update(ring=runtime.ring[slot].tolist(), pos=runtime.ring_pos[slot].tolist(),
+                     dead=reference.ring_dead_bits(runtime.ring_dead[slot].tolist(), rings),
+                     meta=[meta[4 * d:4 * d + 3] for d in range(len(rings))])
+    else:
+        state["order"] = runtime.order[slot].tolist()
+    if runtime.owner_summary.numel():
+        state["summary"] = [w & reference.MASK64 for w in runtime.owner_summary[slot].tolist()]
+    if runtime.index.numel():
+        flat = runtime.index[slot].tolist()
+        state.update(index=[flat[i:i + reference.INDEX_WAYS] for i in range(0, len(flat), reference.INDEX_WAYS)],
+                     index_flag=int(runtime.index_flags[slot]))
+    return state
+
+
+def slot_differences(runtime, row_token, mirror, slot):
+    """Tables where the device differs from the mirror. Index placement may differ (concurrent CUDA
+    inserts); the index must then still hold every live key once, in one of its two buckets."""
+    got, want = device_state(runtime, row_token, slot), mirror.slots[slot]
+    diffs = [name for name in ("owner", "token", "occ", "order", "ring", "dead", "pos", "meta", "summary",
+                               "index_flag") if name in want and got.get(name) != want[name]]
+    if "summary" in want and want["summary"] != mirror.live_summary(slot):
+        diffs.append("summary differs from the owner tags")
+    if "index" in want and not got["index_flag"]:
+        entries = [entry for bucket in got["index"] for entry in bucket]
+        problems = reference.index_problems(entries, mirror.live_keys(slot), mirror.index_half, mirror.row_bits)
+        diffs += [f"index: {problem}" for problem in problems[:3]]
+    return diffs
 
 
 @dataclass(frozen=True)
@@ -164,15 +205,8 @@ class Bench:
         for b, (slot, blocks) in enumerate(rows):
             got = out[b, :width].tolist()
             assert got == expected[b], f"plane {plane} slot {slot}: indices {got} != mirror {expected[b]}"
-            state = self.mirror.slots[slot]
-            assert self.runtime.row_owner[slot].tolist() == state["owner"], "owner tags diverged"
-            assert self.runtime.order[slot].tolist() == state["order"], "recency list diverged"
-            assert self.runtime.occupancy[slot].tolist() == state["occ"], "occupancy diverged"
-            if self.runtime.owner_summary.numel():
-                words = [w & (2**64 - 1) for w in self.runtime.owner_summary[slot].tolist()]
-                assert words == state["summary"] == self.mirror.live_summary(slot), "owner summary diverged"
-            tokens = self.coordinator.req_device_buffer_tokens[:, slot, :self.geometry.hot].reshape(-1).tolist()
-            assert tokens == state["token"], "reverse token table diverged"
+            diffs = slot_differences(self.runtime, self.coordinator.req_device_buffer_tokens, self.mirror, slot)
+            assert not diffs, f"plane {plane} slot {slot}: tables diverged: {diffs}"
             selected = reference.selected_tokens(blocks, self.geometry.block, self.seq[slot])
             valid = [(got[i], slot * self.geometry.context + t) for i, t in enumerate(selected) if t >= 0]
             if valid:

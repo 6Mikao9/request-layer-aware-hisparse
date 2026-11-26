@@ -24,6 +24,7 @@ SPEC_SCHEMA = "shared-lru-plan-spec-v1"
 PLAN_SCHEMA = "shared-lru-paired-plan-v1"
 SHARED = {"mode": "shared", "layout": "arena"}
 SWITCHES = {"owner_summary": True, "touched_bitmap": True}
+INDEXED = {"hit_index": True, "incremental_lru": True, "compact_owner": True}   # issue #6
 # (arm, hot_pool fields, features)
 ARMS = (
     ("stock", {}, {}),
@@ -37,8 +38,14 @@ ARMS = (
     ("shared_lru_touched_bitmap", SHARED, {"touched_bitmap": True}),
     ("shared_lru_optimized", SHARED, SWITCHES),
     ("isolated_arena_optimized", {"layout": "arena"}, SWITCHES),
+    ("shared_lru_hit_index", SHARED, {"hit_index": True}),
+    ("shared_lru_incremental_lru", SHARED, {"incremental_lru": True}),
+    ("shared_lru_compact_owner", SHARED, {"compact_owner": True}),
+    ("shared_lru_indexed", SHARED, INDEXED),
+    ("isolated_arena_indexed", {"layout": "arena"}, INDEXED),
 )
 BOTH = ("features.owner_summary", "features.touched_bitmap")
+ALL_THREE = ("features.compact_owner", "features.hit_index", "features.incremental_lru")
 # (control, candidate, fields expected to differ). Each resolver switch is measured alone and then
 # combined at a fixed algorithm; algorithms are then compared at the same engineering level.
 PAIRS = (
@@ -54,6 +61,13 @@ PAIRS = (
     ("isolated_arena", "isolated_arena_optimized", BOTH),
     ("isolated_arena_optimized", "shared_lru_optimized", ("hot_pool.mode",)),
     ("stock", "shared_lru_optimized", BOTH + ("hot_pool.layout", "hot_pool.mode")),
+    ("shared_lru", "shared_lru_hit_index", ("features.hit_index",)),
+    ("shared_lru", "shared_lru_incremental_lru", ("features.incremental_lru",)),
+    ("shared_lru", "shared_lru_compact_owner", ("features.compact_owner",)),
+    ("shared_lru", "shared_lru_indexed", ALL_THREE),
+    ("isolated_arena", "isolated_arena_indexed", ALL_THREE),
+    ("isolated_arena_indexed", "shared_lru_indexed", ("hot_pool.mode",)),
+    ("stock", "shared_lru_indexed", ALL_THREE + ("hot_pool.layout", "hot_pool.mode")),
 )
 SPEC_KEYS = {"schema", "seed", "split", "geometry", "static_quota_rows", "floor_rows", "bypass_layers",
              "pressure_points", "repeats", "upstream_args", "sm80_bf16_projections"}

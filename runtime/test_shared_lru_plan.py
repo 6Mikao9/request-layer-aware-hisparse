@@ -46,11 +46,13 @@ class PairedPlan(unittest.TestCase):
             plan = json.loads((Path(tmp) / "plan.json").read_text())
             self.assertEqual([a["arm"] for a in plan["arms"]],
                              ["stock", "isolated_arena", "shared_lru", "shared_fifo", "shared_lru_owner_summary",
-                              "shared_lru_touched_bitmap", "shared_lru_optimized", "isolated_arena_optimized"])
+                              "shared_lru_touched_bitmap", "shared_lru_optimized", "isolated_arena_optimized",
+                              "shared_lru_hit_index", "shared_lru_incremental_lru", "shared_lru_compact_owner",
+                              "shared_lru_indexed", "isolated_arena_indexed"])
             self.assertEqual(set(plan["skipped"]), {"isolated_static", "shared_soft_floor", "shared_bypass"})
             self.assertTrue(plan["split_placeholder"])
-            self.assertEqual(len(plan["pairs"]), 9)
-            self.assertEqual(len(plan["schedule"]), 9 * 3 * 3)
+            self.assertEqual(len(plan["pairs"]), 16)
+            self.assertEqual(len(plan["schedule"]), 16 * 3 * 3)
             orders = [run_["order"] for run_ in plan["schedule"][:3]]
             self.assertEqual(orders, [["stock", "isolated_arena"], ["isolated_arena", "stock"],
                                       ["stock", "isolated_arena"]])
@@ -71,7 +73,7 @@ class PairedPlan(unittest.TestCase):
         self.assertEqual(changed[("isolated_arena", "shared_lru")], ["hot_pool.mode"])
         self.assertEqual(changed[("stock", "isolated_arena")], ["hot_pool.layout"])
         self.assertEqual(changed[("shared_lru", "shared_bypass")], ["hot_pool.admission", "hot_pool.bypass_layers"])
-        self.assertEqual(len(plan["arms"]), 11)
+        self.assertEqual(len(plan["arms"]), 16)
         both = ["features.owner_summary", "features.touched_bitmap"]
         self.assertEqual(changed[("shared_lru", "shared_lru_owner_summary")], ["features.owner_summary"])
         self.assertEqual(changed[("shared_lru", "shared_lru_touched_bitmap")], ["features.touched_bitmap"])
@@ -79,6 +81,12 @@ class PairedPlan(unittest.TestCase):
         self.assertEqual(changed[("isolated_arena", "isolated_arena_optimized")], both)
         self.assertEqual(changed[("isolated_arena_optimized", "shared_lru_optimized")], ["hot_pool.mode"])
         self.assertEqual(changed[("stock", "shared_lru_optimized")], both + ["hot_pool.layout", "hot_pool.mode"])
+        three = ["features.compact_owner", "features.hit_index", "features.incremental_lru"]
+        for name in ("hit_index", "incremental_lru", "compact_owner"):     # one technique per ablation
+            self.assertEqual(changed[("shared_lru", f"shared_lru_{name}")], [f"features.{name}"])
+        self.assertEqual(changed[("shared_lru", "shared_lru_indexed")], three)
+        self.assertEqual(changed[("isolated_arena_indexed", "shared_lru_indexed")], ["hot_pool.mode"])
+        self.assertEqual(changed[("stock", "shared_lru_indexed")], three + ["hot_pool.layout", "hot_pool.mode"])
         arms = {a["arm"]: a for a in plan["arms"]}
         summary_bytes = (8 + 1) * 4 * 8              # (slots + template) x ceil(4 x 32 / 32) words x 8 B
         self.assertEqual(arms["shared_lru_optimized"]["capacity"]["arena_metadata_bytes"]
@@ -86,7 +94,16 @@ class PairedPlan(unittest.TestCase):
         self.assertEqual(arms["shared_lru_touched_bitmap"]["capacity"]["arena_metadata_bytes"],
                          arms["shared_lru"]["capacity"]["arena_metadata_bytes"])       # shared memory only
         self.assertEqual(arms["shared_lru_optimized"]["capabilities"]["features"],
-                         {"owner_summary": True, "touched_bitmap": True})
+                         {"owner_summary": True, "touched_bitmap": True, "hit_index": False,
+                          "incremental_lru": False, "compact_owner": False})
+        # 128 rows, K = 16: index 2 x 8 buckets x 16 entries; ring 128 + 5 x 16 entries, 7 dead words, positions
+        index = (8 + 1) * 256 * 4 + 8 * 4
+        ring = (8 + 1) * (208 + 128 + 4) * 4 + 8 * 7 * 4
+        compact = -(8 + 1) * 128 * 3 - 128 * 4       # bytes instead of int32, no generation template
+        plain = arms["shared_lru"]["capacity"]["arena_metadata_bytes"]
+        for name, delta in (("hit_index", index), ("incremental_lru", ring - (8 + 1) * 128 * 4),
+                            ("compact_owner", compact)):
+            self.assertEqual(arms[f"shared_lru_{name}"]["capacity"]["arena_metadata_bytes"] - plain, delta)
 
     def test_invalid_specs_ledgers_and_selection_mismatch_fail(self):
         bad_quota = copy.deepcopy(SMALL)

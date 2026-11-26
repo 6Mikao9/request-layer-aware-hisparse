@@ -31,7 +31,18 @@ DIAGNOSTICS = ("none", "counters", "nsys")
 # touched_bitmap: a shared-memory bitmap of the rows one invocation hits or admits
 #   replaces the repeated owner/token/hash lookups of the victim scan and the
 #   stable recency compaction, and orders the touched rows without a sort.
-FEATURES = ("owner_summary", "touched_bitmap")
+# The next three replace whole-domain work instead of speeding it up (issue #6):
+# hit_index: per-slot GPU hash index (plane, token) -> arena row; the hit search
+#   probes only the selected keys (alternative to owner_summary).
+# incremental_lru: per-domain recency ring with row positions; a call kills and
+#   appends only its touched rows and scans only from the oldest live entry
+#   (alternative to touched_bitmap). Dead entries are reclaimed by a stable
+#   rebuild at the domain's first plane, at most once per decode step.
+# compact_owner: owner tags shrink from int32 (generation << 16 | plane) to one
+#   byte per row; slot reuse relies on init_slot rewriting every tag in stream order.
+FEATURES = ("owner_summary", "touched_bitmap", "hit_index", "incremental_lru", "compact_owner")
+# Pairs that implement the same phase two ways; one ablation measures one of them.
+EXCLUSIVE_FEATURES = (("owner_summary", "hit_index"), ("touched_bitmap", "incremental_lru"))
 
 _TOP = {"schema", "placement", "hot_pool", "features", "diagnostics"}
 _PLACEMENT = {"mode", "selection", "offload_layers", "seed", "calibration"}
@@ -260,6 +271,10 @@ def parse(data):
             raise ValueError(f"features.{name} changes the arena resolver; hot_pool.layout=native runs the "
                              "stock kernel unmodified")
     features = tuple(sorted((name, True) for name, enabled in raw.items() if enabled))
+    for pair in EXCLUSIVE_FEATURES:
+        if set(pair) <= {name for name, _ in features}:
+            raise ValueError(f"features.{pair[0]} and features.{pair[1]} implement the same resolver phase; "
+                             "enable at most one")
 
     raw = _section(data, "diagnostics", {"mode"})
     diagnostics = _choice(raw, "mode", DIAGNOSTICS, "diagnostics")
@@ -289,13 +304,23 @@ def unsupported_reasons(config):
 def capabilities(config):
     """Effective implementation selected for a parsed configuration (startup receipt)."""
     pool, arena = config.hot_pool, config.uses_arena
-    hit_search = recency_update = None
+    hit_search = recency_update = owner_tags = None
     if arena:
-        hit_search = ("owner_summary: physical 32-row blocks whose owner-plane bits include the layer"
-                      if config.feature("owner_summary") else "recency list walk with an owner lookup per row")
-        recency_update = ("touched_bitmap: shared-memory bitmap, chunked stable compaction, bit-order append"
-                          if config.feature("touched_bitmap")
-                          else "per-row owner/token/hash lookup, per-1024-row compaction, bitonic sort")
+        if config.feature("hit_index"):
+            hit_search = "hit_index: two-choice 32-way buckets keyed by (plane, token), probed per selected key"
+        elif config.feature("owner_summary"):
+            hit_search = "owner_summary: physical 32-row blocks whose owner-plane bits include the layer"
+        else:
+            hit_search = "recency list walk with an owner lookup per row"
+        if config.feature("incremental_lru"):
+            recency_update = ("incremental_lru: recency ring, touched rows killed and appended, victim scan "
+                              "from the oldest live entry, stable rebuild at the domain's first plane")
+        elif config.feature("touched_bitmap"):
+            recency_update = "touched_bitmap: shared-memory bitmap, chunked stable compaction, bit-order append"
+        else:
+            recency_update = "per-row owner/token/hash lookup, per-1024-row compaction, bitonic sort"
+        owner_tags = ("compact_owner: uint8 plane per row, 254 taken, 255 free" if config.feature("compact_owner")
+                      else "int32 generation << 16 | plane, -1 free, -2 taken")
     return dict(
         runtime="stock_hisparse" if not arena else "shared_lru_arena",
         experimental_gpu_state=arena,
@@ -310,5 +335,6 @@ def capabilities(config):
         features={name: config.feature(name) for name in FEATURES} if arena else {},
         hit_search=hit_search,
         recency_update=recency_update,
+        owner_tags=owner_tags,
         unsupported=unsupported_reasons(config),
     )

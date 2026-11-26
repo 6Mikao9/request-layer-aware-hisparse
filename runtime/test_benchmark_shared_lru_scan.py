@@ -6,7 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from runtime import shared_lru as s
-from runtime.benchmark_shared_lru_scan import LAYOUTS, Case, main, owner_summary_words, selected_blocks
+from runtime.benchmark_shared_lru_scan import (LAYOUTS, RING_STATES, Case, main, owner_summary_words, recency_lists,
+                                               ring_rebuilds, selected_blocks)
 from runtime.cuda_shared_lru_correctness import FEATURE_SETS, Geometry
 from runtime.cuda_shared_lru_production_correctness import GEOMETRY
 
@@ -117,15 +118,36 @@ class SwitchProbeTests(unittest.TestCase):
                 for misses in (0, 1, 2):
                     states = {}
                     for name, features in FEATURE_SETS.items():
-                        with self.subTest(arm=arm, layout=layout, misses=misses, features=name):
-                            case = Case(torch, arm, self.g, misses, device="cpu", features=features, layout=layout)
-                            self.launch_with_mirror(case)
-                            self.assertEqual(case.verify(), dict(hits=16 - 8 * misses, misses=8 * misses))
-                            states[name] = case.state_sha256()
-                            case.reset()
-                            self.launch_with_mirror(case)                     # replay from the restored state
-                            self.assertEqual(case.state_sha256(), states[name])
+                        for ring_state in RING_STATES if "incremental_lru" in features else ("template",):
+                            with self.subTest(arm=arm, layout=layout, misses=misses, features=name, ring=ring_state):
+                                case = Case(torch, arm, self.g, misses, device="cpu", features=features,
+                                            layout=layout, ring_state=ring_state)
+                                self.launch_with_mirror(case)
+                                self.assertEqual(case.verify(), dict(hits=16 - 8 * misses, misses=8 * misses))
+                                states[name, ring_state] = case.logical_sha256()
+                                raw = case.state_sha256()
+                                self.assertEqual(ring_rebuilds(case), 2 if ring_state == "rebuild" else 0)
+                                case.reset()
+                                self.launch_with_mirror(case)                 # replay from the restored state
+                                self.assertEqual(case.state_sha256(), raw)
                     self.assertEqual(len(set(states.values())), 1, f"{arm}/{layout}/{misses}: {states}")
+
+    def test_rebuild_state_is_a_full_ring_with_the_same_recency_list(self):
+        for arm in ("isolated", "shared"):
+            plain = Case(torch, arm, self.g, 1, device="cpu", features=("incremental_lru",))
+            full = Case(torch, arm, self.g, 1, device="cpu", features=("incremental_lru",), ring_state="rebuild")
+            r = full.runtime
+            domain = s.ring_domain(r.plan, full.plane)
+            _, capacity, _, _ = s.ring_domains(r.plan)[domain]
+            head, tail = r.ring_meta[0, 4 * domain:4 * domain + 2].tolist()
+            self.assertEqual((head, tail + r.plan.selected), (0, capacity + 1))
+            self.assertTrue(torch.equal(recency_lists(torch, plain.runtime), recency_lists(torch, r)))
+            mirror = s.KernelMirror(r.plan, plane_rows=r.plane_rows, features=("incremental_lru",))
+            from runtime.cuda_shared_lru_correctness import device_state
+            mirror.slots[0] = dict(device_state(r, full.coordinator.req_device_buffer_tokens, 0),
+                                   locs=full.coordinator.req_device_buffer_token_locs[0, 0].tolist())
+            from runtime.test_shared_lru_opt import check_structures
+            check_structures("rebuild state", mirror, 0)
 
     def test_fragmented_layout_scatters_every_layer_and_keeps_the_summary_exact(self):
         contiguous = Case(torch, "shared", self.g, 0, device="cpu", features=("owner_summary",))

@@ -2,11 +2,14 @@
 
 python -m runtime.benchmark_shared_lru_scan --allow-cuda-test --output scan.json
 
-Arena arms also run every requested resolver switch set (features.owner_summary,
-features.touched_bitmap) from the same initial state; each set must reproduce the
-switches-off output indices, owner tags, recency lists, occupancy, reverse tokens
-and status (``state_sha256``) before its timing is kept. ``--layouts fragmented``
+Arena arms also run every requested resolver switch set (``--features``; the
+issue #6 set is ``indexed`` = hit_index + incremental_lru + compact_owner) from
+the same initial state; each set must reproduce the switches-off output
+indices, owner planes, recency order, occupancy, reverse tokens and status
+(``logical_sha256``) before its timing is kept. ``--layouts fragmented``
 scatters the rows of every layer over the whole domain after admission.
+``--ring-states rebuild`` starts incremental_lru sets from a ring whose next
+append would overflow, so the timed call includes the stable rebuild.
 """
 import argparse
 import gc
@@ -25,6 +28,7 @@ from runtime.cuda_shared_lru_production_correctness import GEOMETRY
 from runtime.shared_lru_device import ArenaRuntime, BLOCK_SIZE, KERNEL_SOURCE, verify_digests
 
 LAYOUTS = ("contiguous", "fragmented")
+RING_STATES = ("template", "rebuild")
 
 
 def selected_blocks(g, miss_blocks):
@@ -62,8 +66,10 @@ class Case:
     ``pi(r)`` takes the owner tag, reverse token, recency position and K/V of row ``r``.
     """
 
-    def __init__(self, torch, arm, g, miss_blocks, device="cuda", features=(), layout="contiguous", seed=20261126):
-        if layout not in LAYOUTS or (arm == "stock" and (features or layout != "contiguous")):
+    def __init__(self, torch, arm, g, miss_blocks, device="cuda", features=(), layout="contiguous", seed=20261126,
+                 ring_state="template"):
+        if layout not in LAYOUTS or ring_state not in RING_STATES or (
+                arm == "stock" and (features or layout != "contiguous" or ring_state != "template")):
             raise ValueError("stock runs the native kernel on its own contiguous layout without switches")
         self.torch, self.arm, self.g, self.features, self.layout = torch, arm, g, tuple(features), layout
         self.hits = (g.blocks - miss_blocks) * g.block
@@ -111,11 +117,13 @@ class Case:
             r = self.runtime = ArenaRuntime(c, cfg, cfg.digest, torch=torch)
             for rid in range(g.slots):
                 r.init_slot(rid)
-            mutable.extend((r.row_owner, r.order, r.occupancy, r.status))
-            if r.owner_summary.numel():
-                mutable.append(r.owner_summary)
+            mutable.extend(t for t in (r.row_owner, r.order, r.occupancy, r.status, r.owner_summary, r.index,
+                                       r.index_flags, r.ring, r.ring_dead, r.ring_pos, r.ring_meta) if t.numel())
             if layout == "fragmented":
                 self.fragment(random.Random(seed))
+            if ring_state == "rebuild" and r.ring.numel():
+                self.fill_ring()
+        self.ring_state = ring_state if self.runtime is not None and self.runtime.ring.numel() else "template"
         home = self.home[self.tokens[:, :self.hits]]                       # rows of the hit tokens
         hit_planes, hit_locs = home // g.hot, locs.gather(1, home % g.hot)
         for buf, history in zip((self.k, self.v), self.host):
@@ -131,16 +139,46 @@ class Case:
         planes = r.plan.rows // g.hot
         tokens = self.coordinator.req_device_buffer_tokens
         flat = tokens[:, :, :g.hot].permute(1, 0, 2).reshape(g.slots, planes * g.hot).clone()
-        for table in (r.row_owner, flat):
+        for table in (r.row_owner, flat) + ((r.ring_pos,) if r.ring.numel() else ()):  # ring positions move too
             table[:, target] = table[:, offset:offset + size].clone()
         tokens[:, :, :g.hot] = flat.reshape(g.slots, planes, g.hot).permute(1, 0, 2)
-        region = r.order[:, offset:offset + size]
+        if r.ring.numel():    # template ring: the domain's live entries are its first ``size`` entries
+            start = reference.ring_domains(r.plan)[reference.ring_domain(r.plan, self.plane)][0]
+            region = r.ring[:, start:start + size]
+        else:
+            region = r.order[:, offset:offset + size]
         region.copy_(target[(region - offset).long()].to(region.dtype))
         mapping = torch.arange(r.plan.rows, dtype=torch.int64, device=self.out.device)
         mapping[offset:offset + size] = target
         self.home = mapping[self.home]
         if r.owner_summary.numel():
             r.owner_summary.copy_(owner_summary_words(torch, r.row_owner, r.generation, planes))
+        if r.index.numel():   # every slot holds the same permuted tables: index slot 0's keys once, copy
+            owners = owner_planes(torch, r.row_owner[:1], r.generation[:1])[0].tolist()
+            index = reference.index_from_keys(r.plan, {row: (plane, token) for row, (plane, token)
+                                                       in enumerate(zip(owners, flat[0].tolist())) if plane >= 0})
+            r.index.copy_(torch.tensor(index, dtype=torch.int32, device=self.out.device).expand_as(r.index))
+
+    def fill_ring(self):
+        """Ring state whose next append overflows: G dead entries, then the live list, tail = capacity - K + 1."""
+        torch, r = self.torch, self.runtime
+        domain = reference.ring_domain(r.plan, self.plane)
+        start, capacity, words, _ = reference.ring_domains(r.plan)[domain]
+        size = r.plan.domains[domain][1]
+        gap = capacity - size - r.plan.selected + 1
+        live = r.ring[:, start:start + size].clone()
+        filler = live[:, :gap] if gap <= size else live[:, torch.arange(gap, device=self.out.device) % size]
+        r.ring[:, start:start + gap] = filler
+        r.ring[:, start + gap:start + gap + size] = live
+        offset = r.plan.domains[domain][0]
+        rows = torch.arange(offset, offset + size, device=self.out.device)
+        r.ring_pos[:, rows] += gap
+        bits = torch.zeros(-(-capacity // 32) * 32, dtype=torch.int64, device=self.out.device)
+        bits[:gap] = 1
+        packed = (bits.view(-1, 32) << torch.arange(32, device=self.out.device)).sum(1)
+        r.ring_dead[:, words:words + packed.numel()] = (packed - (packed >= 2**31).long() * 2**32).to(torch.int32)
+        r.ring_meta[:, 4 * domain:4 * domain + 2] = torch.tensor([0, gap + size], dtype=torch.int32,
+                                                                device=self.out.device)
 
     def launch(self):
         g, c, p = self.g, self.coordinator, self.plane
@@ -186,52 +224,98 @@ class Case:
         require((self.coordinator.req_device_buffer_tokens[planes, slots, row] == self.tokens).all(),
                 "reverse token disagrees with output")
         if self.runtime is not None:
-            tag = (self.runtime.generation[slots] << 16) | self.plane
-            require((self.runtime.row_owner[slots, planes * g.hot + row] == tag).all(), "wrong owner tag")
-            require(self.runtime.status.item() == 0, "resolver status bits are set")
-            if self.runtime.owner_summary.numel():
-                live = owner_summary_words(torch, self.runtime.row_owner, self.runtime.generation,
-                                           self.runtime.plan.rows // g.hot)
-                require(torch.equal(self.runtime.owner_summary, live), "owner summary differs from the owner tags")
+            r = self.runtime
+            owners = owner_planes(torch, r.row_owner, r.generation)
+            require((owners[slots, planes * g.hot + row] == self.plane).all(), "wrong owner tag")
+            require(r.status.item() == 0, "resolver status bits are set")
+            if r.owner_summary.numel():
+                live = owner_summary_words(torch, r.row_owner, r.generation, r.plan.rows // g.hot)
+                require(torch.equal(r.owner_summary, live), "owner summary differs from the owner tags")
+            if r.index.numel():
+                require(not bool(r.index_flags.any()), "a hit index overflowed")
         for buf, history in zip((self.k, self.v), self.host):
             require(torch.equal(buf.flatten(0, 1)[idx].cpu(), history[self.host_rows]), "returned KV bytes differ")
         hits = int(was_hit.sum())
         return dict(hits=hits, misses=idx.numel() - hits)
 
     def state_sha256(self):
-        """Digest of every output and table the switches must leave unchanged (owner summary excluded)."""
+        """Digest of every output and table this switch set writes (owner summary excluded): equal replays."""
         digest = hashlib.sha256()
         tables = [self.out, self.coordinator.req_device_buffer_tokens]
         if self.runtime is not None:
-            tables += [self.runtime.row_owner, self.runtime.order, self.runtime.occupancy, self.runtime.status]
+            r = self.runtime
+            tables += [t for t in (r.row_owner, r.order, r.occupancy, r.status, r.ring, r.ring_dead, r.ring_pos,
+                                   r.ring_meta) if t.numel()]
         else:
             tables.append(self.coordinator.lru_slots)
         for table in tables:
             digest.update(bytes(table.cpu().clone().untyped_storage()))   # clone: exactly this view's bytes
         return digest.hexdigest()
 
+    def logical_sha256(self):
+        """Digest of what every switch set must agree on: outputs, reverse tokens, owner planes, the recency
+        list of every domain (decoded from the ring under incremental_lru), occupancy and status."""
+        torch, digest = self.torch, hashlib.sha256()
+        tables = [self.out, self.coordinator.req_device_buffer_tokens]
+        if self.runtime is not None:
+            r = self.runtime
+            tables += [owner_planes(torch, r.row_owner, r.generation), recency_lists(torch, r), r.occupancy, r.status]
+        else:
+            tables.append(self.coordinator.lru_slots)
+        for table in tables:
+            digest.update(bytes(table.cpu().to(torch.int64).clone().untyped_storage()))
+        return digest.hexdigest()
+
+
+def owner_planes(torch, row_owner, generation):
+    """Plane owning each row of the slot's generation, else -1 (int32 tags or compact_owner bytes)."""
+    if row_owner.dtype == torch.uint8:
+        tags = row_owner.long()
+        return torch.where(tags < 64, tags, -1)
+    live = (row_owner >= 0) & ((row_owner >> 16) == generation.view(-1, 1))
+    return torch.where(live, row_owner & 0xFFFF, -1).long()
+
+
+def recency_lists(torch, runtime):
+    """[slots, sum of domain sizes] recency lists in plain ``order`` form, decoded from the ring if present."""
+    if not runtime.ring.numel():
+        return runtime.order
+    ring, dead, meta = runtime.ring.cpu(), runtime.ring_dead.cpu().long() & 0xFFFFFFFF, runtime.ring_meta.cpu()
+    lists = []
+    for slot in range(ring.shape[0]):
+        parts = []
+        for d, (start, capacity, words, _) in enumerate(reference.ring_domains(runtime.plan)):
+            head, tail = int(meta[slot, 4 * d]), int(meta[slot, 4 * d + 1])
+            at = torch.arange(head, tail)
+            alive = ((dead[slot, words + at // 32] >> (at % 32)) & 1) == 0
+            parts.append(ring[slot, start + at[alive]])
+        lists.append(torch.cat(parts))
+    return torch.stack(lists)
+
 
 def owner_summary_words(torch, row_owner, generation, planes):
     """Owner-plane bits per 32-row block from each slot's live tags (int64, plane 63 is the sign bit)."""
     slots, rows = row_owner.shape
     blocks = reference.summary_blocks(rows)
-    tags = torch.nn.functional.pad(row_owner, (0, blocks * reference.SUMMARY_ROWS - rows), value=reference.FREE_TAG)
-    live = (tags >= 0) & ((tags >> 16) == generation.view(-1, 1))
-    plane = torch.where(live, tags & 0xFFFF, -1).view(slots, blocks, reference.SUMMARY_ROWS)
+    owners = torch.nn.functional.pad(owner_planes(torch, row_owner, generation), (0, blocks * reference.SUMMARY_ROWS - rows),
+                                     value=-1)
+    plane = owners.view(slots, blocks, reference.SUMMARY_ROWS)
     words = torch.zeros((slots, blocks), dtype=torch.int64, device=row_owner.device)
     for p in range(planes):
         words |= (plane == p).any(-1).to(torch.int64) << p
     return words
 
 
-def run_case(torch, arm, g, miss_blocks, repeats, warmup, *, features=(), layout="contiguous", seed=20261126):
+def run_case(torch, arm, g, miss_blocks, repeats, warmup, *, features=(), layout="contiguous", seed=20261126,
+             ring_state="template"):
     torch.cuda.reset_peak_memory_stats()
-    case = Case(torch, arm, g, miss_blocks, features=features, layout=layout, seed=seed)
+    case = Case(torch, arm, g, miss_blocks, features=features, layout=layout, seed=seed, ring_state=ring_state)
     # Build all specializations before capture. This eager launch also validates
     # output locations before the first sparse payload reset.
     case.launch()
     counts = case.verify()
-    state = case.state_sha256()
+    state, logical = case.state_sha256(), case.logical_sha256()
+    rebuilds = ring_rebuilds(case)
     case.reset()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -255,16 +339,28 @@ def run_case(torch, arm, g, miss_blocks, repeats, warmup, *, features=(), layout
     runtime = case.runtime
     domain = runtime.plan.domain(case.plane)[1] if runtime else g.hot
     arena_tables = sum(t.numel() * t.element_size() for t in runtime.tables().values()) if runtime else 0
-    return dict(arm=arm, features=list(features), layout=layout, geometry=asdict(g), measured_plane=case.plane,
+    return dict(arm=arm, features=list(features), layout=layout, ring_state=case.ring_state,
+                ring_rebuilds_per_launch=rebuilds, geometry=asdict(g), measured_plane=case.plane,
                 device_planes=case.k.size(0), blocks_per_grid=g.slots,
                 threads_per_cta=960 if arm == "stock" else BLOCK_SIZE,
                 shared_memory_bytes_per_cta=runtime.shared_memory if runtime else None,
                 arena_table_bytes=arena_tables, domain_rows_per_request=domain,
                 selected_rows_per_request=case.selected, miss_blocks=miss_blocks,
                 actual_counts_per_launch=counts, miss_kv_bytes_per_launch=counts["misses"] * 4 * g.dim,
-                state_sha256=state, host_pinned_bytes=sum(t.numel() * t.element_size() for t in case.host),
+                state_sha256=state, logical_sha256=logical,
+                host_pinned_bytes=sum(t.numel() * t.element_size() for t in case.host),
                 device_kv_bytes=case.k.numel() * 4, torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                 kernel_us=dict(median=statistics.median(timings), samples=timings))
+
+
+def ring_rebuilds(case):
+    """Ring rebuilds the last launch performed, summed over slots (0 without incremental_lru)."""
+    r = case.runtime
+    if r is None or not r.ring.numel():
+        return 0
+    before = dict(case.snapshots)
+    return int((r.ring_meta.view(r.ring_meta.shape[0], -1, 4)[:, :, 2]
+                - before[r.ring_meta].view(r.ring_meta.shape[0], -1, 4)[:, :, 2]).sum())
 
 
 def main(argv=None):
@@ -276,6 +372,11 @@ def main(argv=None):
                         help="resolver switch sets for arena arms; 'none' always runs first as the reference")
     parser.add_argument("--layouts", nargs="+", choices=LAYOUTS, default=["contiguous"],
                         help="fragmented permutes the measured domain's rows (arena arms only)")
+    parser.add_argument("--ring-states", nargs="+", choices=RING_STATES, default=["template"],
+                        help="rebuild starts incremental_lru sets from a ring the timed call must compact")
+    parser.add_argument("--no-reference", action="store_true",
+                        help="profiling only: run just the listed sets, without the switches-off reference "
+                             "case and its state comparison (the clean timing run performs it)")
     parser.add_argument("--batches", nargs="+", type=int, default=[1, 8, 32])
     parser.add_argument("--layers", nargs="+", type=int, default=[1, 8, 60])
     parser.add_argument("--miss-blocks", nargs="+", type=int, default=[0, 4])
@@ -297,7 +398,8 @@ def main(argv=None):
     bad = {k: v for k, v in verify_digests(Path(sglang.__file__).resolve().parent).items() if v != "ok"}
     if bad:
         raise RuntimeError(f"Pinned SGLang source mismatch: {bad}")
-    switch_sets = ["none"] + [name for name in args.features if name != "none"]
+    switch_sets = list(args.features) if args.no_reference else (
+        ["none"] + [name for name in args.features if name != "none"])
     results = []
     for batch in args.batches:
         for layers in args.layers:
@@ -308,22 +410,26 @@ def main(argv=None):
                             continue                                  # no arena rows to permute
                         reference_state = None
                         for name in ["none"] if arm == "stock" else switch_sets:
-                            result = run_case(torch, arm, replace(GEOMETRY, slots=batch, layers=layers), misses,
-                                              args.repeats, args.warmup, features=FEATURE_SETS[name],
-                                              layout=layout, seed=args.seed)
-                            reference_state = reference_state or result["state_sha256"]
-                            if result["state_sha256"] != reference_state:
-                                raise RuntimeError(f"{arm} {name}: hits, victims or tables differ from switches off")
-                            result["matches_switches_off"] = True
-                            results.append(result)
-                            print(json.dumps(result), flush=True)
-                            gc.collect()
-                            torch.cuda.empty_cache()
+                            ring = "incremental_lru" in FEATURE_SETS[name]
+                            for ring_state in [s for s in args.ring_states if ring or s == "template"] or ["template"]:
+                                result = run_case(torch, arm, replace(GEOMETRY, slots=batch, layers=layers), misses,
+                                                  args.repeats, args.warmup, features=FEATURE_SETS[name],
+                                                  layout=layout, seed=args.seed, ring_state=ring_state)
+                                if not args.no_reference:
+                                    reference_state = reference_state or result["logical_sha256"]
+                                    if result["logical_sha256"] != reference_state:
+                                        raise RuntimeError(f"{arm} {name}: hits, victims or tables differ from "
+                                                           "switches off")
+                                result["matches_switches_off"] = None if args.no_reference else True
+                                results.append(result)
+                                print(json.dumps(result), flush=True)
+                                gc.collect()
+                                torch.cuda.empty_cache()
     summary = dict(event="hisparse_resolver_scan_microbench", device=torch.cuda.get_device_name(),
                    torch=str(torch.__version__), cuda=torch.version.cuda, warmup=args.warmup,
                    repeats=args.repeats, dtype="bfloat16", kv_heads_per_rank=1, diagnostics="none",
                    feature_sets={name: list(FEATURE_SETS[name]) for name in switch_sets}, layouts=args.layouts,
-                   fragment_seed=args.seed,
+                   ring_states=args.ring_states, fragment_seed=args.seed,
                    arena_kernel_sha256=hashlib.sha256(KERNEL_SOURCE.read_bytes()).hexdigest(),
                    timing="external CUDA events inside one graph, one complete resolver, reset before replay",
                    cache_condition="synthetic locations, metadata touched by device reset before each sample",

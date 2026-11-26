@@ -23,7 +23,13 @@ EPOCH_MASK = (1 << 32) - 1
 FREE_TAG, TAKEN_TAG = -1, -2  # device owner-tag sentinels (KernelMirror / CUDA)
 GENERATION_MASK = 0x7FFF      # device tag = generation << 16 | eligible plane index
 SUMMARY_ROWS = 32             # arena rows per owner-summary block (kSummaryRows in the CUDA kernel)
-RESOLVER_FEATURES = ("owner_summary", "touched_bitmap")  # study_config.FEATURES the resolver implements
+# study_config.FEATURES the resolver implements, and pairs that implement the same phase two ways.
+RESOLVER_FEATURES = ("owner_summary", "touched_bitmap", "hit_index", "incremental_lru", "compact_owner")
+EXCLUSIVE_FEATURES = (("owner_summary", "hit_index"), ("touched_bitmap", "incremental_lru"))
+INDEX_WAYS = 16               # entries per hit-index bucket (kIndexWays): one 64-byte load per probe
+INDEX_EMPTY = -1
+COMPACT_FREE, COMPACT_TAKEN = 255, 254   # compact_owner codes (kCompactFree, kCompactTaken)
+MASK32, MASK64 = (1 << 32) - 1, (1 << 64) - 1
 
 
 def summary_blocks(rows):
@@ -37,6 +43,152 @@ def owner_summary(planes):
         if plane is not None:
             words[row // SUMMARY_ROWS] |= 1 << plane
     return words
+
+
+# -- hit_index: per-slot two-choice bucket index (plane, token) -> arena row --------------------
+def index_geometry(plan):
+    """(buckets per half, row bits). Two halves of 16-way buckets hold 2x the rows that can carry a key."""
+    keyed = plan.rows - plan.scratch[1]
+    bits = max(1, (plan.rows - 1).bit_length())
+    if 31 - bits < 8:
+        raise ValueError("hit_index keeps a fingerprint of at least 8 bits: the arena must stay below 2**23 rows")
+    return -(-keyed // INDEX_WAYS), bits
+
+
+def index_hash(plane, token):
+    """murmur3 fmix64 of (token << 6 | plane), as ``index_mix`` in shared_lru_kernel.cuh."""
+    x = ((token << 6) | plane) & MASK64
+    x ^= x >> 33
+    x = (x * 0xFF51AFD7ED558CCD) & MASK64
+    x ^= x >> 33
+    x = (x * 0xC4CEB9FE1A85EC53) & MASK64
+    return x ^ (x >> 33)
+
+
+def index_slots(plane, token, half, row_bits):
+    """(left bucket, right bucket, fingerprint) of one key."""
+    x = index_hash(plane, token)
+    return (((x & MASK32) * half) >> 32, half + (((x >> 32) * half) >> 32),
+            (x >> 32) & ((1 << (31 - row_bits)) - 1))
+
+
+def index_insert(buckets, plane, token, row, half, row_bits):
+    """Less loaded of the two buckets (ties left), first empty way; False when both are full."""
+    left, right, fp = index_slots(plane, token, half, row_bits)
+    loads = [INDEX_WAYS - buckets[b].count(INDEX_EMPTY) for b in (left, right)]
+    for b in ((left, right) if loads[0] <= loads[1] else (right, left)):
+        if INDEX_EMPTY in buckets[b]:
+            buckets[b][buckets[b].index(INDEX_EMPTY)] = fp << row_bits | row
+            return True
+    return False
+
+
+def index_remove(buckets, plane, token, row, half, row_bits):
+    left, right, fp = index_slots(plane, token, half, row_bits)
+    for b in (left, right):
+        if fp << row_bits | row in buckets[b]:
+            buckets[b][buckets[b].index(fp << row_bits | row)] = INDEX_EMPTY
+            return True
+    return False
+
+
+def index_find(buckets, plane, token, half, row_bits, verify):
+    """Row whose entry carries the key's fingerprint and passes ``verify`` (owner tag and reverse token)."""
+    left, right, fp = index_slots(plane, token, half, row_bits)
+    mask = (1 << row_bits) - 1
+    for b in (left, right):
+        for entry in buckets[b]:
+            if entry != INDEX_EMPTY and entry >> row_bits == fp and verify(entry & mask):
+                return entry & mask
+    return -1
+
+
+def build_index(plan):
+    """Template buckets: every admission owner's key inserted in row order (the device copies this table)."""
+    flat = index_from_keys(plan, {row: (plane, row % plan.hot_rows)
+                                  for row, plane in enumerate(plan.owner_template()) if plane is not None})
+    return [flat[i:i + INDEX_WAYS] for i in range(0, len(flat), INDEX_WAYS)]
+
+
+def index_from_keys(plan, keys):
+    """Flat index holding ``{row: (plane, token)}``, inserted in row order."""
+    half, bits = index_geometry(plan)
+    buckets = [[INDEX_EMPTY] * INDEX_WAYS for _ in range(2 * half)]
+    for row in sorted(keys):
+        if not index_insert(buckets, *keys[row], row, half, bits):
+            raise ValueError("hit_index template overflows its buckets")
+    return [entry for bucket in buckets for entry in bucket]
+
+
+def index_problems(entries, live, half, row_bits):
+    """How a flat index (device or mirror) differs from the live keys ``{row: (plane, token)}``.
+
+    Placement inside the two buckets is not compared: concurrent CUDA inserts may pick
+    another way or bucket. Every live key must appear once, in one of its buckets."""
+    problems, seen, mask = [], set(), (1 << row_bits) - 1
+    for position, entry in enumerate(entries):
+        if entry == INDEX_EMPTY:
+            continue
+        row, bucket = entry & mask, position // INDEX_WAYS
+        if entry < 0 or row not in live:
+            problems.append(f"entry {position} ({entry}) names no live row")
+            continue
+        left, right, fp = index_slots(*live[row], half, row_bits)
+        if bucket not in (left, right) or entry >> row_bits != fp or row in seen:
+            problems.append(f"entry {position}: row {row} misplaced, wrong fingerprint or duplicated")
+        seen.add(row)
+    if set(live) - seen:
+        problems.append(f"{len(set(live) - seen)} live keys are missing from the index")
+    return problems
+
+
+# -- incremental_lru: recency ring per domain --------------------------------------------------
+def ring_domains(plan):
+    """Per recency domain: (ring offset, capacity, dead-word offset, first plane).
+
+    Capacity is D + (planes using the domain + 1) x K. The domain's first plane rebuilds
+    once the tail passes D + K, so the remaining planes of a decode step append without
+    a rebuild; any call that could overflow rebuilds first."""
+    users = 1 if plan.mode == "isolated" else len(plan.layers)
+    out, ring, words = [], 0, 0
+    for index, (_, size) in enumerate(plan.domains):
+        capacity = size + (users + 1) * plan.selected
+        out.append((ring, capacity, words, index if plan.mode == "isolated" else 0))
+        ring, words = ring + capacity, words + -(-capacity // 32)
+    return tuple(out)
+
+
+def ring_domain(plan, plane):
+    return plane if plan.mode == "isolated" else 0
+
+
+def ring_templates(plan):
+    """(ring, positions): each domain's admission recency list at its ring start; row -> ring index."""
+    domains = ring_domains(plan)
+    ring, positions = [-1] * sum(c for _, c, _, _ in domains), [-1] * plan.rows
+    order, start = plan.order_template(), 0
+    for (_, size), (offset, _, _, _) in zip(plan.domains, domains):
+        for index, row in enumerate(order[start:start + size]):
+            ring[offset + index], positions[row] = row, index
+        start += size
+    return ring, positions
+
+
+def ring_dead_bits(words, rings):
+    """Device dead-bit words (int32, one region per domain) -> one 0/1 per ring entry (``dead``)."""
+    bits = []
+    for _, capacity, offset, _ in rings:
+        bits += [(words[offset + i // 32] & MASK32) >> (i % 32) & 1 for i in range(capacity)]
+    return bits
+
+
+def ring_dead_words(bits, rings):
+    """Inverse of ``ring_dead_bits``, as int32 words."""
+    words = [0] * sum(-(-capacity // 32) for _, capacity, _, _ in rings)
+    for ring_offset, capacity, offset, _ in rings:
+        for i in range(capacity):
+            words[offset + i // 32] |= bits[ring_offset + i] << (i % 32)
+    return [w - (1 << 32) if w >> 31 else w for w in words]
 
 
 class Deferred(RuntimeError):
@@ -750,40 +902,112 @@ class KernelMirror:
     ``owner_summary`` adds ``summary`` (owner-plane bits per 32-row block) and
     finds hits by walking the blocks that carry the plane's bit;
     ``touched_bitmap`` tests the hit/touched row set instead of repeating the
-    owner/token lookup and appends touched rows in row order. Both must leave
-    every output and table equal to the plain statement.
+    owner/token lookup and appends touched rows in row order.
+    ``hit_index`` adds ``index`` (two-choice 16-way buckets of fingerprint|row)
+    and ``index_flag`` (sticky overflow: the slot falls back to the row scan).
+    ``incremental_lru`` replaces ``order`` by ``ring``/``dead``/``pos``/``meta``
+    (head, tail, rebuilds per domain): live ring entries in [head, tail) are the
+    recency list. ``compact_owner`` stores one byte per row (plane, 254 taken,
+    255 free) instead of the generation-tagged int32. Every switch set must leave
+    outputs and the logical tables (``owner_view``, ``order_view``) equal to
+    the plain statement.
     """
 
     def __init__(self, plan, *, plane_rows, features=()):
-        unknown = set(features) - set(RESOLVER_FEATURES)
+        features = frozenset(features)
+        unknown = features - set(RESOLVER_FEATURES)
         if unknown:
             raise ValueError(f"Unknown resolver feature(s) {sorted(unknown)}")
+        for pair in EXCLUSIVE_FEATURES:
+            if set(pair) <= features:
+                raise ValueError(f"Resolver features {list(pair)} implement the same phase; enable one")
         self.plan, self.plane_rows, self.status = plan, plane_rows, 0
-        self.features = frozenset(features)
+        self.features = features
+        self.compact = "compact_owner" in features
+        self.free_tag, self.taken_tag = (COMPACT_FREE, COMPACT_TAKEN) if self.compact else (FREE_TAG, TAKEN_TAG)
         self._owners, self._order = plan.owner_template(), plan.order_template()
+        if "hit_index" in features:
+            self.index_half, self.row_bits = index_geometry(plan)
+            self._index = build_index(plan)
+        if "incremental_lru" in features:
+            self.rings = ring_domains(plan)
+            self._ring, self._pos = ring_templates(plan)
         self.slots = {}
 
+    def tag(self, generation, plane):
+        """Owner tag of ``plane`` for a device generation (compact_owner: the plane itself)."""
+        return plane if self.compact else (generation << 16) | plane
+
+    def owner_index(self, slot, value):
+        """Plane owning a row of this slot's generation, or None (free, taken or another generation)."""
+        if self.compact:
+            return value if 0 <= value < 64 else None
+        return None if value < 0 or (value >> 16) != self.slots[slot]["gen"] else value & 0xFFFF
+
     def init_slot(self, slot, generation, locs):
-        H, planes = self.plan.hot_rows, len(self.plan.layers)
-        self.slots[slot] = dict(
-            gen=device_generation(generation), locs=list(locs),
-            owner=[FREE_TAG if o is None else owner_tag(generation, o) for o in self._owners],
-            token=[row % H for row in range(self.plan.rows)], order=list(self._order),
+        H, planes, gen = self.plan.hot_rows, len(self.plan.layers), device_generation(generation)
+        state = self.slots[slot] = dict(
+            gen=gen, locs=list(locs),
+            owner=[self.free_tag if o is None else self.tag(gen, o) for o in self._owners],
+            token=[row % H for row in range(self.plan.rows)],
             occ=[sum(1 for o in self._owners if o == p) for p in range(planes)])
+        if "incremental_lru" in self.features:
+            state.update(ring=list(self._ring), dead=[0] * len(self._ring), pos=list(self._pos),
+                         meta=[[0, size, 0] for _, size in self.plan.domains])
+        else:
+            state["order"] = list(self._order)
         if "owner_summary" in self.features:
-            self.slots[slot]["summary"] = owner_summary(self._owners)
+            state["summary"] = owner_summary(self._owners)
+        if "hit_index" in self.features:
+            state.update(index=[list(bucket) for bucket in self._index], index_flag=0)
 
     def reset_slot(self, slot):
         if slot in self.slots:
             state = self.slots[slot]
-            state["owner"] = [FREE_TAG] * self.plan.rows
+            state["owner"] = [self.free_tag] * self.plan.rows
             if "summary" in state:
                 state["summary"] = [0] * summary_blocks(self.plan.rows)
+            if "index" in state:
+                state.update(index=[[INDEX_EMPTY] * INDEX_WAYS for _ in state["index"]], index_flag=0)
+
+    def owner_view(self, slot):
+        return [self.owner_index(slot, value) for value in self.slots[slot]["owner"]]
 
     def live_summary(self, slot):
         """Owner bits recomputed from the tags: what the maintained ``summary`` must equal."""
+        return owner_summary(self.owner_view(slot))
+
+    def order_view(self, slot):
+        """Recency list per domain region, as the plain statement stores ``order``."""
         state = self.slots[slot]
-        return owner_summary([None if t < 0 or (t >> 16) != state["gen"] else t & 0xFFFF for t in state["owner"]])
+        if "incremental_lru" not in self.features:
+            return list(state["order"])
+        out = []
+        for (offset, _, _, _), (head, tail, _) in zip(self.rings, state["meta"]):
+            out += [state["ring"][offset + i] for i in range(head, tail) if not state["dead"][offset + i]]
+        return out
+
+    def live_keys(self, slot):
+        """{row: (plane, token)} of every row owned by the slot's generation: what the index must hold."""
+        token = self.slots[slot]["token"]
+        return {row: (plane, token[row]) for row, plane in enumerate(self.owner_view(slot)) if plane is not None}
+
+    def index_entries(self, slot):
+        return [entry for bucket in self.slots[slot]["index"] for entry in bucket]
+
+    def _ring_rebuild(self, slot, domain):
+        """Stable compaction of the live entries of [head, tail) to the ring start (the CUDA rebuild)."""
+        state = self.slots[slot]
+        offset, capacity, _, _ = self.rings[domain]
+        head, tail, rebuilds = state["meta"][domain]
+        ring, dead, pos = state["ring"], state["dead"], state["pos"]
+        live = [ring[offset + i] for i in range(head, tail) if not dead[offset + i]]
+        for index, row in enumerate(live):
+            ring[offset + index], pos[row] = row, index
+        dead[offset:offset + capacity] = [0] * capacity
+        state["meta"][domain] = [0, len(live), rebuilds + 1]
+        if len(live) != self.plan.domains[domain][1]:
+            self.status |= 2
 
     def flat(self, slot, row):
         H = self.plan.hot_rows
@@ -808,23 +1032,39 @@ class KernelMirror:
         uid_token = sorted(first, key=first.get)  # uids follow first occurrence
         uid = {t: u for u, t in enumerate(uid_token)}
         uid_row = [-1] * len(uid_token)
-        tag, owner, token, order = (st["gen"] << 16) | plane, st["owner"], st["token"], st["order"]
+        tag, owner, token = self.tag(st["gen"], plane), st["owner"], st["token"]
         bypass = plane in plan.bypass
         offset, size = plan.domain(plane)
-        region = order[offset:offset + size]
+        incremental = "incremental_lru" in self.features
+        if incremental:  # rebuild first if this call could overflow the ring, or at the domain's first plane
+            domain = ring_domain(plan, plane)
+            ring_offset, capacity, _, first_plane = self.rings[domain]
+            tail = st["meta"][domain][1]
+            if tail + plan.selected > capacity or (plane == first_plane and tail > size + plan.selected):
+                self._ring_rebuild(slot, domain)
+            head, tail = st["meta"][domain][:2]
+            ring, dead, pos = st["ring"], st["dead"], st["pos"]
+            region = [(i, ring[ring_offset + i]) for i in range(head, tail) if not dead[ring_offset + i]]
+        else:
+            region = list(enumerate(st["order"][offset:offset + size]))   # (list position, row)
 
         def is_hit(row):
             return owner[row] == tag and token[row] in uid
 
-        if "owner_summary" in self.features:  # physical 32-row blocks whose summary carries the plane's bit
+        indexed = "hit_index" in self.features and not st["index_flag"]
+        if indexed:  # two buckets per selected key; the owner tag and reverse token confirm a fingerprint
+            for u, t in enumerate(uid_token):
+                uid_row[u] = index_find(st["index"], plane, t, self.index_half, self.row_bits,
+                                        lambda row: owner[row] == tag and token[row] == t)
+        elif "owner_summary" in self.features:  # physical 32-row blocks whose summary carries the plane's bit
             summary, end = st["summary"], offset + size
             for block in range(offset // SUMMARY_ROWS, (end - 1) // SUMMARY_ROWS + 1):
                 if summary[block] >> plane & 1:
                     for row in range(max(offset, block * SUMMARY_ROWS), min(end, (block + 1) * SUMMARY_ROWS)):
                         if is_hit(row):
                             uid_row[uid[token[row]]] = row
-        else:
-            for row in region:
+        else:  # recency list walk; incremental_lru (and an overflowed index) walks the domain rows instead
+            for row in range(offset, offset + size) if incremental else (row for _, row in region):
                 if is_hit(row):
                     uid_row[uid[token[row]]] = row
         if "touched_bitmap" in self.features:  # later phases test the phase-3 hit set, not the tables
@@ -832,58 +1072,67 @@ class KernelMirror:
             is_hit = hit_rows.__contains__
         hits = sum(r >= 0 for r in uid_row)
         need = len(uid_token) - hits
-        victims, old, breaches = [], [], 0
+        victims, old, breaches, last_taken = [], [], 0, -1
 
-        def owner_index(value):
-            return None if value == FREE_TAG or (value >> 16) != st["gen"] else value & 0xFFFF
-
-        def take(row):
+        def take(index, row):
+            nonlocal last_taken
             victims.append(row)
-            old.append(owner_index(owner[row]))
-            owner[row] = TAKEN_TAG
+            old.append(self.owner_index(slot, owner[row]))
+            owner[row] = self.taken_tag
+            last_taken = max(last_taken, index)
 
         if need and bypass:
             victims, old = list(range(plan.scratch[0], plan.scratch[0] + need)), [None] * need
         elif need:
             if plan.quota == "soft_floor":
                 surplus = [o - f for o, f in zip(st["occ"], plan.floors)]
-                for row in region:
+                for index, row in region:
                     if len(victims) == need:
                         break
-                    if owner[row] == TAKEN_TAG or is_hit(row):
+                    if owner[row] == self.taken_tag or is_hit(row):
                         continue
-                    o = owner_index(owner[row])
+                    o = self.owner_index(slot, owner[row])
                     if o is None or surplus[o] > 0:
                         if o is not None:
                             surplus[o] -= 1
-                        take(row)
+                        take(index, row)
             before = len(victims)
-            for row in region:
+            for index, row in region:
                 if len(victims) == need:
                     break
-                if owner[row] != TAKEN_TAG and not is_hit(row):
-                    take(row)
+                if owner[row] != self.taken_tag and not is_hit(row):
+                    take(index, row)
             breaches = len(victims) - before if plan.quota == "soft_floor" else 0
             if len(victims) < need:  # capacity preflight makes this unreachable; roll back tags
                 for row, o in zip(victims, old):
-                    owner[row] = FREE_TAG if o is None else (st["gen"] << 16) | o
+                    owner[row] = self.free_tag if o is None else self.tag(st["gen"], o)
                 self.status |= 1
                 return out, [], counters
         miss_uid = [u for u, row in enumerate(uid_row) if row < 0]
         for k, u in enumerate(miss_uid):
             uid_row[u] = victims[k]
         copies = [(uid_row[u], uid_token[u]) for u in miss_uid]
-        if not bypass:  # publish after the copies: reverse token, then owner tag
-            for k, u in enumerate(miss_uid):
+        if not bypass:
+            if indexed:  # drop the victims' old keys while their reverse tokens still name them
+                for row, o in zip(victims, old):
+                    if o is not None and not index_remove(st["index"], o, token[row], row, self.index_half,
+                                                          self.row_bits):
+                        self.status |= 4
+            for k, u in enumerate(miss_uid):  # publish after the copies: reverse token, then owner tag
                 row = uid_row[u]
                 token[row], owner[row] = uid_token[u], tag
                 if old[k] is not None:
                     st["occ"][old[k]] -= 1
             st["occ"][plane] += len(miss_uid)
+            if indexed:  # then the new keys; a full bucket pair parks the index for this generation
+                for u in miss_uid:
+                    if not st["index_flag"] and not index_insert(st["index"], plane, uid_token[u], uid_row[u],
+                                                                 self.index_half, self.row_bits):
+                        st["index_flag"] = 1
             if "owner_summary" in self.features:  # recompute every block that received a victim
                 for row in victims:
                     first = row // SUMMARY_ROWS * SUMMARY_ROWS
-                    block = [owner_index(owner[r]) for r in range(first, min(plan.rows, first + SUMMARY_ROWS))]
+                    block = [self.owner_index(slot, owner[r]) for r in range(first, min(plan.rows, first + SUMMARY_ROWS))]
                     st["summary"][row // SUMMARY_ROWS] = owner_summary(block)[0]
         for i, t in enumerate(tokens):
             if t >= 0 and t != newest:
@@ -893,18 +1142,30 @@ class KernelMirror:
             touched = [uid_row[u] for u in range(len(uid_row)) if not (bypass and u in missed)]
         else:
             touched = [] if bypass else [uid_row[u] for u in miss_uid]
-        if "touched_bitmap" in self.features:  # bit set of the touched rows, appended in bit order
+        if incremental:  # kill each touched row's entry, append the rows in row order, move the head
+            for row in touched:
+                i = pos[row]
+                if not head <= i < tail or dead[ring_offset + i]:
+                    self.status |= 2
+                dead[ring_offset + i] = 1
+            for k, row in enumerate(sorted(touched)):
+                ring[ring_offset + tail + k], pos[row] = row, tail + k
+            end = last_taken + 1 if last_taken >= 0 else head   # entries the victim scan consumed
+            new_head = next((i for i in range(head, end) if not dead[ring_offset + i]), end)
+            st["meta"][domain][:2] = [new_head, tail + len(touched)]
+        elif "touched_bitmap" in self.features:  # bit set of the touched rows, appended in bit order
+            order = st["order"]
             bits = set(hit_rows) if plan.eviction == "lru" else set()
             if not bypass:
                 bits.update(uid_row[u] for u in miss_uid)
-            kept = [row for row in region if row not in bits]
+            kept = [row for _, row in region if row not in bits]
             appended = [row for row in range(offset, offset + size) if row in bits]
             if len(kept) + len(touched) != size or len(appended) != len(touched):
                 self.status |= 2
             order[offset:offset + size] = kept + appended
         else:
-            touched_set = set(touched)
-            kept = [row for row in region if row not in touched_set]
+            order, touched_set = st["order"], set(touched)
+            kept = [row for _, row in region if row not in touched_set]
             if len(kept) + len(touched) != size:
                 self.status |= 2
             order[offset:offset + size] = kept + sorted(touched)
@@ -948,6 +1209,43 @@ class DirectReader:
 COUNTER_FIELDS = ("unique", "hits", "misses", "bypassed", "bytes", "breaches", "latest", "invalid")
 
 
+def arena_tables(plan, *, slots, counters=False, features=()):
+    """Bytes of every arena tensor ``ArenaRuntime.tables()`` allocates, by its name (zero-size ones omitted).
+
+    With S slots, R arena rows, L planes, D_d domain sizes, K the selection width:
+    owner S*R*b (b = 1 with compact_owner, else 4) plus templates; recency either
+    ``order`` S*sum(D_d)*4 or, with incremental_lru, ``ring`` S*sum(C_d)*4 with
+    C_d = D_d + (planes using d + 1)*K, ``ring_dead`` S*sum(ceil(C_d/32))*4,
+    ``ring_pos`` S*R*4 and ``ring_meta`` S*domains*16; hit_index adds
+    ``index`` S*2*ceil((R - scratch)/16)*16*4 and one flag per slot;
+    owner_summary adds (S+1)*ceil(R/32)*8.
+    """
+    features = set(features)
+    L, R = len(plan.layers), plan.rows
+    owner = 1 if "compact_owner" in features else 4
+    out = dict(row_owner=slots * R * owner, owner_template=R * owner, occupancy=slots * L * 4,
+               occupancy_template=L * 4, generation=slots * 4, floors=L * 4, status=4)
+    if "compact_owner" not in features:
+        out["owned_template"] = R * 4               # adds the generation to the int32 template
+    if "incremental_lru" in features:
+        rings = ring_domains(plan)
+        ring_rows, words = sum(c for _, c, _, _ in rings), sum(-(-c // 32) for _, c, _, _ in rings)
+        out.update(ring=slots * ring_rows * 4, ring_dead=slots * words * 4, ring_pos=slots * R * 4,
+                   ring_meta=slots * len(rings) * 16, ring_template=ring_rows * 4, ring_pos_template=R * 4,
+                   ring_meta_template=len(rings) * 16)
+    else:
+        order_rows = sum(size for _, size in plan.domains)   # bypass scratch rows have no recency entry
+        out.update(order=slots * order_rows * 4, order_template=order_rows * 4)
+    if counters:
+        out["counters"] = L * len(COUNTER_FIELDS) * 8
+    if "owner_summary" in features:
+        out.update(owner_summary=slots * summary_blocks(R) * 8, owner_summary_template=summary_blocks(R) * 8)
+    if "hit_index" in features:
+        entries = 2 * index_geometry(plan)[0] * INDEX_WAYS
+        out.update(index=slots * entries * 4, index_flags=slots * 4, index_template=entries * 4)
+    return out
+
+
 def byte_ledger(*, layers, hot_rows, page, item_bytes, slots, pool_rows, plan=None, counters=False,
                 features=()):
     """Estimated per-rank byte categories for one arm; GPU receipts replace them with allocations.
@@ -956,22 +1254,16 @@ def byte_ledger(*, layers, hot_rows, page, item_bytes, slots, pool_rows, plan=No
     page. Categories are mutually exclusive. Main KV and per-request
     history/tails overlap by construction (the arena reuses native hot slots)
     and are therefore listed under ``overlaps`` instead of being summed.
-    ``owner_summary`` adds one 64-bit word per 32 arena rows for every slot and
-    the template; ``touched_bitmap`` lives in shared memory and adds no HBM.
+    ``arena_tables`` states the formula of every arena tensor. touched_bitmap
+    lives in shared memory; no switch allocates HBM workspace per launch.
     """
     L, H = len(layers), hot_rows
     padded = H + page
     native_tables = 2 * L * slots * padded * 4 + L * slots * H * 2   # tokens/locs int32, LRU int16
-    arena_tables = 0
-    if plan is not None:
-        order_rows = sum(size for _, size in plan.domains)    # bypass scratch rows have no recency entry
-        live_tables = slots * (plan.rows + order_rows) + slots * L + slots + L + 1
-        init_templates = 2 * plan.rows + order_rows + L
-        arena_tables = (live_tables + init_templates) * 4
-        if counters:
-            arena_tables += L * len(COUNTER_FIELDS) * 8
-        if "owner_summary" in features:
-            arena_tables += (slots + 1) * summary_blocks(plan.rows) * 8
+    breakdown = {} if plan is None else arena_tables(plan, slots=slots, counters=counters, features=features)
+    one_slot = {} if plan is None else arena_tables(plan, slots=1, counters=counters, features=features)
+    no_slot = {} if plan is None else arena_tables(plan, slots=0, counters=counters, features=features)
+    arena_tables_bytes = sum(breakdown.values())
     scratch = 0 if plan is None else plan.scratch[1]
     return dict(
         estimated=True,
@@ -979,7 +1271,11 @@ def byte_ledger(*, layers, hot_rows, page, item_bytes, slots, pool_rows, plan=No
         main_kv_bytes=L * pool_rows * 2 * item_bytes,
         main_kv_layout="contiguous all-layer planes" if plan is not None else "one allocation per layer",
         native_metadata_bytes=native_tables,
-        arena_metadata_bytes=arena_tables,
+        arena_metadata_bytes=arena_tables_bytes,
+        arena_metadata_breakdown=breakdown,
+        arena_metadata_per_slot_bytes=sum(one_slot.values()) - sum(no_slot.values()),
+        arena_metadata_fixed_bytes=sum(no_slot.values()),
+        resolver_hbm_workspace_bytes=0,
         per_request=dict(history_rows=L * H, history_payload_bytes=L * H * 2 * item_bytes,
                          tail_rows=L * page, tail_payload_bytes=L * page * 2 * item_bytes,
                          bypass_scratch_rows=scratch, cacheable_history_rows=L * H - scratch),
