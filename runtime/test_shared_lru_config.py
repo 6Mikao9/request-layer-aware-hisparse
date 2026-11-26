@@ -103,6 +103,8 @@ class StudyConfigParser(unittest.TestCase):
         rejected = [
             {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers"}},
             {"schema": sc.SCHEMA, "placement": {"mode": "native", "offload_layers": [1]}},
+            {"schema": sc.SCHEMA, "placement": {"mode": "full_resident", "offload_layers": [2]}},
+            {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": [-1]}},
             {"schema": sc.SCHEMA, "placement": {"mode": "native", "selection": "random", "seed": 1}},
             {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": [1], "selection": "random"}},
             {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": [1], "seed": 3}},
@@ -118,7 +120,19 @@ class StudyConfigParser(unittest.TestCase):
                                                           "calibration": {"training_sha256": "a" * 64,
                                                                           "list_sha256": "b" * 64}}})
         self.assertEqual(fixed.placement.offload_layers, (3, 7))
-        self.assertIn("not implemented", sc.unsupported_reasons(fixed)[0])
+        self.assertTrue(fixed.uses_fixed_layers)
+        self.assertEqual(sc.unsupported_reasons(fixed), [])
+        caps = sc.capabilities(fixed)
+        self.assertEqual((caps["runtime"], caps["offload_layers"], caps["host_backing"]),
+                         ("fixed_layers+stock_hisparse", [3, 7], "offloaded layers only"))
+        self.assertTrue(caps["experimental_gpu_state"])
+        shared = parse(dict(SHARED, placement={"mode": "fixed_layers", "offload_layers": [5, 15]}))
+        self.assertEqual(sc.capabilities(shared)["runtime"], "fixed_layers+shared_lru_arena")
+        self.assertIn("offloaded layers", sc.capabilities(shared)["borrowing_domain"])
+        empty = parse({"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": []}})
+        self.assertIn("at least one host-backed layer", sc.unsupported_reasons(empty)[0])
+        resident = parse({"schema": sc.SCHEMA, "placement": {"mode": "full_resident"}})
+        self.assertIn("without --enable-hisparse", sc.unsupported_reasons(resident)[0])
         counters = parse({"schema": sc.SCHEMA, "diagnostics": {"mode": "counters"}})
         self.assertTrue(sc.unsupported_reasons(counters))
         self.assertEqual(sc.unsupported_reasons(parse(dict(SHARED, diagnostics={"mode": "counters"}))), [])

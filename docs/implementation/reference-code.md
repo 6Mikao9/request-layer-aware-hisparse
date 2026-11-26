@@ -16,6 +16,9 @@
 | [runtime/shared_lru.py](../../runtime/shared_lru.py)、[runtime/shared_lru_replay.py](../../runtime/shared_lru_replay.py) | 全层共享热池的 CPU 参考（代次、租约、LRU/FIFO、静态配额、软保底、旁路）、原生逐层 LRU 对照、与 CUDA 核逐步一致的 `KernelMirror` 和固定夹具回放。 |
 | [runtime/shared_lru_kernel.cuh](../../runtime/shared_lru_kernel.cuh)、[runtime/shared_lru_device.py](../../runtime/shared_lru_device.py) | 共享热池的 SM80 解析/回填核与 SGLang 接线：连续主 KV 平面、协调器生命周期、消费者视图、启动收据和不加载模型的 dry-run。 |
 | [runtime/shared_lru_plan.py](../../runtime/shared_lru_plan.py)、[runtime/cuda_shared_lru_correctness.py](../../runtime/cuda_shared_lru_correctness.py) | 每臂配置与 AB/BA 配对计划；需显式开启的 A100 正确性门（逐次对照 `KernelMirror`，覆盖 eager 与 Graph）。 |
+| [runtime/layer_placement.py](../../runtime/layer_placement.py)、[runtime/layer_placement_device.py](../../runtime/layer_placement_device.py)、[runtime/layer_placement_kernel.cuh](../../runtime/layer_placement_kernel.cuh) | 固定卸载层 S 与热池联用：CPU 参考（常驻层按逻辑位置读，S 内复用共享/隔离 arena 或原生逐层 LRU）、SGLang 拆池接线（S 热平面 + 常驻完整平面、按层路由、容量计费）、`features.resident_direct` 的直读与常驻 resolver（SM80 核与镜像 `resident_slot_table`）、dry-run 和 build receipt。 |
+| [runtime/combined_calibration.py](../../runtime/combined_calibration.py)、[runtime/combined_plan.py](../../runtime/combined_plan.py) | 只读训练桶冻结校准名单、高代价反向名单、随机名单与静态配额；A–E 臂、交互、A/A、验收对和按优先级排列的 AB/BA 计划。 |
+| [runtime/combined_run.py](../../runtime/combined_run.py)、[runtime/combined_measure.py](../../runtime/combined_measure.py)、[runtime/combined_timeline.py](../../runtime/combined_timeline.py)、[runtime/cuda_combined_correctness.py](../../runtime/cuda_combined_correctness.py) | 实验室 runner（identity → build → gate → functional → capacity → performance → diagnostics → verdict）、稳态窗口/实际 B/配对区间/验收判定、Nsight 导出的逐 rank 整步与瓶颈 rank 逐层时间线；需显式开启的 A100 门，检查 S 上的 arena 与常驻层的直读和 resolver 读数。 |
 
 下列 scoped 命令在只包含公开白名单的目录里运行通过。参考套件用 Python 3.12 + CPU PyTorch。命令不下载权重、不需要真实服务、CUDA 设备或任何服务器地址。Windows 如不支持 Linux 特定能力，精确说明跳过项。贡献者把新 CPU 测试加到自己的验收入口。
 
@@ -71,6 +74,66 @@ python -m runtime.launch --hisparse-study-config runtime/fixtures/shared_lru_arm
 ```
 
 每个 worker 在绑定协调器时打印一行 `hisparse_shared_lru_bound` 收据（解析后配置、能力、几何、实际分配字节）；`diagnostics.mode=counters` 在进程退出时打印逐层计数。
+
+### 联用整层卸载和跨层热池（[combined](combined.md)）
+
+CPU 命令同样在新 clone 的仓库根目录运行。设置 `SGLANG_SRC` 后，`runtime.test_layer_placement_device` 还会在 CPU 上执行固定版本的 `MiniMaxSparseKVPool`、`HiSparseMHAMainPool`、换入、备份和后端方法源码，dry-run 也对该 checkout 运行。
+
+```bash
+python -B -m unittest runtime.test_layer_placement runtime.test_layer_placement_device \
+  runtime.test_combined_calibration runtime.test_combined_plan runtime.test_combined_measure \
+  runtime.test_combined_timeline runtime.test_combined_run runtime.test_combined_gate
+for arm in fixed_stock_layout fixed_isolated_arena fixed_shared_arena fixed_shared_resident_resolver; do
+  python -B -m runtime.shared_lru_replay --fixture runtime/fixtures/shared_lru_fixture.json \
+    --config runtime/fixtures/combined_arms/$arm.json --output /tmp/combined-$arm.json
+done
+python -B -m runtime.layer_placement_device dry-run --sglang-src "$SGLANG_SRC" \
+  --config runtime/fixtures/combined_arms/combined_example.json
+python -B -m runtime.combined_calibration --source data/a100-minimax-20261122.json \
+  --training-bucket 8-16 --training-bucket 64-128 --heldout-bucket 16-32 --offload-layers 40 \
+  --output /tmp/combined-calibration.json
+python -B -m runtime.combined_plan --spec runtime/fixtures/combined_plan_spec.example.json \
+  --output-dir /tmp/combined-plan
+```
+
+回放夹具的 S={1,3}，层 0、2 常驻。`fixed_shared_resident_resolver` 是 `features.resident_direct` 的关臂：常驻层改走 resolver，选集、输出和字节摘要与 `fixed_shared_arena` 相同，只多出 resolver 调用。`combined_example.json` 即 combined.md 的 [5,15] 示例。
+
+示例 spec 的名单和配额由上面的校准命令写入：只读公开计数 `data/a100-minimax-20261122.json` 的 8–16 Ki 与 64–128 Ki 两个训练桶，16–32 Ki 只做不相交检查。T40 下有校准（低 miss）名单、高代价反向名单、随机 seed 13/37/71 名单，以及每个名单的 D 臂静态配额；逐层代价和名单摘要见 `runtime/fixtures/combined_calibration.example.json`。`split.heldout_sha256` 仍是占位，维护者换成留出 manifest 的摘要后重新编译计划。dry-run 和计划中的容量都是按 stock 同一 KV 预算的估计：常驻层按逻辑行（`size × host_to_device_ratio`）计费，热池可用的设备 token 由剩余空间反推；未提供 `--index-bytes-per-token` 时估计不含索引 KV。
+
+实机入口：
+
+```bash
+python -m runtime.combined_plan --spec "$RUN_SPEC" --output-dir "$PLAN_DIR"
+python -m runtime.combined_run --plan-dir "$PLAN_DIR" --manifest "$DATA_MANIFEST" --model-dir "$MODEL_DIR" \
+  --devices 0,1,2,3,4,5,6,7 --image-id sha256:614b1509bcb729c653528d448bff9850f8977fcad9d12ba56bd6dbe3d7985e87 \
+  --weights-sha256 "$WEIGHTS_SHA256" --output-dir "$OUTPUT_DIR/combined" --allow-gpu \
+  --max-priority 1 --deadline 2026-11-26T09:00:00+08:00
+```
+
+`$RUN_SPEC` 是示例 spec 填入留出 manifest 摘要后的副本。`--max-priority 1` 只跑 stock A/A 与验收对，去掉后按 `plan.json` 的优先级跑完全部配对；`--points` 选压力点，`--stages` 选阶段，`--resume` 在同一目录继续（已完成的 run 不重跑，结果文件从不覆盖），`--nsys` 给诊断阶段加 Nsight 采集。runner 只使用维护者给的设备；每次启动前查 compute 进程，出现外部占用就停止后续 run 并记录。
+
+`$DATA_MANIFEST` 为 `combined-workload-manifest-v1`：`{"schema", "split": "heldout", "functional": {"path", "sha256"}, "points": {压力点名: {"path", "sha256"}}}`，路径相对 manifest 所在目录。JSONL 行与 `benchmarks/sglang_stream_client.py` 相同（`request_alias`、`workload`、`input_ids`、`max_new_tokens`）。每个压力点至少有 repeats × B 条、输入长度落在该点区间内；第 r 轮读第 r 批 B 条，`max_new_tokens` 统一取 spec 的 `measurement.max_new_tokens`。
+
+| 阶段 | 结果 | 内容 |
+| --- | --- | --- |
+| identity | `identity.json` | 所选 GPU 的 UUID/型号/时钟、外部进程、拓扑、镜像 ID、固定 SGLang 摘要与符号、权重摘要、memlock/内存/cgroup、磁盘、工具链 |
+| build | `build/{shared_lru,layer_placement}.json` | 两个 SM80 JIT 核的构建收据：nvcc、torch、NCCL、产物 SHA-256 与 `cuobjdump --list-elf` |
+| gate | `gate/combined-gate.json` | A100 正确性门（eager 与 Graph） |
+| functional | `functional/correctness.json` | 真实模型：无配置、全默认配置和每个臂对 stock 的逐请求输出（顺序与并发两遍），stock A/A 重复率，逐 rank 收据；token ID 只写私有 `output_ids.jsonl` |
+| capacity | `capacity/admission.json` | 每臂 `/server_info` 池容量与显存、收据字节、每卡已用显存，每个压力点能否容纳计划 B；启动失败（如 OOM）记为该臂全部压力点不可行 |
+| performance | `runs/<点>/<对照__候选>/r<k>/<a\|b>-<臂>/{run_config,admission,correctness,metrics}.json` | 每次新服务、预热、一批满批请求：解析后 CLI 与摘要、收据与显存、输出哈希、窗口指标 |
+| diagnostics | `diagnostics/diagnostic_summary.csv` | arena 臂逐 rank、逐层计数（unique/hits/misses/bypassed/bytes/breaches/latest/invalid）；原生布局无计数。`--nsys` 为每臂另起一次采集，导出 SQLite 后写 `diagnostics/<臂>/nsys/timeline.json`，并在 CSV 加每 rank 整步、每步瓶颈 rank 和该 rank 的逐层读路核时间、暴露等待、读路到 merge 与整层时间 |
+| verdict | `verdict-<UTC>.json` | 每个压力点、每对的配对区间、A/A 噪声、被拒轮次、不可行对和验收结论 |
+
+窗口与指标（`runtime/combined_measure.py`）：窗口从所有请求都拿到首 token（prefill 屏障）且各自又解码 `warmup_steps` 步之后开始，到第一个请求的最后一个 token 结束，窗内每步都是满批。TPOT 为每个请求窗内相邻 token 间隔的平均值，报 p50/p95/p99（ms/token）；吞吐为窗内交付 token 数除以窗口墙钟秒（token/s）；整批另报 TTFT 和 SLO goodput。窗口内的 SGLang decode 日志行（spec 固定 `--decode-log-interval`）必须全部显示计划 B 和 `cuda graph: True`，且不少于 `min_decode_log_samples` 行。
+
+Nsight 时间线（`runtime/combined_timeline.py`，沿用 [A100 原生 Graph](../../NATIVE_GRAPH_20261123.md) 的口径）：`nsys profile --trace=cuda,nvtx --cuda-graph-trace=node` 采集后由 `nsys export --type sqlite` 导出。同一次 graph launch 的 kernel 共享 CUPTI correlation ID，构成一次 replay；每个 rank 出现次数最多的 replay 签名（kernel 名与 grid）是满批稳态 decode 图，各 rank 的第 k 次 replay 是同一步。整步为该 replay 第一个 kernel 开始到最后一个结束（含空档），每步整步最长的 rank 为瓶颈 rank，CSV 的 `bottleneck` 行取每步瓶颈 rank 自己的逐层值再求中位数，不把不同 rank 的逐层最大值相加。第 j 个 `_merge_topk_attn_out_kernel` 结束第 j 个稀疏层：上一 merge 之后的读路核（原生 `load_cache_to_device_buffer_kernel`、arena `resolve_kernel`、常驻 `resolve_resident_kernel`）时间、其中没有其他 kernel 同时运行的暴露部分、读路或 attention 开始到 merge 结束，以及 merge 到 merge 的整层周期（µs）。每步读路核个数可核对实际分派（`features.resident_direct` 关时多出常驻层的 resolver）。导出缺列、rank 数或每步 merge 数不符时写原因并留空，不做猜测。
+
+拒绝一轮的条件：服务未就绪或中途失败；收据缺 rank，或配置摘要、S、常驻读法与该臂不符；有请求失败；窗口不足 `min_window_steps` 步；日志中的 B 或 Graph 不符。被拒的 run 保留在目录里，所在轮次不进入区间。
+
+判定：一轮是一对 AB/BA 运行，各轮读不同输入批，作为独立单位。增益 = 候选窗口吞吐 / 对照窗口吞吐 − 1，取各轮均值和双侧 95% t 区间。`pass`：区间下界 > 0、均值 ≥ `min_gain`（示例 5%）、p95 TPOT 平均变化 ≤ `tpot_p95_regression_max`，且输出哈希不一致率不超过同点同轮 stock A/A 加 `quality_mismatch_over_stock_max`。`fail`：区间上界低于目标（负结果也在此），或尾延迟、质量超限。其余为 `inconclusive`。验收要求候选对 spec 声明的每个基线都在至少 `min_pressure_points` 个压力点 `pass` 且没有 `fail`；容量不足的配对记为 `infeasible`。
+
+固定卸载臂拒绝 `--max-total-tokens`，由 SGLang 自动定容。每个 worker 绑定协调器时打印收据，runner 设置 `REQUEST_LAYER_HISPARSE_RECEIPT_DIR` 后同时按 rank 写成文件：原生热池布局为 `hisparse_layer_placement_bound`，arena 布局为带 `placement` 段的 `hisparse_shared_lru_bound`。收据记录 S、常驻层、常驻读法、两类平面的实际字节、host pinned 字节和容量计费。
 
 ## 后续实机可复用的最小 CUDA 测试
 

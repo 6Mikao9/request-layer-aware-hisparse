@@ -63,6 +63,9 @@ class StudyConfigLauncher(unittest.TestCase):
             fixed = Path(tmp) / "fixed.json"
             fixed.write_text(json.dumps({"schema": "hisparse-study-config-v1",
                                          "placement": {"mode": "fixed_layers", "offload_layers": [3]}}))
+            empty = Path(tmp) / "empty.json"
+            empty.write_text(json.dumps({"schema": "hisparse-study-config-v1",
+                                         "placement": {"mode": "fixed_layers", "offload_layers": []}}))
             typo = Path(tmp) / "typo.json"
             typo.write_text('{"schema": "hisparse-study-config-v1", "hot_pool": {"mode": "shared"}}')
             shared = str(ARMS / "shared_arena.json")
@@ -76,15 +79,32 @@ class StudyConfigLauncher(unittest.TestCase):
                  "--cuda-graph-config", '{"decode": {"backend": "breakable"}}'),
                 ("--hisparse-study-config", shared, "--six-layer-timing", "--", *BASE, *SINGLE_STREAM),
                 ("--hisparse-study-config", shared, "--policy", shared, "--", *BASE, *SINGLE_STREAM),
-                ("--hisparse-study-config", str(fixed), "--", *BASE, *SINGLE_STREAM),
+                ("--hisparse-study-config", str(fixed), "--", *BASE),                             # needs single stream
+                ("--hisparse-study-config", str(fixed), "--", *BASE, *SINGLE_STREAM, "--max-total-tokens", "4096"),
+                ("--hisparse-study-config", str(empty), "--", *BASE, *SINGLE_STREAM),
                 ("--hisparse-study-config", str(typo), "--", *BASE, *SINGLE_STREAM),
             ]
             for argv in cases:
                 with self.subTest(argv=argv[2:]), self.assertRaises(SystemExit):
                     resolve(*argv)
+            plan, _, _ = resolve("--hisparse-study-config", str(fixed), "--", *BASE, *SINGLE_STREAM)
+            self.assertIsNotNone(plan.study_config_path)
         plan, _, _ = resolve("--hisparse-study-config", shared, "--", *BASE, *SINGLE_STREAM,
                              "--cuda-graph-config", '{"decode": {"backend": "full", "bs": [1, 2, 4]}}')
         self.assertIsNotNone(plan.study_config_path)
+
+    def test_worker_installs_placement_before_the_arena(self):
+        calls = []
+        combined = Path(__file__).parent / "fixtures" / "combined_arms"
+        plans = [resolve("--hisparse-study-config", str(combined / f"{arm}.json"), "--", *BASE, *SINGLE_STREAM)[0]
+                 for arm in ("fixed_stock_layout", "fixed_shared_arena")]
+        with patch("runtime.shared_lru_device.install", lambda config, digest: calls.append(("arena", digest))), \
+                patch("runtime.layer_placement_device.install",
+                      lambda config, digest: calls.append(("placement", digest))):
+            for plan in plans:
+                launch.install_for_process(plan)
+        self.assertEqual(calls, [("placement", plans[0].study_config_sha256),
+                                 ("placement", plans[1].study_config_sha256), ("arena", plans[1].study_config_sha256)])
 
     def test_worker_installs_arena_only_for_arena_layouts(self):
         calls = []

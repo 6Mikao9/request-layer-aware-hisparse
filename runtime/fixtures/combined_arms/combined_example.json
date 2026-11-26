@@ -1,0 +1,7 @@
+{
+  "schema": "hisparse-study-config-v1",
+  "placement": {"mode": "fixed_layers", "selection": "fixed", "offload_layers": [5, 15]},
+  "hot_pool": {"mode": "shared", "scope": "request_rank", "layout": "arena", "eviction": "lru", "quota": "none", "admission": "all"},
+  "features": {"resident_direct": true},
+  "diagnostics": {"mode": "none"}
+}

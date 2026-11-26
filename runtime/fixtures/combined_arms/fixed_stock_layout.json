@@ -1,0 +1,7 @@
+{
+  "schema": "hisparse-study-config-v1",
+  "placement": {"mode": "fixed_layers", "selection": "fixed", "offload_layers": [1, 3]},
+  "hot_pool": {"mode": "isolated", "scope": "request_rank", "layout": "native"},
+  "features": {"resident_direct": true},
+  "diagnostics": {"mode": "none"}
+}

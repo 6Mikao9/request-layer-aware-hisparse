@@ -132,25 +132,29 @@ def check_request_execution(argv):
         raise ValueError('Request-type routing requires pinned Triton/page128 without disaggregation/spec')
 
 
-def check_study_execution(argv):
-    """Arena arms decode on one stream: no overlap, Radix, speculation or disaggregation.
+def check_study_execution(argv, *, fixed_layers=False):
+    """Arena and fixed-offload arms decode on one stream: no overlap, Radix, speculation or disaggregation.
 
     Eager or full decode CUDA Graph are both allowed; the worker re-checks the
-    resolved runtime context before allocating anything.
+    resolved runtime context before allocating anything. A fixed offload set
+    sizes its hot pools from the HBM left after the resident planes, so it
+    keeps SGLang's automatic pool sizing.
     """
     flags = {arg.partition("=")[0] for arg in argv}
     forbidden = {"--config", "--enable-two-batch-overlap", "--enable-single-batch-overlap", "--enable-pdmux"}
     if not {"--disable-overlap-schedule", "--disable-radix-cache"}.issubset(argv) or flags & forbidden:
-        raise ValueError("Shared-arena arms require --disable-overlap-schedule, --disable-radix-cache "
-                         "and no config/overlap overrides")
+        raise ValueError("Shared-arena and fixed-offload arms require --disable-overlap-schedule, "
+                         "--disable-radix-cache and no config/overlap overrides")
     if (flag_value(argv, "--disaggregation-mode") not in (None, "null")
             or flag_value(argv, "--speculative-algorithm") not in (None, "NONE")):
-        raise ValueError("Shared-arena arms require non-speculative, non-disaggregated decode")
+        raise ValueError("Shared-arena and fixed-offload arms require non-speculative, non-disaggregated decode")
+    if fixed_layers and "--max-total-tokens" in flags:
+        raise ValueError("Fixed offload sets keep automatic pool sizing; omit --max-total-tokens")
     raw_graph = flag_value(argv, "--cuda-graph-config")
     if raw_graph is not None:
         decode = parse_object(raw_graph).get("decode", {})
         if type(decode) is not dict or decode.get("backend", "full") not in ("full", "disabled"):
-            raise ValueError("Shared-arena decode must be eager or full CUDA Graph")
+            raise ValueError("Shared-arena and fixed-offload decode must be eager or full CUDA Graph")
 
 
 def check_plan(plan, policy, request_config=None, study_config=None):
@@ -278,8 +282,8 @@ def resolve(argv):
         if study_path is not None:
             from .study_config import read as read_study_config
             study_config, study_digest = read_study_config(study_path)
-            if study_config.uses_arena:
-                check_study_execution(sglang_argv)
+            if study_config.uses_arena or study_config.uses_fixed_layers:
+                check_study_execution(sglang_argv, fixed_layers=study_config.uses_fixed_layers)
         if options.six_layer_timing:
             required = {"--disable-cuda-graph", "--disable-prefill-cuda-graph",
                         "--disable-overlap-schedule", "--disable-radix-cache"}
@@ -336,9 +340,13 @@ def install_for_process(plan):
     if request_config is not None:
         from .request_hook import install
         install(**request_config.install_kwargs())
-    elif study_config is not None and study_config.uses_arena:
-        from .shared_lru_device import install
-        install(study_config, plan.study_config_sha256)
+    elif study_config is not None and (study_config.uses_arena or study_config.uses_fixed_layers):
+        if study_config.uses_fixed_layers:      # split pools first; an arena then spans S only
+            from .layer_placement_device import install as install_placement
+            install_placement(study_config, plan.study_config_sha256)
+        if study_config.uses_arena:
+            from .shared_lru_device import install
+            install(study_config, plan.study_config_sha256)
     elif plan.shadow_identity_directory is not None:
         from .shadow import install
         install(policy, Path(plan.shadow_identity_directory))

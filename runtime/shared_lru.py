@@ -408,6 +408,9 @@ class SharedLRUReference:
         unique = list(dict.fromkeys(t for t in tokens if t >= 0 and t != newest))
         hits = {t: req.index[(req.generation, layer, t)] for t in unique
                 if (req.generation, layer, t) in req.index}
+        loading = [t for t, row in hits.items() if req.rows[row].state == LOADING]
+        if loading:
+            raise Deferred(f"Token(s) {loading[:4]} are still loading; K/V become visible after the gather fence")
         misses = tuple(t for t in unique if t not in hits)
         hidden = [t for t in misses if t not in req.host_visible]
         if hidden:

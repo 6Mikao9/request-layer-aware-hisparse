@@ -30,3 +30,24 @@ projection adapter used by the existing SM80 launcher, SHA256
 207df72e8294982f5153a236043871f38a26b37338c543d9c8322fd56d0c2bf0.
 It uses the pinned SGLang MXFP8 dequantization and linear-method interfaces.
 It is enabled explicitly and identically for native and arena comparisons.
+
+The optional fixed offload set (layer_placement.py, layer_placement_device.py)
+copies no SGLang source. It runs the pinned MiniMaxSparseKVPool constructor
+unchanged while building its HiSparse main pool for the offloaded layers only,
+adds one stock MHATokenToKVPool for the resident sparse layers (sized like the
+pinned index pools), routes the pinned buffer accessors by layer, extends the
+pinned MiniMax cell-size formula for resident rows, and sends resident layers
+through the stock sparse decode/prefill consumers without HiSparse slots or
+location mapping. Its pinned inputs are in layer_placement_dependency_sha256.
+The CPU tests execute pinned class and method sources from a local checkout
+only when SGLANG_SRC is set; no SGLang source is vendored.
+
+The resident resolver of the same adapter (layer_placement_kernel.cuh, used
+only without features.resident_direct) includes the pinned kvcacheio/hisparse.cuh
+unmodified for resolve_selected_token and keeps the swap kernel's output
+conventions (-1 sentinel, num_real_reqs early exit). Writing req_to_token rows
+of resident layers as HiSparse slots is new.
+
+The lab runner (combined_run.py) drives the existing benchmarks clients
+(sglang_stream_client.generate, sglang_correctness_client.submit) unchanged and
+parses SGLang's decode log line in the format of the pinned metrics_reporter.

@@ -63,7 +63,9 @@ class ReplayCli(unittest.TestCase):
     def test_invalid_unsupported_and_existing_outputs_exit_nonzero(self):
         with tempfile.TemporaryDirectory() as tmp:
             bad = {"typo": {"schema": sc.SCHEMA, "hot_pool": {"mode": "shared"}},
-                   "placement": {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": [1]}},
+                   "placement": {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers", "offload_layers": [1, 9]}},
+                   "empty_placement": {"schema": sc.SCHEMA, "placement": {"mode": "fixed_layers",
+                                                                          "offload_layers": []}},
                    "unknown_layer": {"schema": sc.SCHEMA, "hot_pool": {"mode": "shared", "layout": "arena",
                                                                       "admission": "bypass_list",
                                                                       "bypass_layers": [9]}}}
@@ -83,6 +85,41 @@ class ReplayCli(unittest.TestCase):
                 replay.main(["--fixture", str(FIXTURE), "--config", str(ARMS / "stock.json"),
                              "--output", str(existing)])
             self.assertEqual(existing.read_text(), "{}")
+
+    def test_fixed_offload_arms_share_selections_and_read_resident_layers_directly(self):
+        combined = ROOT / "fixtures" / "combined_arms"
+        with tempfile.TemporaryDirectory() as tmp:
+            stock = run(ARMS / "stock.json", Path(tmp) / "stock.json")[1]
+            results = {}
+            for arm in ("fixed_stock_layout", "fixed_isolated_arena", "fixed_shared_arena"):
+                code, results[arm] = run(combined / f"{arm}.json", Path(tmp) / f"{arm}.json")
+                self.assertEqual(code, 0)
+                self.assertEqual(results[arm]["selection_sha256"], stock["selection_sha256"])
+                self.assertEqual(results[arm]["placement"], dict(offload=[1, 3], resident=[0, 2]))
+                for counts in results[arm]["counters"]["per_rank"].values():
+                    for layer in ("0", "2"):
+                        self.assertEqual((counts[layer]["unique"], counts[layer]["misses"]), (0, 0))
+                        self.assertGreater(counts[layer]["resident"], 0)
+                    for layer in ("1", "3"):
+                        self.assertEqual(counts[layer]["resident"], 0)
+                ledger = results[arm]["ledger"]["0"]
+                self.assertEqual(ledger["resident_layers"], [0, 2])
+                self.assertEqual(ledger["per_request"]["history_rows"], 2 * 32)
+            self.assertEqual(results["fixed_shared_arena"]["checks"]["kernel_mirror"], "lockstep")
+            # Synthetic fixture: layer 3 needs more rows than H; sharing lends it layer 1's idle rows.
+            self.assertGreater(results["fixed_shared_arena"]["history_hit_rate"],
+                               results["fixed_isolated_arena"]["history_hit_rate"] + 0.1)
+            code, again = run(combined / "fixed_shared_arena.json", Path(tmp) / "again.json")
+            self.assertEqual((Path(tmp) / "again.json").read_bytes(),
+                             (Path(tmp) / "fixed_shared_arena.json").read_bytes())
+            code, resolver = run(combined / "fixed_shared_resident_resolver.json", Path(tmp) / "resolver.json")
+            self.assertEqual(code, 0)
+            direct = results["fixed_shared_arena"]
+            for key in ("selection_sha256", "output_sha256", "device_bytes_sha256", "counters", "history_hit_rate"):
+                self.assertEqual(resolver[key], direct[key], f"{key}: resident_direct changes no row or byte")
+            self.assertEqual(direct["checks"]["resident_resolver_launches"], 0)
+            self.assertGreater(resolver["checks"]["resident_resolver_launches"], 0)
+            self.assertIn("resident resolver", resolver["engine"])
 
 
 if __name__ == "__main__":
