@@ -77,9 +77,11 @@ class ControllerTests(unittest.TestCase):
         decision = ctl.tick(pressure)
         self.assertEqual(decision.level, smallest)
         self.assertEqual(decision.reason, f"offload to level {smallest}")
-        batch, rows, tokens = points[smallest]
-        self.assertEqual((decision.tokens, decision.hot_rows), (tokens, rows))
-        self.assertGreaterEqual(tokens, 96 + 4 * 2 + 2 * per_new)
+        batch, rows, cap = points[smallest]
+        demand = 96 + 4 * 2 + (batch - 4) * per_new             # live rows + horizon, plus each admitted one
+        lazy = min(cap, max(pressure.tokens, -(-int(demand / 0.9) // PAGE) * PAGE))
+        self.assertEqual((decision.tokens, decision.hot_rows), (lazy, rows))    # only what the batch needs
+        self.assertGreaterEqual(decision.tokens, 96 + 4 * 2 + 2 * per_new)
         self.assertGreaterEqual(rows, 6 * 8)
 
     def test_slo_stops_offloading_and_requests_queue(self):

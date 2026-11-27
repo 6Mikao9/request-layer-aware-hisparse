@@ -137,6 +137,7 @@ class Observation:
     retracted: int = 0
     step_ms: float | None = None
     busy: bool = False         # staging, chunked prefill or a transition in flight
+    prefill_rows: int = 0      # hot rows the next prefill chunk takes (stock HiSparse prefills into hot rows)
 
 
 @dataclass(frozen=True)
@@ -217,9 +218,10 @@ class Controller:
         return -(-int(value) // unit) * unit
 
     def _hot_rows_for(self, obs, batch):
-        """Hot rows a running batch needs (one padded device buffer per request), with the high-watermark slack."""
+        """Hot rows a running batch needs (one padded device buffer per request, plus the next prefill chunk),
+        with the high-watermark slack."""
         g = self.geometry
-        need = max(obs.hot_peak, batch * g.hot_per_request)
+        need = max(obs.hot_peak, batch * g.hot_per_request + obs.prefill_rows)
         want = self._align(need / self.c["high_watermark"], g.layout.page)
         return min(g.layout.hot_rows, max(g.hot_min, want))
 
@@ -282,7 +284,12 @@ class Controller:
             target = points[-1] if points[-1][1] >= desired else max(points, key=lambda p: (p[1], -p[0]))
             if cfg.feature("throughput_guard") and target[0] > obs.level:
                 target = self._best_throughput(points, target, ctx)
-            level, batch, rows, tokens = target
+            level, batch, rows, cap = target
+            # Back only what the chosen batch needs (with the watermark slack): chunks left over keep the leaving
+            # layers' rows readable (stale hits, cheaper backfill) until a later grow reclaims them.
+            live = max(obs.tokens_peak, obs.tokens_used) + obs.running * c["horizon_steps"]
+            demand = live + max(0, batch - obs.running) * per_new
+            tokens = min(cap, max(obs.tokens, self._align(demand / c["high_watermark"], layout.page)))
             # Admitting past the chosen point would force the next offload once those requests grow.
             self.batch_cap = batch if cfg.feature("throughput_guard") else None
             if (level, tokens, rows) == (obs.level, obs.tokens, obs.hot_rows):
@@ -298,6 +305,10 @@ class Controller:
             prev = obs.level - 1
             hot = max(hot, obs.hot_rows)
             cap = self.capacity(prev, hot)
+            if cfg.mode == "smooth":    # the paced copy backs both regions of the returning group until it ends
+                cap = min(cap, layout.max_tokens_for(self.geometry.chunks, hot_rows=hot,
+                                                     offloaded=cfg.offloaded(obs.level),
+                                                     filling=cfg.offloaded(obs.level) - cfg.offloaded(prev)))
             compaction = cfg.feature("compaction")
             if cap > 0 and need <= c["low_watermark"] * cap and (obs.tokens_peak <= cap or compaction):
                 if self.low_since is None:

@@ -13,9 +13,8 @@ top down), so an offloaded layer can still read rows written before it was offlo
 what changed. Virtual addresses never move, so CUDA Graphs captured over these buffers stay valid.
 
 Backends: ``CpuBackend`` (torch CPU tensors; unmapped bytes are poisoned so tests catch stale reads) and
-``CudaVmmBackend`` (driver API through ctypes: cuMemCreate, cuMemMap, cuMemSetAccess, cuMemUnmap).
+``CudaVmmBackend`` (cuMemCreate, cuMemMap, cuMemSetAccess and cuMemUnmap through the pinned SGLang VMM helpers).
 """
-import ctypes
 from dataclasses import dataclass, field
 import math
 
@@ -157,77 +156,42 @@ class CpuBackend:
         pass
 
 
-class _Prop(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_int), ("requestedHandleTypes", ctypes.c_int), ("loc_type", ctypes.c_int),
-                ("loc_id", ctypes.c_int), ("win32", ctypes.c_void_p), ("compression", ctypes.c_ubyte),
-                ("rdma", ctypes.c_ubyte), ("usage", ctypes.c_ushort), ("reserved", ctypes.c_ubyte * 4)]
-
-
-class _Access(ctypes.Structure):
-    _fields_ = [("loc_type", ctypes.c_int), ("loc_id", ctypes.c_int), ("flags", ctypes.c_int)]
-
-
-class _CudaArray:
-    def __init__(self, va, nbytes):
-        self.__cuda_array_interface__ = dict(shape=(nbytes,), typestr="|u1", data=(va, False), version=3)
-
-
 class CudaVmmBackend:
-    """CUDA driver VMM: one physical allocation per chunk, mapped into stable virtual reservations."""
-    PINNED, DEVICE, READWRITE = 1, 1, 3
+    """CUDA driver VMM through ``cuda.bindings`` and the pinned SGLang helpers of its post-capture KV backing
+    (srt/utils/cuda_vmm_utils.py): one physical allocation per chunk, mapped into stable virtual reservations
+    and viewed as non-owning torch tensors."""
 
     def __init__(self, torch, device=None):
-        self.torch = torch
-        torch.cuda.init()
-        self.device = torch.cuda.current_device() if device is None else device
-        torch.empty(1, device=f"cuda:{self.device}")    # make the primary context current
-        self.lib = ctypes.CDLL("libcuda.so.1")
-        self.prop = _Prop(type=self.PINNED, loc_type=self.DEVICE, loc_id=self.device)
-        self.access = _Access(loc_type=self.DEVICE, loc_id=self.device, flags=self.READWRITE)
-        granularity = ctypes.c_size_t()
-        self._check(self.lib.cuMemGetAllocationGranularity(ctypes.byref(granularity), ctypes.byref(self.prop), 0),
-                    "cuMemGetAllocationGranularity")
-        self.granularity = granularity.value
-
-    def _check(self, status, what):
-        if status != 0:
-            raise RuntimeError(f"{what} failed with CUresult {status}")
+        from sglang.srt.utils import cuda_vmm_utils as vmm
+        self.torch, self.vmm, self.drv = torch, vmm, vmm._get_cuda_driver()
+        self.device = torch.cuda.current_device() if device is None else int(device)
+        self.prop = vmm.make_device_allocation_prop(self.device, handle_types=None)
+        self.access = [vmm.make_rw_access_desc(self.device)]
+        self.granularity = vmm.get_device_granularity(self.device)
 
     def reserve(self, nbytes, chunk):
         if chunk % self.granularity:
             raise ValueError(f"chunk {chunk} is not a multiple of the VMM granularity {self.granularity}")
-        va = ctypes.c_uint64()
         size = -(-nbytes // chunk) * chunk
-        self._check(self.lib.cuMemAddressReserve(ctypes.byref(va), ctypes.c_size_t(size), ctypes.c_size_t(chunk),
-                                                 ctypes.c_uint64(0), ctypes.c_uint64(0)), "cuMemAddressReserve")
-        return va.value
+        return int(self.vmm.check_drv(self.drv.cuMemAddressReserve(size, chunk, 0, 0), "cuMemAddressReserve"))
 
     def create(self, count, chunk):
-        handles = []
-        for _ in range(count):
-            handle = ctypes.c_uint64()
-            self._check(self.lib.cuMemCreate(ctypes.byref(handle), ctypes.c_size_t(chunk), ctypes.byref(self.prop),
-                                             ctypes.c_uint64(0)), "cuMemCreate")
-            handles.append(handle.value)
-        return handles
+        return [self.vmm.check_drv(self.drv.cuMemCreate(chunk, self.prop, 0), "cuMemCreate") for _ in range(count)]
 
     def map(self, va, first, chunk, handles):
         """Map consecutive chunks starting at chunk ``first``; one access call and one zero fill per run."""
         base = va + first * chunk
         for i, handle in enumerate(handles):
-            self._check(self.lib.cuMemMap(ctypes.c_uint64(base + i * chunk), ctypes.c_size_t(chunk),
-                                          ctypes.c_size_t(0), ctypes.c_uint64(handle), ctypes.c_uint64(0)),
-                        "cuMemMap")
+            self.vmm.check_drv(self.drv.cuMemMap(base + i * chunk, chunk, 0, handle, 0), "cuMemMap")
         size = len(handles) * chunk
-        self._check(self.lib.cuMemSetAccess(ctypes.c_uint64(base), ctypes.c_size_t(size), ctypes.byref(self.access),
-                                            ctypes.c_size_t(1)), "cuMemSetAccess")
+        self.vmm.check_drv(self.drv.cuMemSetAccess(base, size, self.access, len(self.access)), "cuMemSetAccess")
         self.tensor(base, size).zero_()
 
     def unmap(self, va, offset, chunk):
-        self._check(self.lib.cuMemUnmap(ctypes.c_uint64(va + offset), ctypes.c_size_t(chunk)), "cuMemUnmap")
+        self.vmm.check_drv(self.drv.cuMemUnmap(va + offset, chunk), "cuMemUnmap")
 
     def tensor(self, va, nbytes):
-        return self.torch.as_tensor(_CudaArray(va, nbytes), device=f"cuda:{self.device}")
+        return self.vmm.tensor_from_pointer(va, nbytes, device_id=self.device)
 
     def synchronize(self):
         self.torch.cuda.synchronize(self.device)
@@ -237,18 +201,34 @@ class ElasticMemory:
     """Mapping state of one rank. ``resize`` moves the backing to a new (tokens, hot rows, offload set) state;
     the caller synchronizes the device first when chunks leave a region that kernels may still read."""
 
-    def __init__(self, layout, backend, physical_chunks, *, torch):
+    def __init__(self, layout, backend, physical_chunks=None, *, torch):
+        """Reserves every spec of ``layout``; ``add`` reserves more (pool construction registers buffers one by
+        one) and ``seal`` creates the physical chunks before the first ``resize``."""
         self.layout, self.backend, self.torch = layout, backend, torch
-        self.handles = backend.create(physical_chunks, layout.chunk)
-        self.free = list(range(physical_chunks - 1, -1, -1))     # pop() hands out low chunk IDs first
-        self.buffers = {}
-        for spec in layout.specs:
-            nbytes = layout.total_rows(spec) * spec.row_bytes
-            buf = _Buffer(spec, backend.reserve(nbytes, layout.chunk), nbytes, layout.hot_offset(spec))
-            buf.chunks = [None] * (-(-nbytes // layout.chunk))
-            self.buffers[spec.name] = buf
+        self.handles, self.free, self.buffers = [], [], {}
+        specs, layout.specs = list(layout.specs), []
+        for spec in specs:
+            self.add(spec)
         self.tokens, self.hot_rows, self.offloaded, self.filling = 0, 0, frozenset(), frozenset()
         self.stale = {}                       # (layer, buffer) -> bytes of its inactive resident region backed
+        if physical_chunks is not None:
+            self.seal(physical_chunks)
+
+    def add(self, spec):
+        if spec.name in self.buffers:
+            raise ValueError(f"buffer {spec.name} registered twice")
+        self.layout.specs = (*self.layout.specs, spec)
+        nbytes = self.layout.total_rows(spec) * spec.row_bytes
+        buf = _Buffer(spec, self.backend.reserve(nbytes, self.layout.chunk), nbytes, self.layout.hot_offset(spec))
+        buf.chunks = [None] * (-(-nbytes // self.layout.chunk))
+        self.buffers[spec.name] = buf
+        return buf
+
+    def seal(self, physical_chunks):
+        if self.handles:
+            raise RuntimeError("the chunk pool already exists")
+        self.handles = self.backend.create(physical_chunks, self.layout.chunk)
+        self.free = list(range(physical_chunks - 1, -1, -1))     # pop() hands out low chunk IDs first
 
     @property
     def free_chunks(self):
@@ -284,10 +264,11 @@ class ElasticMemory:
             buf.spec, tokens=tokens, hot_rows=hot_rows, offloaded=offloaded, filling=filling))
             for name, buf in self.buffers.items()}
 
-    def plan(self, *, tokens, hot_rows, offloaded, filling=(), keep_stale=True):
+    def plan(self, *, tokens, hot_rows, offloaded, filling=(), keep_stale=True, protect=()):
         """(maps, unmaps, reclaims) of (buffer name, chunk index) to reach a state; None if it does not fit.
         Unneeded chunks of newly inactive resident regions stay mapped (stale) when ``keep_stale``; reclaims take
-        stale chunks from the top of their regions only when the free pool runs short."""
+        stale chunks from the top of their regions only when the free pool runs short, never from a
+        ``protect`` layer (its rows are about to be read)."""
         wanted = self._wanted(tokens, hot_rows, offloaded, filling)
         maps, unmaps, stale = [], [], []
         for name, buf in self.buffers.items():
@@ -300,6 +281,7 @@ class ElasticMemory:
                 (stale if keep and c >= resident_lo else unmaps).append((name, c))
         shortfall = len(maps) - len(self.free) - len(unmaps)
         reclaims = []
+        stale = [item for item in stale if self.buffers[item[0]].spec.layer not in protect]
         if shortfall > 0:
             stale.sort(key=lambda item: -item[1])          # top of each region first
             if shortfall > len(stale):
@@ -307,9 +289,9 @@ class ElasticMemory:
             reclaims = stale[:shortfall]
         return maps, unmaps, reclaims
 
-    def resize(self, *, tokens, hot_rows, offloaded, filling=(), keep_stale=True):
+    def resize(self, *, tokens, hot_rows, offloaded, filling=(), keep_stale=True, protect=()):
         planned = self.plan(tokens=tokens, hot_rows=hot_rows, offloaded=offloaded, filling=filling,
-                            keep_stale=keep_stale)
+                            keep_stale=keep_stale, protect=protect)
         if planned is None:
             raise MemoryError(f"state tokens={tokens} hot_rows={hot_rows} offloaded={sorted(offloaded)} does not "
                               f"fit {len(self.handles)} chunks")

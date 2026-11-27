@@ -35,6 +35,7 @@ FEATURES = {
     "compaction": True,      # live pages above a shrink ceiling move down instead of blocking the shrink
     "slo_admission": True,   # with an SLO, cap the running batch at the largest size the model predicts fits
     "throughput_guard": True,  # offload another group only if the model expects more decode tokens per second
+    "fused_route": True,     # smooth: the Triton route kernels (elastic_route) instead of the torch statement
 }
 _TOP = {"schema", "model", "mode", "layers", "slo", "profile", "controller", "memory", "features"}
 _LAYERS = {"eviction_order", "always_offload", "granularity", "pinned_resident"}
@@ -46,7 +47,7 @@ _PROFILE = {"bytes_per_miss", "selected_rows", "h2d_gbps", "fixed_us", "per_requ
             "default_miss_rate", "exposed", "base_ms", "measurements"}
 _CONTROLLER = {"interval_steps", "high_watermark", "low_watermark", "dwell_steps", "horizon_steps",
                "backfill_gbps", "max_level", "min_level", "initial_level", "min_gain"}
-_MEMORY = {"chunk_mib", "hot_rows", "max_logical_tokens", "host_kv_gib", "precapture_levels"}
+_MEMORY = {"chunk_mib", "precapture_levels"}
 
 
 def _number(value, where, *, low=0.0, high=None, strict=False):
@@ -267,10 +268,6 @@ def parse(data):
 
     raw = _section(data, "memory", _MEMORY)
     memory = dict(chunk_mib=_count(raw.get("chunk_mib", 2), "memory.chunk_mib"),
-                  hot_rows=_optional_count(raw.get("hot_rows"), "memory.hot_rows"),
-                  max_logical_tokens=_optional_count(raw.get("max_logical_tokens"), "memory.max_logical_tokens"),
-                  host_kv_gib=(None if raw.get("host_kv_gib") is None else
-                               _number(raw["host_kv_gib"], "memory.host_kv_gib", strict=True)),
                   precapture_levels=_precapture(raw.get("precapture_levels", "all"), levels))
     if memory["chunk_mib"] < 2 or memory["chunk_mib"] & (memory["chunk_mib"] - 1):
         raise ValueError("memory.chunk_mib must be a power of two of at least 2 (the CUDA VMM granularity)")
@@ -284,6 +281,7 @@ def parse(data):
     features = {**FEATURES, **raw}
     if mode == "steady":
         features["stale_hits"] = False   # the stock kernels of the steady sets have no stale-row path
+        features["fused_route"] = False  # steady graphs call the stock kernels only
     if slo is None:
         features["slo_admission"] = False
     return ElasticConfig(model, mode, groups, always, slo, profile, controller, memory, features, pinned,
@@ -294,10 +292,6 @@ def _object(value, where):
     if type(value) is not dict:
         raise ValueError(f"{where} must be a JSON object")
     return value
-
-
-def _optional_count(value, where):
-    return None if value is None else _count(value, where)
 
 
 def _miss_rates(value):
