@@ -10,7 +10,7 @@
 | `elastic_memory` | CUDA VMM 弹性显存：物理 chunk 在层之间移动，不做释放再分配 |
 | `elastic_policy` | 代价模型与压力控制器，纯 Python |
 | `elastic_kv` | 设备侧状态与每种切换的拷贝，只依赖 torch |
-| `elastic_route` | smooth 版的 Triton 融合路由核 |
+| `elastic_route` | decode 热路径上的 CUDA 路由核（`elastic_route.cuh`，经固定 SGLang 的 JIT 编译）与绑定前的自检 |
 | `elastic_device` | SGLang 适配：池、协调器、DSA/MiniMax/DeepSeek-V4 后端、scheduler、Graph、`/set_internal_state` |
 | `elastic_sim` | CPU 上的服务模拟器，对比 full_resident、stock、fixed、hybrid 和 elastic |
 | `cuda_elastic_gate` | A100 上第一件要跑的门禁：VMM、融合路由核、host 拷贝（含 C4 记录） |
@@ -72,12 +72,12 @@ DeepSeek-V4 的 C4 池以页为行：一行是 64 条记录（每条 576 字节�
 | | steady（稳态性能） | smooth（平滑切换） |
 | --- | --- | --- |
 | decode Graph | 每级一套，键为 `("hisparse-elastic", level, shape)`；`precapture_levels` 启动时捕获，其余首次用到时捕获 | 一套 |
-| 常驻层 | 原生非 HiSparse 路径，直接读逻辑行，不跑换入核 | 每层先按路由表算出哪些选中位置读常驻区，余下交给原生换入核，再合并 |
+| 常驻层 | 原生非 HiSparse 路径，直接读逻辑行，不跑换入核（DSA 与 C4 的页表由一个路由核算出） | 每层先按路由表算出哪些选中位置读常驻区，余下交给原生换入核，再合并 |
 | 卸载层 | 原生 HiSparse 路径 | 同上；常驻区里仍有效的 stale 行直接命中 |
 | 切换 | 两个 batch 之间停下 decode，拷贝完再切 Graph | 只改路由表；回填拷贝按 `backfill_gbps` 分摊到多步，期间继续 decode |
 | 额外开销 | 无每步开销；切换时有停顿，首次用到的级别要现场捕获 | 每个可切换层每步多一次路由核和一次合并核；回填期间两区都占物理页 |
 
-smooth 版的路由由 `elastic_route` 的两个 Triton 核完成（每层一次选择、一次合并），torch 写法 `ElasticKV.reference_select` 是参考。worker 绑定时先在随机表上对比两者，不一致就拒绝启动并提示关掉 `fused_route`。
+decode 热路径上每层的下标计算由 `elastic_route.cuh` 的 CUDA 核完成（按仓库的[开发约定](agent-environment.md)，新的逐层 decode 热路径用 CUDA C++），经固定 SGLang 的 JIT（`load_jit`）编译，每个都替代 `ElasticKV` 里一串小 torch 算子：常驻层的 decode 页表（DSA、C4，两版都用）一次；smooth 版每层的选择、合并、写入行号各一次；shared-index 计划拷贝的请求数一次。torch 写法是参考。worker 绑定时先在设备上用随机表对比两者，不一致就拒绝启动并提示关掉 `fused_route`。
 
 ## decode、prefill 与 PD 准入
 
@@ -123,7 +123,7 @@ controller 只用 CPU 上的标量，rank 0 每次决策只有一次 GPU 归约�
 | 模型 | 可卸载层 | 状态 |
 | --- | --- | --- |
 | MiniMax-M3.1-Flash（BF16 KV，TP8） | HiSparse 主池的全部稀疏层（K、V 各一块组合 buffer）；dense 层与 index 池不变 | 已接入 |
-| GLM-5、GLM-5.1、GLM-5.2-AWQ-INT4（W4A16，BF16 KV） | `GlmMoeDsaForCausalLM` 走 `deepseek_v2` 与 DSA 后端，每层一块 MLA 组合 buffer；indexer 的 K 缓存不变 | 已接入 |
+| GLM-5、GLM-5.1（含量化版）、GLM-5.2-AWQ-INT4（W4A16，BF16 KV） | `GlmMoeDsaForCausalLM` 走 `deepseek_v2` 与 DSA 后端，每层一块 MLA 组合 buffer；indexer 的 K 缓存不变。权重量化不经过 KV 路径；KV 须为 BF16，FP8 KV 会被 launcher 和建池 hook 拒绝 | 已接入 |
 | DeepSeek-V3.2（含 QuantTrio AWQ，61 层） | 同 DSA | 已接入 |
 | DeepSeek-V4-Flash（TP4/TP8） | 21 个 C4 层（第 2、4、…、42 层），每层一块页组合 buffer；SWA、C128、indexer K 与压缩状态池不变 | 已接入 |
 
@@ -146,7 +146,7 @@ DeepSeek-V4 的接入：`DeepSeekV4TokenToKVPool._make_kv_pool` 构造 `HiSparse
 | `compaction`（开；DeepSeek-V4 强制关） | 降上限时把高处的活页搬下来 | 降上限那一刻的 D2D 和一次 `req_to_token` 改写；关掉后只能等高处的请求结束 |
 | `slo_admission`（有 SLO 时开） | 按模型限制准入 | 排队变长，换 TPOT |
 | `throughput_guard`（开） | 多卸一组要换来至少 `min_gain` 的吞吐 | 无；关掉后只要装得下就卸 |
-| `fused_route`（smooth 开） | Triton 路由核 | 无；关掉后每层每步多约二十个小 Graph 节点 |
+| `fused_route`（开） | CUDA 路由核 | 首次绑定时一次 JIT 编译；关掉后常驻层每层每步多十几个小 Graph 节点，smooth 版每层再多二十多个 |
 
 模拟器里 `min_gain` 是吞吐与 TPOT 的主要旋钮：MiniMax、8–32 Ki 输入、到达率 2 和 4 时，0.02 比 0.1 吞吐高 0.4–2.3%，TPOT p50 高 21–28%。默认值偏吞吐；更看重 TPOT 时调大，或者直接给 SLO。
 
@@ -163,12 +163,13 @@ DeepSeek-V4 的接入：`DeepSeekV4TokenToKVPool._make_kv_pool` 构造 `HiSparse
 
 ## 正确性证据（CPU）
 
-Python 3.12 + CPU PyTorch，共 47 项：
+Python 3.12 + CPU PyTorch，共 49 项：
 
 - `runtime.test_elastic_config`（7）、`runtime.test_elastic_memory`（6）、`runtime.test_elastic_policy`（9）、`runtime.test_elastic_sim`（4）：配置规则、chunk 账本与 stale 前缀、代价模型和 controller 的决策（按需卸载、SLO 拦截与准入上限、吞吐保护、回填驻留）、模拟器。
 - `runtime.test_elastic_device`（21）：在 CPU 版 `ElasticMemory`（未映射字节填 0xA5，读到 stale 数据会暴露）上运行真实的 `Runtime` 与 `ElasticKV`，页选择的协调器 hook 装在一个复述原生协调器的类上（槽表、LRU 换入核、`skip_io`、shared-index 的 miss 计划与重放）。每次 attention 读取都与该（请求，层，位置）写入的值比较。DSA 行上覆盖 steady 的 0→1→2→1→0、smooth 的分摊回填与 stale 命中、回填跳过 stale 行、关闭写穿、follower 常驻卸载而 anchor 切换（两版）、PD 直连准入、warm 的两种来源、compaction、`deferred`、钉住级别后交回 controller 自动回填、排队压力触发卸载、steady 预捕获每级 Graph 并恢复显存状态、`Ceiling`、MHA 行拷贝与 MiniMax 按块选择。DeepSeek-V4 用同一套装置换成 C4 页行（第 2、4、6、8 层，每 4 个 token 一条记录，H 为一页 64 条，逻辑分配器包在 SWA 分配器里）：steady 0→1→2→1→0、smooth 分摊回填与 stale 命中、PD 直连准入，每条读取逐字节比较 584 字节的记录；去掉 warm 对保留槽 H 的拷贝时 steady 与 PD 两项会失败。C4 池的 hook 另在复述的固定池类上测：组合 buffer 的构造与原生页数、`data_ptrs`、按层模式的视图和位置翻译、常驻与卸载两种写入、`MQALayer.forward` 的层上下文。另有 launcher 的执行规则与 worker 安装；设置 `SGLANG_SRC` 后，五份示例配置对固定 checkout 的 dry-run 全部通过（摘要、符号签名、调用点）。
+- `runtime.test_elastic_route`（2）：`elastic_route.cuh` 用 clang 的 CUDA 前端按 sm_80 编主机侧和设备侧，`-Wall -Wextra` 无告警（复用 `test_shared_lru_kernel` 里按固定签名写的 SGLang/tvm-ffi 桩）；再把这些核当主机 C++ 编译运行（块内同步处每个 CUDA 线程一个系统线程），在 ratio 1 和 4 的随机表上与 torch 写法逐项比较，覆盖 strided top-k、stale 上界与有物理页的行界、越界与负位置。提交前手工做过一次变异检查：把比较符、块内同步、负位置、闭合 token、合并取值、路由基址等十处分别改坏，这项测试每处都失败。
 
-全量 `python -m unittest discover -s runtime -t .` 为 295 项，在 macOS 上只有 `test_shared_lru_kernel.test_index_key_matches_the_python_statement` 失败：它用主机 C++ 编译器编 `.cuh`，clang 不认 PTX 内联汇编约束，与本次改动无关。
+全量 `python -m unittest discover -s runtime -t .` 为 297 项，在 macOS 上只有 `test_shared_lru_kernel.test_index_key_matches_the_python_statement` 失败：它用主机 C++ 编译器编 `.cuh`，clang 不认 PTX 内联汇编约束，与本次改动无关。
 
 ## 模拟结果（模型，不是测量）
 
@@ -188,7 +189,7 @@ CPU，在仓库根目录：
 
 ```bash
 SGLANG_SRC=/path/to/pinned/sglang python -B -m unittest runtime.test_elastic_config runtime.test_elastic_memory \
-  runtime.test_elastic_policy runtime.test_elastic_sim runtime.test_elastic_device
+  runtime.test_elastic_policy runtime.test_elastic_sim runtime.test_elastic_device runtime.test_elastic_route
 python -B -m runtime.elastic_device --config runtime/fixtures/elastic/minimax_m3_steady.json --sglang-src "$SGLANG_SRC"
 python -B -m runtime.elastic_sim --config runtime/fixtures/elastic/minimax_m3_steady.json --rate 2 --requests 300
 ```
@@ -210,7 +211,7 @@ launcher 拒绝 overlap、Radix、投机解码、PD 的 prefill 侧、`--enable-
 
 按顺序，每一步用新进程：
 
-1. 门禁：`python -m runtime.cuda_elastic_gate --output elastic_gate.json`，单卡。VMM 在卸载、扩容、回填、收缩状态间移动 chunk，保留的行字节不变、新映射的行读到 0；Triton 路由核与 torch 写法在 token、C4（ratio 4）、块选择上逐位一致；`transfer_kv_per_layer(_mla)` 与 torch 下标一致；C4 记录经 `transfer_cache_dsv4_mla`（host 侧走核指针表）的 H2D、D2D、D2H 与 torch 写的页布局逐字节一致。
+1. 门禁：`python -m runtime.cuda_elastic_gate --output elastic_gate.json`，单卡。VMM 在卸载、扩容、回填、收缩状态间移动 chunk，保留的行字节不变、新映射的行读到 0；CUDA 路由核与 torch 写法在 token、C4（ratio 4）、块选择、合并、写入行号、计划拷贝请求数和常驻页表上逐位一致；`transfer_kv_per_layer(_mla)` 与 torch 下标一致；C4 记录经 `transfer_cache_dsv4_mla`（host 侧走核指针表）的 H2D、D2D、D2H 与 torch 写的页布局逐字节一致。
 2. dry-run：对镜像里的 SGLang 跑上面的 dry-run，`status` 必须为 `pass`。
 3. 输出一致性：同一份短请求文件，B=1 贪心解码，elastic server 依次用 `hisparse_elastic_level` 钉在 0、中间级、最高级，与原生 HiSparse server 逐 token 比较；常驻层读的是同一份 KV，预期完全相同。再在 decode 进行中改钉住级别（升和降各一次），输出仍应相同。steady 与 smooth、Graph 与 eager decode 各跑一遍。
 4. 服务性能，对照臂：`full_resident`（不开 HiSparse）、`stock`（原生 HiSparse）、`fixed:k`（elastic 钉在第 k 级，等价于固定名单）、`elastic-steady`、`elastic-smooth`、`vllm-hybrid`。所有臂同模型、同 TP、同 `--mem-fraction-static`（或 vLLM 的同等显存预算）、同 `max_running_requests`、同 HiSparse `top_k` 与 `device_buffer_size`，decode 都开 CUDA Graph。
@@ -231,7 +232,8 @@ launcher 拒绝 overlap、Radix、投机解码、PD 的 prefill 侧、`--enable-
 - 每层每张量的区域按 2 MiB chunk 取整，最多浪费约一个 chunk；DeepSeek-V4 的页行与 chunk 对不齐，每层约多占一个 chunk（见“显存布局”）。
 - steady 版首次用到的级别要现场捕获 Graph，那一次切换会慢；`precapture_levels: "all"` 在启动时全部捕获，启动时间随级别数增加。
 - smooth 版回填期间返回的层两区都占物理页，所以回填要等需求降到这个状态放得下。
-- smooth 版的路由核用 Triton 写；issue 提到的 TileLang 或手写 CUDA 版本没有做。steady 版只调用原生核。
+- CUDA 路由核在 CPU 上只做过两件事：clang 的 CUDA 前端按 sm_80 做语法与类型检查，以及把核当主机 C++ 编译运行、与 torch 写法逐项对照；nvcc 构建和 GPU 上的运行都待实机。
+- smooth 版每层仍是三次 launch（选择、原生换入、合并）。把选择与合并并进原生换入核可以降到一次（issue #11 的路由核就是这样改原生核的），这里没有做；TileLang 版本也没有做。
 - 按请求的混合驻留没有实现。
 
 ## pending_hardware

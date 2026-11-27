@@ -4,7 +4,8 @@
 
 1. CUDA VMM: an ElasticMemory over the pinned SGLang VMM helpers moves chunks between buffers through offload,
    grow, backfill and shrink states; rows that stay mapped keep their bytes, newly mapped rows read zero.
-2. The fused smooth route (Triton) against its torch statement, token and block selection, both modes.
+2. The CUDA route kernels (elastic_route.cuh, built by the pinned SGLang JIT) against their torch statements: token,
+   C4 (ratio 4) and block selection, merge, store rows, planned-copy gate and resident page tables, both modes.
 3. Host transfers of ElasticKV (sgl_kernel transfer_kv_per_layer / _mla) against torch indexing, and DeepSeek-V4
    C4 records (transfer_cache_dsv4_mla) against the torch statement of the C4 page layout.
 Prints one JSON receipt and exits non-zero when a check fails.

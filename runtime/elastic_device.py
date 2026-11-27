@@ -6,12 +6,13 @@ hot region (the stock device rows) and a resident region (one row per logical lo
 the bytes stock would have allocated backs whichever regions the current offload level needs. Logical capacity is
 an allocator ceiling that grows as layers leave the GPU and shrinks (after compaction) when they return.
 
-* resident layer: stores and reads go to its logical rows, like the stock non-HiSparse path; no swap-in.
+* resident layer: stores and reads go to its logical rows, like the stock non-HiSparse path; no swap-in (DSA and
+  C4 page tables come from one kernel of ``elastic_route``).
 * offloaded layer: the stock HiSparse path over its hot rows.
 * steady mode: one decode CUDA Graph set per level (captured at start-up or on first use); a transition runs
   between batches, stops decode, copies, and selects another set.
-* smooth mode: one graph set; every managed layer selects through its row of a device route table (the fused
-  Triton route of ``elastic_route``, or its torch statement) around the stock swap-in, so a transition only
+* smooth mode: one graph set; every managed layer selects through its row of a device route table (the CUDA route
+  kernels of ``elastic_route``, or their torch statements) around the stock swap-in, so a transition only
   rewrites the table; backfill copies are paced across steps and offloaded layers keep hitting stale rows.
 
 Every managed layer writes its decode tokens through to host whichever mode wrote them, so offloading moves no
@@ -776,13 +777,13 @@ def _view(layer, part):
     return views["resident"] if rt.layer_mode(layer) == ekv.RESIDENT else views["hot"]
 
 
-def _store_target(layer, raw, mapping):
+def _store_target(layer, raw):
     """(rows, view name) of a store into ``layer``, or None for the stock offloaded path."""
     rt = _runtime()
     if rt is None:
         return None
     if rt.mode == "smooth" and rt.decoding and layer in rt.cfg.managed:
-        return rt.kv.store_rows(rt.kv.index[layer], raw, mapping[raw]), "full"
+        return rt.kv.store_rows(rt.kv.index[layer], raw), "full"
     if rt.layer_mode(layer) == ekv.RESIDENT:
         return raw, "resident"
     return None
@@ -841,7 +842,7 @@ def _minimax_pool(state, torch):
         if layer_id not in state.get("eligible", ()):
             return originals["set_kv_buffer"](self, layer, loc, cache_k, cache_v, k_scale, v_scale)
         raw, _, _ = memory_mod.unwrap_write_loc(loc)
-        target = _store_target(layer_id, raw, main.full_to_hisparse_device_index_mapping)
+        target = _store_target(layer_id, raw)
         if target is None:
             return originals["set_kv_buffer"](self, layer, loc, cache_k, cache_v, k_scale, v_scale)
         rows, view = target
@@ -950,7 +951,7 @@ def _dsa_pool(state, torch):
 
     def set_mla_kv_buffer(self, layer, loc_info, cache_k_nope, cache_k_rope):
         raw, _, _ = memory_mod.unwrap_write_loc(loc_info)
-        target = _store_target(layer.layer_id, raw, self.full_to_hisparse_device_index_mapping)
+        target = _store_target(layer.layer_id, raw)
         if target is None:
             return originals["set_mla_kv_buffer"](self, layer, loc_info, cache_k_nope, cache_k_rope)
         rows, view = target
@@ -1052,8 +1053,7 @@ def _dsv4_pool(state, torch):
             if self is not state.get("pool") or layer not in state.get("eligible", ()):
                 return originals[name](self, compressed_indices)
             if rt.mode == "smooth" and rt.decoding and layer in rt.cfg.managed:
-                rows = rt.kv.store_rows(rt.kv.index[layer], compressed_indices,
-                                        self.full_to_hisparse_device_index_mapping[compressed_indices])
+                rows = rt.kv.store_rows(rt.kv.index[layer], compressed_indices)
             elif rt.layer_mode(layer) == ekv.RESIDENT:
                 rows = compressed_indices
             else:
@@ -1066,7 +1066,7 @@ def _dsv4_pool(state, torch):
             if self is not state.get("pool"):
                 return originals[name](self, layer_id, loc, *args, **kwargs)
             layer = state["eligible"][layer_id]
-            target = _store_target(layer, loc, self.full_to_hisparse_device_index_mapping)
+            target = _store_target(layer, loc)
             if target is None:
                 return originals[name](self, layer_id, loc, *args, **kwargs)
             rows, view = target
@@ -1108,7 +1108,7 @@ ANCHOR_COPY_BLOCKS = 32     # grid of a smooth anchor's own planned copy (on the
 def _planned_copy(module, c, kv, i, num_reqs, blocks):
     """Replay the anchor's miss plan into pool layer i only while i is offloaded: the request count the kernel
     reads is ``num_real_reqs`` gated by the route table on the device, so one captured graph serves both modes."""
-    gate = c.num_real_reqs * (kv.route[i, 0:1] == ekv.OFFLOADED).to(c.num_real_reqs.dtype)
+    gate = kv.gate(i, c.num_real_reqs)
     module.copy_cache_planned_mla(miss_src=c._miss_src[:num_reqs], miss_dst=c._miss_dst[:num_reqs],
                                   miss_count=c._miss_count[:num_reqs], num_real_reqs=gate,
                                   host_cache=c.mem_pool_host.kv_buffer[i], device_buffer=c.mem_pool_device.kv_buffer[i],
@@ -1380,7 +1380,8 @@ def _bind(state, c, *, torch, dist, module):
             rows = (ekv.MLALayers if cfg.model == "dsa" else ekv.C4Layers)(torch, full, c.mem_pool_host)
         return ekv.ElasticKV(rows, c, layers=eligible, managed=bound.managed, hot_offset=offsets,
                              offloaded=bound.offloaded(rt.level), torch=torch, device=torch.device(c.device),
-                             ratio=c.compress_ratio, owner=owner, through=bound.feature("write_through"))
+                             ratio=c.compress_ratio, owner=owner, through=bound.feature("write_through"),
+                             mapping=c.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping)
 
     def compaction_buffers(rt):
         inactive = set(rt.cfg.offloaded(rt.level)) - set(rt._filling())
@@ -1390,13 +1391,15 @@ def _bind(state, c, *, torch, dist, module):
     state.update(config=bound, max_running=c.req_to_token_pool.req_to_token.shape[0] - 1, make_kv=make_kv,
                  compaction_buffers=compaction_buffers, repo_root=REPO_ROOT, signature=signature)
     state["runtime"] = rt = Runtime(state, c, torch=torch, dist=dist)
-    if bound.mode == "smooth" and bound.feature("fused_route") and torch.cuda.is_available():
+    # The route kernels serve smooth selection, merge and stores, and the resident page tables of DSA and C4.
+    if bound.feature("fused_route") and torch.cuda.is_available() and (bound.mode == "smooth"
+                                                                       or cfg.model != "minimax_m3"):
         from . import elastic_route
         checks = [elastic_route.self_check(torch, rt.kv.device, ratio=c.compress_ratio)]
         if cfg.model == "minimax_m3":
             checks.append(elastic_route.self_check(torch, rt.kv.device, block=128))
         if not all(checks):
-            raise RuntimeError("the fused smooth route disagrees with its torch statement on this device; "
+            raise RuntimeError("the CUDA route kernels disagree with their torch statements on this device; "
                                "set features.fused_route to false")
         rt.kv.fused = elastic_route
     dict(minimax_m3=_minimax_backend, dsa=_dsa_backend, deepseek_v4=_dsv4_backend)[cfg.model](state, torch)

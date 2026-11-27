@@ -269,7 +269,8 @@ class Rig:
             rows = self._kv_rows([views[(layer, self.part)]["full"] for layer in self.layers])
             return ekv.ElasticKV(rows, c, layers=self.layers, managed=cfg.managed, hot_offset=offsets,
                                  offloaded=cfg.offloaded(rt.level), torch=torch, device=torch.device("cpu"),
-                                 ratio=self.r, owner=owner, through=cfg.feature("write_through"))
+                                 ratio=self.r, owner=owner, through=cfg.feature("write_through"),
+                                 mapping=c.mem_pool_device.full_to_hisparse_device_index_mapping)
 
         def compaction_buffers(rt):
             inactive = set(rt.cfg.offloaded(rt.level)) - set(rt._filling())
@@ -309,7 +310,7 @@ class Rig:
         """What the store hooks do with record locations ``locs``: resident or route rows, else the stock mapping
         to hot rows."""
         rows = self._rows(self.uid[slot], layer, positions)
-        target = dev._store_target(layer, locs, self.mapping)
+        target = dev._store_target(layer, locs)
         if target is None:
             self._write(self.views[(layer, self.part)]["hot"], self.mapping[locs], rows)
         else:
@@ -889,7 +890,7 @@ class C4PoolHookTests(unittest.TestCase):
         rt = dev.Runtime.__new__(dev.Runtime)          # level 1 offloads layer 1; layers 3 and 4 stay resident
         rt.cfg = make_config("steady", [[1], [3]], model="deepseek_v4").resolve((1, 3, 4))
         rt.mode, rt.level, rt.capture_level, rt.layer, rt.decoding = "steady", 1, None, None, False
-        rt.kv = types.SimpleNamespace(index={1: 0, 3: 1, 4: 2}, store_rows=lambda i, loc, hot: loc + 1000 * (i + 1))
+        rt.kv = types.SimpleNamespace(index={1: 0, 3: 1, 4: 2}, store_rows=lambda i, loc: loc + 1000 * (i + 1))
         state["runtime"] = rt
         mapping = torch.zeros(tokens.c4_logical_size + C4_PAGE + 1, dtype=torch.int64)
         mapping[70] = 130

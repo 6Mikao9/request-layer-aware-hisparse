@@ -139,19 +139,20 @@ class ElasticKV:
     is the first resident row of layer i's combined buffer, ``managed`` the model layers the config may offload,
     ``owner`` maps a pool index to the pool index whose swap table it uses (DSA shared-index followers ->
     anchor). ``through`` is ``features.write_through``: without it resident layers skip the per-step host copy
-    and an offload flushes their whole history instead.
+    and an offload flushes their whole history instead. ``mapping`` is the allocator's logical-to-hot location
+    table (smooth stores of offloaded layers).
     """
 
     def __init__(self, rows, coordinator, *, layers, managed, hot_offset, offloaded, torch, device, ratio=1,
-                 owner=None, through=True):
+                 owner=None, through=True, mapping=None):
         self.rows, self.c, self.torch, self.device, self.ratio = rows, coordinator, torch, device, ratio
         self.layers = tuple(layers)                           # model layer id of each pool index
         self.index = {layer: i for i, layer in enumerate(self.layers)}
         self.managed = frozenset(self.index[layer] for layer in managed)
         self.hot_offset = list(hot_offset)
         self.owner = dict(owner or {})
-        self.through = through
-        self.fused = None                    # runtime.elastic_route once a worker bound the fused smooth route
+        self.through, self.mapping = through, mapping
+        self.fused = None                    # runtime.elastic_route once a worker bound the route kernels
         self.fills = []                      # PD admissions still copying host -> resident rows: (event, req)
         n, slots = len(self.layers), coordinator.req_to_token_pool.req_to_token.shape[0]
         self.mode = [OFFLOADED if layer in offloaded else RESIDENT for layer in self.layers]
@@ -295,7 +296,10 @@ class ElasticKV:
     def resident_page_table(self, req_pool_indices, top_k, seq_lens=None, offset=0):
         """Decode page table of a resident layer (graph-safe): the logical rows of the selected records (+
         ``offset``, the resident region start in the combined buffer), -1 for padded selections and, when
-        ``seq_lens`` (records) is given, for selections past a request's length."""
+        ``seq_lens`` (records) is given, for selections past a request's length. One kernel of ``fused`` when
+        bound."""
+        if self.fused is not None and seq_lens is not None:
+            return self.fused.resident(self, req_pool_indices, top_k, seq_lens, offset)
         t, r = self.torch, self.ratio
         req_to_token = self.c.req_to_token_pool.req_to_token
         safe = top_k.long().clamp(min=0, max=req_to_token.shape[1] // r - 1)
@@ -439,12 +443,22 @@ class ElasticKV:
         for i, m in enumerate(self.mode):
             self.route[i, 2] = int(rows_by_index.get(i, 0)) if m == OFFLOADED else 0
 
-    def store_rows(self, i, loc, hot_loc):
-        """Smooth mode decode store rows of layer i (graph-safe): the device-buffer row when offloaded, else
-        hot_offset + logical location; a negative location (a C4 token that closes no record) stays negative."""
+    def store_rows(self, i, loc):
+        """Smooth mode decode store rows of layer i (graph-safe): the device-buffer row (``mapping``) when
+        offloaded, else hot_offset + logical location; a negative location (a C4 token that closes no record)
+        stays negative. One kernel of ``fused`` when bound."""
+        if self.fused is not None:
+            return self.fused.store_rows(self, i, loc)
         t = self.torch
-        rows = t.where(self.route[i, 0] == OFFLOADED, hot_loc, loc + self.route[i, 1])
+        rows = t.where(self.route[i, 0] == OFFLOADED, self.mapping[loc], loc + self.route[i, 1])
         return t.where(loc < 0, loc, rows)
+
+    def gate(self, i, num_real_reqs):
+        """Request count a planned copy into layer i replays (graph-safe): ``num_real_reqs`` while the layer is
+        offloaded, else 0. One kernel of ``fused`` when bound."""
+        if self.fused is not None:
+            return self.fused.gate(self, i, num_real_reqs)
+        return num_real_reqs * (self.route[i, 0:1] == OFFLOADED).to(num_real_reqs.dtype)
 
     def record_bytes(self):
         """Bytes one record of one layer moves (pacing of smooth backfill)."""
@@ -455,7 +469,7 @@ class ElasticKV:
         reads). Selected records the layer reads from its resident region -- all of them in resident mode,
         the still-valid stale ones in offloaded mode -- become -1 for the stock kernel and resolve to
         hot_offset + logical row instead. ``block`` is MiniMax's sparse block size (selection by block ids).
-        Runs the fused kernels of ``elastic_route`` once a worker bound them (``fused``)."""
+        Runs the kernels of ``elastic_route`` once a worker bound them (``fused``)."""
         if self.fused is not None:
             return self.fused.select(self, i, req_pool_indices, seq_lens, top_k, block=block)
         return self.reference_select(i, req_pool_indices, seq_lens, top_k, block=block)

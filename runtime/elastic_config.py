@@ -35,7 +35,7 @@ FEATURES = {
     "compaction": True,      # live pages above a shrink ceiling move down instead of blocking the shrink
     "slo_admission": True,   # with an SLO, cap the running batch at the largest size the model predicts fits
     "throughput_guard": True,  # offload another group only if the model expects more decode tokens per second
-    "fused_route": True,     # smooth: the Triton route kernels (elastic_route) instead of the torch statement
+    "fused_route": True,     # the CUDA route kernels (elastic_route.cuh) instead of their torch statements
 }
 _TOP = {"schema", "model", "mode", "layers", "slo", "profile", "controller", "memory", "features"}
 _LAYERS = {"eviction_order", "always_offload", "granularity", "pinned_resident"}
@@ -281,7 +281,6 @@ def parse(data):
     features = {**FEATURES, **raw}
     if mode == "steady":
         features["stale_hits"] = False   # the stock kernels of the steady sets have no stale-row path
-        features["fused_route"] = False  # steady graphs call the stock kernels only
     if model == "deepseek_v4":           # a moved page would also move its SWA, C128 and indexer-K entries
         features["compaction"] = False
     if slo is None:
