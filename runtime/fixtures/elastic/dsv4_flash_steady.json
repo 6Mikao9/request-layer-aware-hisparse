@@ -1,0 +1,23 @@
+{
+ "schema": "hisparse-elastic-v1",
+ "model": "deepseek_v4",
+ "mode": "steady",
+ "layers": {
+  "eviction_order": [
+   [36, 42, 28, 4],
+   [30, 6, 8, 18],
+   [10, 12, 2, 32],
+   [20, 26, 22, 38]
+  ],
+  "always_offload": []
+ },
+ "profile": {
+  "measurements": "data/a100-hisparse-graph-and-c4-20261124.json",
+  "bytes_per_miss": 584,
+  "selected_rows": 512
+ },
+ "controller": {
+  "interval_steps": 16,
+  "dwell_steps": 2048
+ }
+}

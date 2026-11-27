@@ -1,0 +1,27 @@
+{
+ "schema": "hisparse-elastic-v1",
+ "model": "minimax_m3",
+ "mode": "steady",
+ "layers": {
+  "eviction_order": [
+   [2, 1, 58, 15, 0, 51, 18, 7],
+   [47, 13, 17, 6, 3, 9, 48, 43],
+   [45, 10, 5, 8, 59, 11, 12, 50],
+   [39, 41, 38, 57, 14, 16, 36, 44],
+   [40, 4, 24, 19, 34, 21, 49, 46],
+   [52, 32, 42, 55, 20, 30, 31, 37]
+  ],
+  "always_offload": []
+ },
+ "profile": {
+  "measurements": "data/a100-hisparse-graph-and-c4-20261124.json"
+ },
+ "controller": {
+  "interval_steps": 16,
+  "dwell_steps": 2048,
+  "horizon_steps": 64
+ },
+ "memory": {
+  "precapture_levels": "all"
+ }
+}

@@ -1,0 +1,19 @@
+{
+ "schema": "hisparse-elastic-v1",
+ "model": "dsa",
+ "mode": "smooth",
+ "layers": {
+  "eviction_order": "by_miss_rate",
+  "granularity": 3,
+  "always_offload": "shared_index_followers"
+ },
+ "profile": {
+  "bytes_per_miss": 1152,
+  "selected_rows": 2048,
+  "exposed": {}
+ },
+ "controller": {
+  "interval_steps": 8,
+  "dwell_steps": 512
+ }
+}
