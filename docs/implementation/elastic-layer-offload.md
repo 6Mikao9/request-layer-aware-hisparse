@@ -213,7 +213,7 @@ launcher 拒绝 overlap、Radix、投机解码、PD 的 prefill 侧、`--enable-
 4. 服务性能，对照臂：`full_resident`（不开 HiSparse）、`stock`（原生 HiSparse）、`fixed:k`（elastic 钉在第 k 级，等价于固定名单）、`elastic-steady`、`elastic-smooth`、`vllm-hybrid`。所有臂同模型、同 TP、同 `--mem-fraction-static`（或 vLLM 的同等显存预算）、同 `max_running_requests`、同 HiSparse `top_k` 与 `device_buffer_size`，decode 都开 CUDA Graph。
    - 负载：固定种子的请求文件；泊松到达率扫低、中、过载三档；输入分 8–16 Ki、16–32 Ki、32–64 Ki 三档，输出 256–1024；再加一组开关式突发（30 s 高、30 s 低循环），专门考察切换。
    - PD：按 issue 评论的虚拟 PD，单机 8 × A100 先以 prefill 实例生成 KV 存 SSD，再把同一台机器切成 decode 实例导入，decode 侧用 `--disaggregation-mode decode`。
-   - 指标：TPOT p50/p95/p99，TTFT p50/p95，输出 token/s，TTFT 与 TPOT 双 SLO 下的 goodput，decode 日志里的实际 `#running-req`，retract 次数，级别随时间的曲线和每次切换的耗时（收据），PCIe H2D 带宽（`nvidia-smi dmon` 或 Nsight），每卡峰值显存。
+   - 指标：TPOT p50/p95/p99，TTFT p50/p95，输出 token/s，TTFT 与 TPOT 双 SLO 下的 goodput（同时满足两项 SLO 的请求速率，即 [DistServe](https://www.usenix.org/conference/osdi24/presentation/zhong-yinmin)（OSDI'24）的口径；另报在 SLO 达成率 90% 时可承受的最大到达率），decode 日志里的实际 `#running-req`，retract 次数，级别随时间的曲线和每次切换的耗时（收据），PCIe H2D 带宽（`nvidia-smi dmon` 或 Nsight），每卡峰值显存。
    - 重复：每个配置 AB/BA 交错三次，报均值与 95% 区间。
 5. Nsight Systems：steady 与 smooth 各一段包含一次卸载和一次回填的全 rank 时间线，看停顿、拷贝与 decode 的重叠，以及 smooth 版每层路由核的耗时。
 
@@ -227,6 +227,7 @@ launcher 拒绝 overlap、Radix、投机解码、PD 的 prefill 侧、`--enable-
 - 每层每张量的区域按 2 MiB chunk 取整，最多浪费约一个 chunk。
 - steady 版首次用到的级别要现场捕获 Graph，那一次切换会慢；`precapture_levels: "all"` 在启动时全部捕获，启动时间随级别数增加。
 - smooth 版回填期间返回的层两区都占物理页，所以回填要等需求降到这个状态放得下。
+- smooth 版的路由核用 Triton 写；issue 提到的 TileLang 或手写 CUDA 版本没有做。steady 版只调用原生核。
 - 按请求的混合驻留没有实现。
 
 ## pending_hardware
