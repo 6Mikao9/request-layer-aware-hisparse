@@ -172,9 +172,10 @@ def check_offload_execution(argv, study_config):
                          "--cuda-graph-config prefill backend 'disabled'")
 
 
-def check_elastic_execution(argv):
+def check_elastic_execution(argv, model):
     """Elastic per-layer HiSparse (issue #13): single-stream decode, eager prefill (its stores follow the layer
-    modes of the moment), BF16 KV; PD decode nodes are allowed, prefill nodes run stock SGLang."""
+    modes of the moment), BF16 KV for MiniMax and DSA (DeepSeek-V4 keeps its V4 C4 pages); PD decode nodes are
+    allowed, prefill nodes run stock SGLang."""
     flags = {arg.partition("=")[0] for arg in argv}
     forbidden = {"--config", "--enable-two-batch-overlap", "--enable-single-batch-overlap", "--enable-pdmux",
                  "--enable-mixed-chunk"}
@@ -184,8 +185,8 @@ def check_elastic_execution(argv):
     if (flag_value(argv, "--disaggregation-mode") not in (None, "null", "decode")
             or flag_value(argv, "--speculative-algorithm") not in (None, "NONE")):
         raise ValueError("Elastic layers run on a normal or PD decode node without speculation")
-    if flag_value(argv, "--kv-cache-dtype") not in (None, "auto", "bf16", "bfloat16"):
-        raise ValueError("Elastic layers store unquantized BF16 KV")
+    if model != "deepseek_v4" and flag_value(argv, "--kv-cache-dtype") not in (None, "auto", "bf16", "bfloat16"):
+        raise ValueError("Elastic MiniMax and DSA layers store unquantized BF16 KV")
     raw_graph = flag_value(argv, "--cuda-graph-config")
     graph = parse_object(raw_graph) if raw_graph is not None else {}
     decode, prefill = graph.get("decode", {}), graph.get("prefill", {})
@@ -348,7 +349,7 @@ def resolve(argv):
         if elastic_path is not None:
             from .elastic_config import read as read_elastic_config
             elastic_config, elastic_digest = read_elastic_config(elastic_path)
-            check_elastic_execution(sglang_argv)
+            check_elastic_execution(sglang_argv, elastic_config.model)
         if options.six_layer_timing:
             required = {"--disable-cuda-graph", "--disable-prefill-cuda-graph",
                         "--disable-overlap-schedule", "--disable-radix-cache"}

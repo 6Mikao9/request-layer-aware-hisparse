@@ -5,7 +5,8 @@
 1. CUDA VMM: an ElasticMemory over the pinned SGLang VMM helpers moves chunks between buffers through offload,
    grow, backfill and shrink states; rows that stay mapped keep their bytes, newly mapped rows read zero.
 2. The fused smooth route (Triton) against its torch statement, token and block selection, both modes.
-3. Host transfers of ElasticKV (sgl_kernel transfer_kv_per_layer / _mla) against torch indexing.
+3. Host transfers of ElasticKV (sgl_kernel transfer_kv_per_layer / _mla) against torch indexing, and DeepSeek-V4
+   C4 records (transfer_cache_dsv4_mla) against the torch statement of the C4 page layout.
 Prints one JSON receipt and exits non-zero when a check fails.
 """
 import argparse
@@ -73,7 +74,28 @@ def transfer_check(torch):
         torch.cuda.synchronize()
         ok &= torch.equal(k[1][dst + 1].cpu(), host_k[1][src.cpu()])
         ok &= torch.equal(host_k[1][(src + 100).cpu()], host_k[1][src.cpu()])
-    return dict(ok=bool(ok))
+    return dict(tokens=bool(ok), c4=c4_transfer_check(torch))
+
+
+def c4_transfer_check(torch):
+    """DeepSeek-V4 C4 records through transfer_cache_dsv4_mla (host side by its kernel pointer table) against the
+    torch statement of the page layout (64 records of 576 value bytes, then their 8-byte scales, per page)."""
+    from . import elastic_kv as ekv
+    d, row = torch.device("cuda"), 37_440
+    torch.manual_seed(0)
+    host = [torch.randint(0, 256, (4, row), dtype=torch.uint8).pin_memory() for _ in range(2)]
+    pages = [torch.randint(0, 256, (8, row), dtype=torch.uint8, device=d) for _ in range(2)]
+    table = torch.tensor([h.data_ptr() for h in host], dtype=torch.uint64, device=d)
+    gpu = ekv.C4Layers(torch, pages, type("Host", (), dict(kv_buffer=host, data_ptrs=table))())
+    cpu = ekv.C4Layers(torch, [p.cpu() for p in pages], type("Host", (), dict(kv_buffer=[h.clone() for h in host]))())
+    for rows, device in ((cpu, "cpu"), (gpu, d)):
+        src, dst = torch.tensor([3, 70, 129], device=device), torch.tensor([200, 5, 511], device=device)
+        rows.h2d(1, src, dst)
+        rows.d2d(1, dst, dst - 1)
+        rows.d2h(1, dst - 1, src + 100)
+    torch.cuda.synchronize()
+    return all(torch.equal(g.cpu(), c) for g, c in zip(pages, cpu.pages)) and \
+        all(torch.equal(g, c) for g, c in zip(host, cpu.host.kv_buffer))
 
 
 def main(argv=None):
@@ -86,7 +108,7 @@ def main(argv=None):
     receipt = dict(event="hisparse_elastic_gate", device=torch.cuda.get_device_name(),
                    capability=list(torch.cuda.get_device_capability()), torch=torch.__version__,
                    vmm=vmm_check(torch), route=route_check(torch), transfer=transfer_check(torch))
-    passed = receipt["vmm"]["ok"] and all(receipt["route"].values()) and receipt["transfer"]["ok"]
+    passed = receipt["vmm"]["ok"] and all(receipt["route"].values()) and all(receipt["transfer"].values())
     receipt["status"] = "pass" if passed else "fail"
     options.output.write_text(json.dumps(receipt, indent=2, sort_keys=True))
     print(json.dumps(receipt, sort_keys=True))

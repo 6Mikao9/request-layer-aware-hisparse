@@ -92,6 +92,7 @@ class C4Layers:
 
     def __init__(self, torch, pages, host):
         self.torch, self.pages, self.host = torch, list(pages), host
+        self.ptrs = {}                       # data pointer -> one-element device tensor for the copy kernel
 
     def _parts(self, buffer):
         pages = buffer.view(-1, buffer.shape[-1])
@@ -99,13 +100,22 @@ class C4Layers:
         return (pages[:, :cut].unflatten(1, (self.PAGE, self.VALUE)),
                 pages[:, cut:cut + self.PAGE * self.SCALE].unflatten(1, (self.PAGE, self.SCALE)))
 
-    def _copy(self, source, src, target, dst, src_ptr=None, dst_ptr=None):
+    def _ptr(self, tensor, device, table=None, index=None):
+        """One-element pointer tensor of a buffer for the copy kernel: the host pool's kernel pointer table entry
+        when it has one (pinned host memory), else the raw data pointer."""
+        if table is not None:
+            return table[index:index + 1]
+        key = tensor.data_ptr()
+        if key not in self.ptrs:
+            self.ptrs[key] = self.torch.tensor([key], dtype=self.torch.uint64, device=device)
+        return self.ptrs[key]
+
+    def _copy(self, source, src, target, dst, src_table=None, dst_table=None, i=None):
         if source.is_cuda or target.is_cuda:
             from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
-            t = self.torch
-            ptr = lambda x: t.tensor([x.data_ptr()], dtype=t.uint64, device=src.device)
-            transfer_cache_dsv4_mla(ptr(source) if src_ptr is None else src_ptr,
-                                    ptr(target) if dst_ptr is None else dst_ptr, src.long(), dst.long())
+            device = src.device
+            transfer_cache_dsv4_mla(self._ptr(source, device, src_table, i), self._ptr(target, device, dst_table, i),
+                                    src.long(), dst.long())
             return
         for part_s, part_t in zip(self._parts(source), self._parts(target)):
             part_t[dst // self.PAGE, dst % self.PAGE] = part_s[src // self.PAGE, src % self.PAGE]
@@ -114,10 +124,12 @@ class C4Layers:
         self._copy(self.pages[i], src, self.pages[i], dst)
 
     def d2h(self, i, src, host_rows):
-        self._copy(self.pages[i], src, self.host.kv_buffer[i], host_rows)
+        self._copy(self.pages[i], src, self.host.kv_buffer[i], host_rows,
+                   dst_table=getattr(self.host, "data_ptrs", None), i=i)
 
     def h2d(self, i, host_rows, dst):
-        self._copy(self.host.kv_buffer[i], host_rows, self.pages[i], dst)
+        self._copy(self.host.kv_buffer[i], host_rows, self.pages[i], dst,
+                   src_table=getattr(self.host, "data_ptrs", None), i=i)
 
 
 class ElasticKV:
@@ -280,12 +292,18 @@ class ElasticKV:
             if m == OFFLOADED:
                 self.rows.h2d(i, host_rows.long(), device_rows.long())
 
-    def resident_page_table(self, req_pool_indices, top_k, offset=0):
-        """DSA decode of a resident layer (graph-safe): the logical rows of the selected positions (+ ``offset``,
-        the resident region start in the combined buffer), -1 for padded selections."""
-        t = self.torch
-        rows = self.c.req_to_token_pool.req_to_token[req_pool_indices.long()[:, None], top_k.long().clamp(min=0)]
-        return t.where(top_k >= 0, rows.long() + offset, -1).to(t.int32)
+    def resident_page_table(self, req_pool_indices, top_k, seq_lens=None, offset=0):
+        """Decode page table of a resident layer (graph-safe): the logical rows of the selected records (+
+        ``offset``, the resident region start in the combined buffer), -1 for padded selections and, when
+        ``seq_lens`` (records) is given, for selections past a request's length."""
+        t, r = self.torch, self.ratio
+        req_to_token = self.c.req_to_token_pool.req_to_token
+        safe = top_k.long().clamp(min=0, max=req_to_token.shape[1] // r - 1)
+        rows = req_to_token[req_pool_indices.long()[:, None], (safe + 1) * r - 1].long() // r
+        valid = top_k >= 0
+        if seq_lens is not None:
+            valid &= top_k.long() < seq_lens.long()[:, None]
+        return t.where(valid, rows + offset, -1).to(t.int32)
 
     # ---- transitions -------------------------------------------------------------------------------------
     def _requests(self):
@@ -295,11 +313,13 @@ class ElasticKV:
 
     def warm(self, indices, source="device", long_hits=True):
         """Hot rows of newly offloaded layers get what their swap table lists: every hot slot holding position
-        p < n of a live request receives record p, from the resident rows (``source="device"``) or from host
-        (when those rows already lost their chunks; the caller flushed the newest records first). Tables stay
-        as they are: alloc_device_buffer leaves positions 0..H-1 (all-miss for PD requests longer than H) and an
-        earlier offloaded period leaves its LRU state, both consistent with the rows copied here. With
-        ``long_hits`` off, a layer owning its table restarts requests longer than H all-miss (no copy)."""
+        p < n of a live request receives record p, and the reserved slot H of a request longer than H its newest
+        record (the swap-in kernel reads it there until the next record closes, up to 3 steps later for C4).
+        Copies come from the resident rows (``source="device"``) or from host (when those rows already lost
+        their chunks; the caller flushed the newest records first). Tables stay as they are: alloc_device_buffer
+        leaves positions 0..H-1 (all-miss for PD requests longer than H) and an earlier offloaded period leaves
+        its LRU state, both consistent with the rows copied here. With ``long_hits`` off, a layer owning its table
+        restarts requests longer than H all-miss (only the newest record is copied)."""
         c, t, moved = self.c, self.torch, 0
         hot_slots = c.device_buffer_size
         for slot, n, _ in self._requests():
@@ -308,9 +328,9 @@ class ElasticKV:
                 if not long_hits and o == i and n > hot_slots:
                     c.req_device_buffer_tokens[i, slot, :hot_slots] = -1
                     c.lru_slots[i, slot] = t.arange(hot_slots, dtype=c.lru_slots.dtype, device=self.device)
-                    continue
-                pos = c.req_device_buffer_tokens[o, slot, :hot_slots].long()
-                dst = c.req_device_buffer_token_locs[o, slot, :hot_slots].long()
+                pos = t.cat((c.req_device_buffer_tokens[o, slot, :hot_slots].long(),
+                             self._long([n - 1 if n > hot_slots else -1])))
+                dst = c.req_device_buffer_token_locs[o, slot, :hot_slots + 1].long()
                 keep = (pos >= 0) & (pos < n) & (dst > 0)
                 pos, dst = pos[keep], dst[keep]
                 if not pos.numel():
@@ -421,9 +441,10 @@ class ElasticKV:
 
     def store_rows(self, i, loc, hot_loc):
         """Smooth mode decode store rows of layer i (graph-safe): the device-buffer row when offloaded, else
-        hot_offset + logical location."""
+        hot_offset + logical location; a negative location (a C4 token that closes no record) stays negative."""
         t = self.torch
-        return t.where(self.route[i, 0] == OFFLOADED, hot_loc, loc + self.route[i, 1])
+        rows = t.where(self.route[i, 0] == OFFLOADED, hot_loc, loc + self.route[i, 1])
+        return t.where(loc < 0, loc, rows)
 
     def record_bytes(self):
         """Bytes one record of one layer moves (pacing of smooth backfill)."""

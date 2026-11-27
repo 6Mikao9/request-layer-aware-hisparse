@@ -82,6 +82,7 @@
     "srt/disaggregation/decode.py": "193d65a0cd524759b4aefd653c70ee1b5c23d5f218a5c80dd167178de686525b",
     "srt/utils/cuda_vmm_utils.py": "8d3dd9358c22cb2a5e84292e28c3211756a3df3667b217f3c217ea6c85058c34",
     "srt/mem_cache/allocator/paged.py": "c72f28d9c5b953a05fcc0a0451307ecdbfbfb756eca3f0073f7be3eb737d38f6",
+    "srt/mem_cache/allocator/swa.py": "57e6e797556d8e6d696a9343de3fe2f447ab3ae473b7588b025e59d555a63665",
     "srt/mem_cache/index_key_cache.py": "befd54ba5e58f4426f4457a850bea75fc90e2a3b0e8062329ca7729b40b70f65",
     "srt/mem_cache/pool_host/mla.py": "703bb41354183e6f9acf0cfbbf7f68f4f7329b2755f73d4d67be37a82972861f"
   }

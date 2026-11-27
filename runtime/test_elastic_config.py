@@ -57,6 +57,8 @@ class ParseTests(unittest.TestCase):
         smooth = ec.parse(dict(base(), mode="smooth", slo={"tpot_ms": 50}))
         self.assertTrue(smooth.feature("stale_hits") and smooth.feature("slo_admission"))
         self.assertEqual(smooth.slo, {"tpot_ms": 50.0, "tail_factor": 1.1, "margin_ms": 1.0})
+        self.assertFalse(ec.parse(dict(base(), model="deepseek_v4", features={"compaction": True}))
+                         .feature("compaction"))
 
 
 class ResolveTests(unittest.TestCase):

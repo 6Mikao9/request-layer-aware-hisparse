@@ -282,6 +282,8 @@ def parse(data):
     if mode == "steady":
         features["stale_hits"] = False   # the stock kernels of the steady sets have no stale-row path
         features["fused_route"] = False  # steady graphs call the stock kernels only
+    if model == "deepseek_v4":           # a moved page would also move its SWA, C128 and indexer-K entries
+        features["compaction"] = False
     if slo is None:
         features["slo_admission"] = False
     return ElasticConfig(model, mode, groups, always, slo, profile, controller, memory, features, pinned,

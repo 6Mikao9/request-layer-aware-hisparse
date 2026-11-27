@@ -11,11 +11,11 @@
 | `elastic_policy` | 代价模型与压力控制器，纯 Python |
 | `elastic_kv` | 设备侧状态与每种切换的拷贝，只依赖 torch |
 | `elastic_route` | smooth 版的 Triton 融合路由核 |
-| `elastic_device` | SGLang 适配：池、协调器、DSA/MiniMax 后端、scheduler、Graph、`/set_internal_state` |
+| `elastic_device` | SGLang 适配：池、协调器、DSA/MiniMax/DeepSeek-V4 后端、scheduler、Graph、`/set_internal_state` |
 | `elastic_sim` | CPU 上的服务模拟器，对比 full_resident、stock、fixed、hybrid 和 elastic |
-| `cuda_elastic_gate` | A100 上第一件要跑的门禁：VMM、融合路由核、host 拷贝 |
+| `cuda_elastic_gate` | A100 上第一件要跑的门禁：VMM、融合路由核、host 拷贝（含 C4 记录） |
 
-现状：CPU 测试、对固定 checkout 的 dry-run 和模拟器都已跑通；A100 上的任何结果都还没有，见文末 `pending_hardware`。MiniMax-M3 和 DSA 系列（GLM-5、GLM-5.1、GLM-5.2-AWQ-INT4、DeepSeek-V3.2）已接入。DeepSeek-V4-Flash 的 C4 层还没接入，`install` 会直接拒绝，原因和接入步骤见“模型适配”。
+现状：CPU 测试、对固定 checkout 的 dry-run 和模拟器都已跑通；A100 上的任何结果都还没有，见文末 `pending_hardware`。MiniMax-M3、DSA 系列（GLM-5、GLM-5.1、GLM-5.2-AWQ-INT4、DeepSeek-V3.2）和 DeepSeek-V4-Flash 的 C4 层都已接入。
 
 ## 与 vLLM Hybrid HiSparse 的取舍
 
@@ -38,7 +38,7 @@ vLLM Hybrid HiSparse 按请求管理页的驻留：放得下的页留在 GPU，�
 
 | 字段 | 含义 |
 | --- | --- |
-| `model` | `minimax_m3`（稀疏 MHA 层）、`dsa`（GLM-5/5.1/5.2、DeepSeek-V3.2 的 MLA 层）或 `deepseek_v4`（暂被拒绝） |
+| `model` | `minimax_m3`（稀疏 MHA 层）、`dsa`（GLM-5/5.1/5.2、DeepSeek-V3.2 的 MLA 层）或 `deepseek_v4`（DeepSeek-V4-Flash 的 C4 层） |
 | `mode` | `steady` 或 `smooth`，见“两个版本” |
 | `layers.eviction_order` | 必填。压力上升时依次卸载的层组，`groups[0]` 最先离开 GPU；第 k 级卸载前 k 组。也可以给平铺的层号加 `granularity` 按 n 层分组，或写 `"by_miss_rate"`，按 profile 里的 miss 率从低到高排。没出现在任何列表里的层始终常驻 |
 | `layers.always_offload` | 启动起就卸载、从不回填的层。DSA 可写 `"shared_index_followers"`，即复用上一层 top-k 的 follower 层，它们的拷贝由 anchor 的计划提前发出，卸载几乎不露出时间 |
@@ -49,7 +49,7 @@ vLLM Hybrid HiSparse 按请求管理页的驻留：放得下的页留在 GPU，�
 | `memory` | `chunk_mib`（物理 chunk 大小，2 的幂且至少 2 MiB，即 A100 上的 VMM 粒度）、`precapture_levels`（steady 版启动时捕获哪些级别的 Graph，其余首次用到时捕获） |
 | `features` | 见“开关与开销” |
 
-`runtime/fixtures/elastic/` 有五份示例：`minimax_m3_steady.json`（6 组 × 8 层，按 11 月 24 日实测 miss 率从低到高，12 个最高 miss 层常驻）、`minimax_m3_smooth_slo.json`（同样 48 层按 2 层一组、TPOT SLO 60 ms）、`glm52_smooth.json`（`by_miss_rate`、3 层一组、follower 常驻卸载）、`dsv32_steady.json`（8 层一组、第 0 层常驻）和 `dsv4_flash_steady.json`。
+`runtime/fixtures/elastic/` 有五份示例：`minimax_m3_steady.json`（6 组 × 8 层，按 11 月 24 日实测 miss 率从低到高，12 个最高 miss 层常驻）、`minimax_m3_smooth_slo.json`（同样 48 层按 2 层一组、TPOT SLO 60 ms）、`glm52_smooth.json`（`by_miss_rate`、3 层一组、follower 常驻卸载）、`dsv32_steady.json`（8 层一组、第 0 层常驻）和 `dsv4_flash_steady.json`（21 个 C4 层里 miss 率最低的 16 个按 11 月 24 日约 29 Ki 上下文档的实测排序，4 组 × 4 层，其余 5 个常驻）。
 
 ## 显存布局
 
@@ -64,6 +64,8 @@ HiSparse 设备池每层每个 KV 张量是一块 CUDA VMM 虚拟地址预留，
 全常驻时（第 0 级、无 `always_offload`）hot 区不占物理页，逻辑容量等于非 HiSparse SGLang 在同样预算下的容量。实现复用了固定 SGLang 的 VMM 工具（`srt/utils/cuda_vmm_utils.py`，即它给 post-capture KV backing 用的那套 `cuMemCreate`/`cuMemMap`/`cuMemSetAccess`），思路与 [vAttention](https://arxiv.org/abs/2405.04437)（ASPLOS'25）和 [kvcached](https://github.com/ovg-project/kvcached) 相同：虚拟地址不动，CUDA Graph 捕获过的指针始终有效。
 
 卸载后，常驻区原有的 chunk 不立刻回收，按需从区域顶部往下拿（stale 行）。`ElasticMemory.stale_rows` 报告每层仍有物理页的前缀行数。smooth 版里卸载层对这些行仍能命中，回填时两版都跳过仍有效的记录。
+
+DeepSeek-V4 的 C4 池以页为行：一行是 64 条记录（每条 576 字节值加 8 字节 scale，页补齐到 37440 字节）。hot 区就是原生 C4 池按 `_num_dsv4_physical_kv_pages` 算出的全部页，常驻区第 p 行存逻辑第 p 页，即 256 个 full token 的 64 条记录。逻辑容量按 full token 计，上限加在 SWA 分配器内部的 full 分配器上；hot 行按记录计。37440 字节的行与 2 MiB chunk 对不齐，常驻区起点落在 chunk 中间，每层约多占一个 chunk：按 dry-run 预设（21 层、每层 131072 条 hot 记录），第 0 级逻辑容量 506624 token，比行与 chunk 整除时少约 3.5%。
 
 ## 两个版本
 
@@ -83,12 +85,13 @@ smooth 版的路由由 `elastic_route` 的两个 Triton 核完成（每层一次
 - 存储：常驻层写常驻视图的逻辑行；卸载层走原生映射写 hot 行；smooth 版 decode 内按路由表算行号。
 - prefill 必须 eager（launcher 和 worker 各检查一次），它的存取按当时的层模式选视图。MiniMax 读常驻视图时去掉稀疏 prefill 的 `loc_mapping`；DSA 常驻层的 prefill 页表不经 HiSparse 映射。staging 时卸载层从 hot 行备份，可切换的常驻层从逻辑行备份。
 - PD decode 节点：KV 照原生直连准入进 host。卸载层照原生处理（短请求预载到 buffer，长请求全 miss），常驻层的逻辑行在 staging stream 上从 host 填充。填充没完成的请求暂时移出 waiting queue，各 rank 用一次 Gloo all-reduce 对齐完成的个数后再放回，所以 decode 步不会等一次长的 H2D。
+- DeepSeek-V4：C4 层的压缩器、indexer 和 attention 调用都不带模型层号，适配在 `MQALayer.forward` 上设层上下文。压缩器经 `_translate_loc_to_hisparse_device` 取写入位置、经 `get_extra_key_buffer` 取 buffer，常驻层拿到逻辑位置和常驻视图，卸载层照原生。decode 的 indexer 按关键字调用 `swap_in_selected_pages(..., layer_id=compress_layer_id)`，hook 沿用原生参数名。每 4 个 token 才闭合一条记录，最新记录要在保留槽 H 里再被读最多 3 步，所以卸载时的 warm 除了按换入表拷，还把每个长请求的最新记录拷进槽 H。
 
 ## 切换
 
 controller 在 TP rank 0 上每 `interval_steps` 个 decode batch 决策一次，结果在协调器的 Gloo 组上广播，各 rank 在同一个 batch 边界执行。每次决策打印一行 `hisparse_elastic_transition` 收据（状态、级别、逻辑 token、hot 行、耗时、拷贝与回收的 chunk 数）。
 
-- 卸载（升级）：先把要离开的层最新一条记录刷到 host（写穿落后一步），再给它们接上 hot 区，按各自的换入表把常驻行拷进 hot 行（D2D；空闲 chunk 不够、只能回收它们自己的常驻行时改从 host 拷），然后切模式，空出的 chunk 用来抬高逻辑上限。表保持原样：新请求的表是位置 0..H−1，以前卸载过的层保留当时的 LRU 状态，两种都与拷过去的行一致。
+- 卸载（升级）：先把要离开的层最新一条记录刷到 host（写穿落后一步），再给它们接上 hot 区，按各自的换入表把常驻行拷进 hot 行，长请求的最新记录拷进保留槽 H（D2D；空闲 chunk 不够、只能回收它们自己的常驻行时改从 host 拷），然后切模式，空出的 chunk 用来抬高逻辑上限。表保持原样：新请求的表是位置 0..H−1，以前卸载过的层保留当时的 LRU 状态，两种都与拷过去的行一致。
 - 回填（降级）：逻辑上限先降到回填状态放得下的值，必要时压缩（compaction）把高处的活页搬下来；然后从 host 拷回历史，跳过 stale 行里仍有效的记录。steady 版一次拷完再切模式；smooth 版每步按带宽配额拷一点，最后一步用 D2D 补上最新记录再切模式。
 - 同级调整：只改逻辑上限和 hot 行数。
 - 放不下的决策（比如用户钉住的级别装不下当前的 KV）在改动任何状态之前就判定为 `deferred`，下次决策再试；真正中途失败的切换会让整个 worker 组报错停止。
@@ -122,7 +125,7 @@ controller 只用 CPU 上的标量，rank 0 每次决策只有一次 GPU 归约�
 | MiniMax-M3.1-Flash（BF16 KV，TP8） | HiSparse 主池的全部稀疏层（K、V 各一块组合 buffer）；dense 层与 index 池不变 | 已接入 |
 | GLM-5、GLM-5.1、GLM-5.2-AWQ-INT4（W4A16，BF16 KV） | `GlmMoeDsaForCausalLM` 走 `deepseek_v2` 与 DSA 后端，每层一块 MLA 组合 buffer；indexer 的 K 缓存不变 | 已接入 |
 | DeepSeek-V3.2（含 QuantTrio AWQ，61 层） | 同 DSA | 已接入 |
-| DeepSeek-V4-Flash | C4 层 | 未接入，`install` 拒绝 |
+| DeepSeek-V4-Flash（TP4/TP8） | 21 个 C4 层（第 2、4、…、42 层），每层一块页组合 buffer；SWA、C128、indexer K 与压缩状态池不变 | 已接入 |
 
 DSA 的 IndexShare（GLM-5.2 有 78 层，其中 57 层复用上一层的 top-k）：follower 层不跑自己的换入核，用 anchor 的槽表，拷贝由 anchor 记录的 miss 计划在 prefetch stream 上提前发出。为此：
 
@@ -130,7 +133,7 @@ DSA 的 IndexShare（GLM-5.2 有 78 层，其中 57 层复用上一层的 top-k�
 - smooth 版里，anchor 的核始终带 `skip_io`，它自己的字节和每个 follower 的字节都用 `copy_cache_planned_mla` 重放计划，请求数取 `num_real_reqs × (该层路由模式 == 卸载)`，在设备上算出，所以同一张 Graph 在两种模式下都对。
 - 卸载一个 follower 或 anchor 时，按 anchor 的表把行拷进 hot 区（warm start 按表拷，正是为了这种共用表的情况）。
 
-DeepSeek-V4 没有接入的原因：C4 层的池由 `DeepSeekV4TokenToKVPool._make_kv_pool` 和 `layer_mapping` 构造，压缩器经 `_translate_loc_to_hisparse_device` 写入，分配器是带 SWA 的 `DeepSeekV4HiSparseTokenToKVPoolAllocator`，逻辑上限要加在 full 分配器上并同时约束 SWA。`elastic_kv.C4Layers`（V4 页布局的拷贝）和 ratio 4 的写穿已经写好并有 CPU 测试，缺的是池、门面和分配器上限这三处 hook，结构可以照搬 issue #11 的 `_dsv4_pool` 与 `C4Layer`。在那之前，DeepSeek-V4 的固定名单卸载用 issue #11 的适配。
+DeepSeek-V4 的接入：`DeepSeekV4TokenToKVPool._make_kv_pool` 构造 `HiSparseC4DevicePool` 时换上组合 buffer，`create_buffer` 逐层返回 hot 视图，所以池的 `data_ptrs` 和 host 池的设备指针都指向组合 buffer 的起点；`get_key_buffer` 按层模式返回视图；两种位置翻译只在 C4 层的 forward 内按模式改写，分配器和 staging 调用时仍走原生映射；`set_key_buffer(_fused)` 写常驻层时临时把该层 buffer 换成常驻视图。协调器侧与 DSA 共用页选择的 hook（`layer_id` 是 C4 池内的序号）。`compaction` 对 DeepSeek-V4 强制关闭：搬动一页还要同时搬它的 SWA 映射、C128 和 indexer K 条目，这部分没做，逻辑上限因此只能等高处的请求结束再降。
 
 ## 开关与开销
 
@@ -140,7 +143,7 @@ DeepSeek-V4 没有接入的原因：C4 层的池由 `DeepSeekV4TokenToKVPool._ma
 | `warm_start`（开） | 卸载时把常驻行按表拷进 hot 行 | 卸载时一次 D2D；关掉后长请求从全 miss 开始（短请求仍然要拷，原生快路径直接读 buffer） |
 | `stale_hits`（smooth 开，steady 强制关） | 卸载层继续命中仍有物理页的常驻行 | 每层选择时多两次比较；省下的是换入字节 |
 | `backfill`（开） | 压力下降后回填 | 无 |
-| `compaction`（开） | 降上限时把高处的活页搬下来 | 降上限那一刻的 D2D 和一次 `req_to_token` 改写；关掉后只能等高处的请求结束 |
+| `compaction`（开；DeepSeek-V4 强制关） | 降上限时把高处的活页搬下来 | 降上限那一刻的 D2D 和一次 `req_to_token` 改写；关掉后只能等高处的请求结束 |
 | `slo_admission`（有 SLO 时开） | 按模型限制准入 | 排队变长，换 TPOT |
 | `throughput_guard`（开） | 多卸一组要换来至少 `min_gain` 的吞吐 | 无；关掉后只要装得下就卸 |
 | `fused_route`（smooth 开） | Triton 路由核 | 无；关掉后每层每步多约二十个小 Graph 节点 |
@@ -149,7 +152,7 @@ DeepSeek-V4 没有接入的原因：C4 层的池由 `DeepSeekV4TokenToKVPool._ma
 
 ## 复用的实现与相关工作
 
-- 固定 SGLang 的 HiSparse 协调器、换入核、host 池和直连准入保持原样调用；本实现只换掉 eager backup、staging、预载和 DSA 的页选择，补上常驻层的读写。
+- 固定 SGLang 的 HiSparse 协调器、换入核、host 池和直连准入保持原样调用；本实现只换掉 eager backup、staging、预载和 DSA 与 DeepSeek-V4 的页选择，补上常驻层的读写。C4 记录的拷贝用固定 SGLang 的 `transfer_cache_dsv4_mla`。
 - 固定 SGLang 的 VMM 工具 `srt/utils/cuda_vmm_utils.py` 与 `srt/mem_cache/kv_vmm_backing.py`（post-capture KV backing）。
 - issue #11 的适配框架：`_patch` 的防叠加检查、AST 符号与调用点检查、`PROVENANCE.json` 摘要（本次增加 `elastic_dependency_sha256`）、`/set_internal_state` 钩子、Gloo 上的 TP 一致性。
 - [vLLM Hybrid HiSparse](https://docs.vllm.ai/en/latest/design/hisparse/)：按请求的页驻留与溢出，是本 issue 的对照对象。
@@ -160,12 +163,12 @@ DeepSeek-V4 没有接入的原因：C4 层的池由 `DeepSeekV4TokenToKVPool._ma
 
 ## 正确性证据（CPU）
 
-Python 3.12 + CPU PyTorch，共 44 项：
+Python 3.12 + CPU PyTorch，共 47 项：
 
 - `runtime.test_elastic_config`（7）、`runtime.test_elastic_memory`（6）、`runtime.test_elastic_policy`（9）、`runtime.test_elastic_sim`（4）：配置规则、chunk 账本与 stale 前缀、代价模型和 controller 的决策（按需卸载、SLO 拦截与准入上限、吞吐保护、回填驻留）、模拟器。
-- `runtime.test_elastic_device`（18）：在 CPU 版 `ElasticMemory`（未映射字节填 0xA5，读到 stale 数据会暴露）上运行真实的 `Runtime` 与 `ElasticKV`，DSA 协调器 hook 装在一个复述原生协调器的类上（槽表、LRU 换入核、`skip_io`、shared-index 的 miss 计划与重放）。每次 attention 读取都与该（请求，层，位置）写入的值比较。覆盖 steady 的 0→1→2→1→0、smooth 的分摊回填与 stale 命中、回填跳过 stale 行、关闭写穿、follower 常驻卸载而 anchor 切换（两版）、PD 直连准入、warm 的两种来源、compaction、`deferred`、钉住级别后交回 controller 自动回填、排队压力触发卸载、steady 预捕获每级 Graph 并恢复显存状态、`Ceiling`、MHA 行拷贝与 MiniMax 按块选择；launcher 的执行规则与 worker 安装；设置 `SGLANG_SRC` 后，四份已接入模型的示例配置对固定 checkout 的 dry-run 全部通过（摘要、符号签名、调用点）。
+- `runtime.test_elastic_device`（21）：在 CPU 版 `ElasticMemory`（未映射字节填 0xA5，读到 stale 数据会暴露）上运行真实的 `Runtime` 与 `ElasticKV`，页选择的协调器 hook 装在一个复述原生协调器的类上（槽表、LRU 换入核、`skip_io`、shared-index 的 miss 计划与重放）。每次 attention 读取都与该（请求，层，位置）写入的值比较。DSA 行上覆盖 steady 的 0→1→2→1→0、smooth 的分摊回填与 stale 命中、回填跳过 stale 行、关闭写穿、follower 常驻卸载而 anchor 切换（两版）、PD 直连准入、warm 的两种来源、compaction、`deferred`、钉住级别后交回 controller 自动回填、排队压力触发卸载、steady 预捕获每级 Graph 并恢复显存状态、`Ceiling`、MHA 行拷贝与 MiniMax 按块选择。DeepSeek-V4 用同一套装置换成 C4 页行（第 2、4、6、8 层，每 4 个 token 一条记录，H 为一页 64 条，逻辑分配器包在 SWA 分配器里）：steady 0→1→2→1→0、smooth 分摊回填与 stale 命中、PD 直连准入，每条读取逐字节比较 584 字节的记录；去掉 warm 对保留槽 H 的拷贝时 steady 与 PD 两项会失败。C4 池的 hook 另在复述的固定池类上测：组合 buffer 的构造与原生页数、`data_ptrs`、按层模式的视图和位置翻译、常驻与卸载两种写入、`MQALayer.forward` 的层上下文。另有 launcher 的执行规则与 worker 安装；设置 `SGLANG_SRC` 后，五份示例配置对固定 checkout 的 dry-run 全部通过（摘要、符号签名、调用点）。
 
-全量 `python -m unittest discover -s runtime -t .` 为 292 项，在 macOS 上只有 `test_shared_lru_kernel.test_index_key_matches_the_python_statement` 失败：它用主机 C++ 编译器编 `.cuh`，clang 不认 PTX 内联汇编约束，与本次改动无关。
+全量 `python -m unittest discover -s runtime -t .` 为 295 项，在 macOS 上只有 `test_shared_lru_kernel.test_index_key_matches_the_python_statement` 失败：它用主机 C++ 编译器编 `.cuh`，clang 不认 PTX 内联汇编约束，与本次改动无关。
 
 ## 模拟结果（模型，不是测量）
 
@@ -192,7 +195,7 @@ python -B -m runtime.elastic_sim --config runtime/fixtures/elastic/minimax_m3_st
 
 dry-run 不导入 torch 和 SGLang，输出摘要校验、符号检查和每一级的逻辑容量（规划预设，worker 从真实池重新推导）。GLM 的 follower 层号用 `--followers` 传入，例如 GLM-5.2 的 57 个 follower。
 
-服务（以 MiniMax 为例；DSA 模型把配置换成 `glm52_smooth.json` 或 `dsv32_steady.json`）：
+服务（以 MiniMax 为例；DSA 模型把配置换成 `glm52_smooth.json` 或 `dsv32_steady.json`；DeepSeek-V4-Flash 换成 `dsv4_flash_steady.json`，`--hisparse-config` 用 C4 记录计的 `top_k` 和 `device_buffer_size`，例如 11 月 24 日实测用的 512 和 1024，后者须是 64 的倍数）：
 
 ```bash
 python -m runtime.launch --hisparse-elastic-config runtime/fixtures/elastic/minimax_m3_steady.json -- \
@@ -201,13 +204,13 @@ python -m runtime.launch --hisparse-elastic-config runtime/fixtures/elastic/mini
   --disable-overlap-schedule --disable-radix-cache --disable-prefill-cuda-graph --mem-fraction-static 0.84
 ```
 
-launcher 拒绝 overlap、Radix、投机解码、PD 的 prefill 侧、`--enable-mixed-chunk`、非 BF16 KV 和 prefill CUDA Graph；PD decode 节点加 `--disaggregation-mode decode`。
+launcher 拒绝 overlap、Radix、投机解码、PD 的 prefill 侧、`--enable-mixed-chunk`、MiniMax 与 DSA 的非 BF16 KV 和 prefill CUDA Graph；PD decode 节点加 `--disaggregation-mode decode`。
 
 ## A100 上的测试与 vLLM Hybrid 对照
 
 按顺序，每一步用新进程：
 
-1. 门禁：`python -m runtime.cuda_elastic_gate --output elastic_gate.json`，单卡。VMM 在卸载、扩容、回填、收缩状态间移动 chunk，保留的行字节不变、新映射的行读到 0；Triton 路由核与 torch 写法在 token、C4（ratio 4）、块选择上逐位一致；`transfer_kv_per_layer(_mla)` 与 torch 下标一致。
+1. 门禁：`python -m runtime.cuda_elastic_gate --output elastic_gate.json`，单卡。VMM 在卸载、扩容、回填、收缩状态间移动 chunk，保留的行字节不变、新映射的行读到 0；Triton 路由核与 torch 写法在 token、C4（ratio 4）、块选择上逐位一致；`transfer_kv_per_layer(_mla)` 与 torch 下标一致；C4 记录经 `transfer_cache_dsv4_mla`（host 侧走核指针表）的 H2D、D2D、D2H 与 torch 写的页布局逐字节一致。
 2. dry-run：对镜像里的 SGLang 跑上面的 dry-run，`status` 必须为 `pass`。
 3. 输出一致性：同一份短请求文件，B=1 贪心解码，elastic server 依次用 `hisparse_elastic_level` 钉在 0、中间级、最高级，与原生 HiSparse server 逐 token 比较；常驻层读的是同一份 KV，预期完全相同。再在 decode 进行中改钉住级别（升和降各一次），输出仍应相同。steady 与 smooth、Graph 与 eager decode 各跑一遍。
 4. 服务性能，对照臂：`full_resident`（不开 HiSparse）、`stock`（原生 HiSparse）、`fixed:k`（elastic 钉在第 k 级，等价于固定名单）、`elastic-steady`、`elastic-smooth`、`vllm-hybrid`。所有臂同模型、同 TP、同 `--mem-fraction-static`（或 vLLM 的同等显存预算）、同 `max_running_requests`、同 HiSparse `top_k` 与 `device_buffer_size`，decode 都开 CUDA Graph。
@@ -221,10 +224,11 @@ launcher 拒绝 overlap、Radix、投机解码、PD 的 prefill 侧、`--enable-
 
 ## 已知限制
 
-- DeepSeek-V4-Flash 未接入（见“模型适配”）。
-- 只支持 BF16、未量化的 KV（GLM-5.2-AWQ 的权重量化不受影响）；不支持投机解码、overlap 调度、Radix、mixed chunk、PP、DP attention；prefill 必须 eager。
-- dense 层、MiniMax 的 index 池和 DSA indexer 的 K 缓存按全部逻辑容量静态分配，不参与弹性。
-- 每层每张量的区域按 2 MiB chunk 取整，最多浪费约一个 chunk。
+- MiniMax 与 DSA 只支持 BF16、未量化的 KV（GLM-5.2-AWQ 的权重量化不受影响）；DeepSeek-V4 只支持原生 HiSparse 也只支持的 V4 页布局（不支持 unified KV、trtllm 的 uniform FP8）。不支持投机解码、overlap 调度、Radix、mixed chunk、PP、DP attention；prefill 必须 eager。
+- dense 层、MiniMax 的 index 池、DSA indexer 的 K 缓存，以及 DeepSeek-V4 的 SWA、C128、indexer K 与压缩状态池，按全部逻辑容量静态分配，不参与弹性。
+- DeepSeek-V4 的 `compaction` 强制关闭（见“模型适配”）。
+- DeepSeek-V4 PD 直连准入的长请求（记录数大于 H）：在它闭合第一条新记录之前（最多 3 步），卸载层按原生规则从保留槽 H 读最新一条 prompt 记录，而原生直连准入没有往槽 H 装数据。这是原生 DeepSeek-V4 HiSparse 的行为，本实现没有改；常驻层不受影响（逻辑行由 host 填满）。这一点只是读代码得出的，没在 GPU 上确认。
+- 每层每张量的区域按 2 MiB chunk 取整，最多浪费约一个 chunk；DeepSeek-V4 的页行与 chunk 对不齐，每层约多占一个 chunk（见“显存布局”）。
 - steady 版首次用到的级别要现场捕获 Graph，那一次切换会慢；`precapture_levels: "all"` 在启动时全部捕获，启动时间随级别数增加。
 - smooth 版回填期间返回的层两区都占物理页，所以回填要等需求降到这个状态放得下。
 - smooth 版的路由核用 Triton 写；issue 提到的 TileLang 或手写 CUDA 版本没有做。steady 版只调用原生核。
@@ -232,4 +236,4 @@ launcher 拒绝 overlap、Radix、投机解码、PD 的 prefill 侧、`--enable-
 
 ## pending_hardware
 
-启动收据的 `pending_hardware` 列出 `sm80_vmm_map_unmap`、`fused_route_self_check`、`steady_graph_sets_capture`、`tp8_level_broadcast`、`pd_decode_admission_fill`、`serving_tpot_throughput_goodput`、`vllm_hybrid_hisparse_comparison` 和 `nsys_transition_timeline`，均未在 GPU 上运行。
+启动收据的 `pending_hardware` 列出 `sm80_vmm_map_unmap`、`fused_route_self_check`、`c4_page_transfer`、`steady_graph_sets_capture`、`tp8_level_broadcast`、`pd_decode_admission_fill`、`serving_tpot_throughput_goodput`、`vllm_hybrid_hisparse_comparison` 和 `nsys_transition_timeline`，均未在 GPU 上运行。

@@ -26,8 +26,9 @@ POISON = 0xA5
 @dataclass(frozen=True)
 class BufferSpec:
     """One KV tensor. ``layer`` is the model layer of a switchable or hot-only buffer, None for an always-resident
-    one. ``tokens_per_row`` converts logical tokens to rows (4 for a C4 record). ``pad_rows`` precede the first
-    real row (SGLang's padding page)."""
+    one. ``tokens_per_row`` converts logical tokens to rows and ``locs_per_row`` locations (hot rows or logical
+    locations) to rows: 1 and 1 for token rows, 256 and 64 for a DeepSeek-V4 C4 page of 64 records. ``pad_rows``
+    precede the first real row (SGLang's padding page)."""
     name: str
     row_bytes: int
     kind: str
@@ -36,6 +37,7 @@ class BufferSpec:
     pad_rows: int = 0
     shape: tuple = ()          # trailing shape of one row for the tensor view (product * itemsize == row_bytes)
     dtype: str = "uint8"
+    locs_per_row: int = 1
 
 
 @dataclass
@@ -48,11 +50,12 @@ class _Buffer:
 
 
 class Layout:
-    """Pure chunk accounting; no device. ``max_tokens`` and ``hot_rows`` size the virtual reservations."""
+    """Pure chunk accounting; no device. ``max_tokens`` and ``hot_rows`` size the virtual reservations; logical
+    capacities are multiples of ``page_tokens``."""
 
     def __init__(self, specs, *, chunk_bytes, max_tokens, hot_rows, page_tokens):
-        if max_tokens % page_tokens or hot_rows % page_tokens:
-            raise ValueError("max_tokens and hot_rows must be page multiples")
+        if max_tokens % page_tokens:
+            raise ValueError("max_tokens must be a page multiple")
         self.specs, self.chunk, self.page = tuple(specs), chunk_bytes, page_tokens
         self.max_tokens, self.hot_rows = max_tokens, hot_rows
         names = [s.name for s in self.specs]
@@ -63,14 +66,14 @@ class Layout:
         """Rows of the hot region, rounded so the resident region starts on a chunk when the row size allows."""
         if spec.kind == ALWAYS:
             return 0
-        rows = spec.pad_rows + self.hot_rows
+        rows = self.region_rows(spec, HOT, self.hot_rows)
         step = self.chunk // math.gcd(self.chunk, spec.row_bytes)
         return -(-rows // step) * step if step * spec.row_bytes <= 64 * self.chunk else rows
 
     def region_rows(self, spec, space, size):
         """Rows a region needs to hold ``size`` units of its space (tokens or hot rows), padding included."""
         if space == HOT:
-            return spec.pad_rows + size
+            return spec.pad_rows + -(-size // spec.locs_per_row)
         return spec.pad_rows + -(-size // spec.tokens_per_row)
 
     def total_rows(self, spec):
@@ -250,12 +253,14 @@ class ElasticMemory:
         return flat[:rows * rb].view(dtype).view(rows, *spec.shape) if spec.shape else flat[:rows * rb]
 
     def stale_rows(self, layer):
-        """Rows of ``layer``'s inactive resident region that are still backed; row r holds location r (row 0..pad
-        is SGLang's padding page), so a location below this bound may still hold its pre-offload KV."""
+        """Locations of ``layer``'s inactive resident region that are still backed; row r holds locations
+        r * locs_per_row onward (row 0..pad is SGLang's padding page), so a location below this bound may still
+        hold its pre-offload KV."""
         out = None
         for buf in self.buffers.values():
             if buf.spec.layer == layer and buf.spec.kind == SWITCHABLE:
                 rows = self.stale.get((layer, buf.spec.name), 0) // buf.spec.row_bytes
+                rows *= buf.spec.locs_per_row
                 out = rows if out is None else min(out, rows)
         return out or 0
 

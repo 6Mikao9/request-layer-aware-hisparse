@@ -17,8 +17,9 @@ an allocator ceiling that grows as layers leave the GPU and shrinks (after compa
 Every managed layer writes its decode tokens through to host whichever mode wrote them, so offloading moves no
 bytes to host. The controller (``elastic_policy``) runs on TP rank 0 every ``interval_steps`` decode batches and
 its decision is broadcast on the coordinator's Gloo group, so all ranks change level at the same batch boundary.
-Models: MiniMax-M3 (sparse MHA layers) and the DSA family (GLM-5 / 5.1 / 5.2, DeepSeek-V3.2, with shared-index
-groups); DeepSeek-V4 C4 layers are refused at install for now.
+Models: MiniMax-M3 (sparse MHA layers), the DSA family (GLM-5 / 5.1 / 5.2, DeepSeek-V3.2, with shared-index
+groups) and the C4 layers of DeepSeek-V4-Flash (a row is one C4 page of 64 records; logical capacity counts full
+tokens, hot rows count records).
 """
 from contextlib import contextmanager, nullcontext
 import hashlib
@@ -46,18 +47,24 @@ FULL_GRAPH = "srt/model_executor/runner_backend/full_cuda_graph_backend.py"
 MINIMAX_BACKEND = "srt/layers/attention/minimax_sparse_backend.py"
 MINIMAX_OPS = "srt/layers/attention/minimax_sparse_ops/minimax_sparse.py"
 DSA_BACKEND = "srt/layers/attention/dsa_backend.py"
+DSV4_POOL = "srt/mem_cache/deepseek_v4_memory_pool.py"
+DSV4_INDEXER = "srt/layers/attention/dsv4/indexer.py"
+DSV4_COMPRESSOR = "srt/layers/attention/dsv4/compressor_v2.py"
 INTERNAL_STATE = "srt/managers/scheduler_components/internal_state.py"
 LEVEL_KEY = "hisparse_elastic_level"
 PREFILL = "minimax_sparse_prefill"
 _COORD = ("__init__", "_eager_backup_previous_token", "admit_request_into_staging", "admit_request_direct",
-          "_preload_to_device_buffer", "alloc_device_buffer", "request_finished", "map_last_loc_to_buffer",
-          "swap_in_selected_pages")
+          "_preload_to_device_buffer", "alloc_device_buffer", "request_finished", "map_last_loc_to_buffer")
 SYMBOLS = {
     "*": (
         *((COORDINATOR, f"HiSparseCoordinator.{name}", None) for name in _COORD),
+        (COORDINATOR, "HiSparseCoordinator.swap_in_selected_pages", ("self", "req_pool_indices",
+                                                                      "compressed_seq_lens", "top_k_result",
+                                                                      "layer_id")),
         (COORDINATOR, "HiSparseCoordinator._run_swap_in_kernel", ("self", "req_pool_indices",
                                                                    "compressed_seq_lens", "top_k_result",
                                                                    "layer_id", "record_plan")),
+        (COORDINATOR, "HiSparseCoordinator._run_copy_only_kernel", ("self", "num_reqs", "skip_layer")),
         (ALLOCATOR, "HiSparseTokenToKVPoolAllocator.__init__", ("self", "size", "page_size", "dtype", "device",
                                                                 "kvcache", "need_sort", "host_to_device_ratio")),
         ("srt/mem_cache/allocator/paged.py", "PagedTokenToKVPoolAllocator.clear", ("self",)),
@@ -99,19 +106,46 @@ SYMBOLS = {
         (MEMORY_POOL, "MLATokenToKVPool.get_value_buffer", ("self", "layer_id")),
         *((DSA_BACKEND, f"DeepseekSparseAttnBackend.{name}", ("self", "q", "k", "v", "layer", "forward_batch"))
           for name in ("forward_extend", "forward_decode")),
-        (COORDINATOR, "HiSparseCoordinator._run_copy_only_kernel", ("self", "num_reqs", "skip_layer")),
         ("kernels/ops/kvcache/hisparse.py", "copy_cache_planned_mla",
          ("miss_src", "miss_dst", "miss_count", "num_real_reqs", "host_cache", "device_buffer", "item_size_bytes",
           "num_blocks")),
         ("srt/mem_cache/index_key_cache.py", "IndexKeyCache.move", ("self", "tgt_loc", "src_loc")),
     ),
-    "deepseek_v4": (),
+    "deepseek_v4": (
+        (DSV4_POOL, "DeepSeekV4TokenToKVPool._make_kv_pool", ("self", "size", "page_size", "dtype", "layer_num",
+                                                              "device", "enable_memory_saver", "global_page_size",
+                                                              "cls", "kv_layout")),
+        (DSV4_POOL, "DeepSeekV4SingleKVPool.create_buffer", ("self", "num_pages")),
+        (DSV4_POOL, "DeepSeekV4SingleKVPool.get_key_buffer", ("self", "layer_id")),
+        (DSV4_POOL, "DeepSeekV4SingleKVPool.set_key_buffer", ("self", "layer_id", "loc")),
+        (DSV4_POOL, "DeepSeekV4SingleKVPool.set_key_buffer_fused", ("self", "layer_id", "loc")),
+        (DSV4_POOL, "HiSparseC4DevicePool.__init__", None),
+        *((DSV4_POOL, f"HiSparseC4DevicePool.{name}", ("self", "compressed_indices"))
+          for name in ("translate_loc_to_hisparse_device", "_translate_loc_to_hisparse_device")),
+        *((DSV4_POOL, f"HiSparseC4DevicePool.{name}", ("self", "layer_id", "loc"))
+          for name in ("set_key_buffer", "set_key_buffer_fused")),
+        (DSV4_POOL, "_num_dsv4_physical_kv_pages", ("size", "physical_page_size", "logical_page_size")),
+        ("srt/models/deepseek_v4.py", "MQALayer.forward", ("self", "x", "positions", "forward_batch")),
+        ("kernels/ops/kvcache/hisparse.py", "transfer_cache_dsv4_mla",
+         ("src_ptrs", "dst_ptrs", "src_indices", "dst_indices")),
+    ),
 }
 
 
 def _calls(node, attribute):
     import ast
     return [n for n in ast.walk(node) if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == attribute]
+
+
+def _keywords(node, attribute):
+    """Keyword names of each call of ``attribute`` in ``node``."""
+    return [{k.arg for k in c.keywords} for c in _calls(node, attribute)]
+
+
+def _assigns(node, attribute):
+    import ast
+    return any(isinstance(t, ast.Attribute) and t.attr == attribute
+               for n in ast.walk(node) if isinstance(n, ast.Assign) for t in n.targets)
 
 
 # (model, file, symbol, contract, predicate over the symbol's AST): stock call sites the hooks rely on.
@@ -122,6 +156,23 @@ CONTRACTS = (
     ("dsa", DSA_BACKEND, "DeepseekSparseAttnBackend.forward_decode",
      "takes kv_cache from get_key_buffer before swap_in_selected_pages translates the top-k",
      lambda n: bool(_calls(n, "get_key_buffer")) and bool(_calls(n, "swap_in_selected_pages"))),
+    ("deepseek_v4", DSV4_POOL, "DeepSeekV4TokenToKVPool._init_compressed_pools",
+     "builds the C4 HiSparse pool through _make_kv_pool keywords size, page_size, layer_num, global_page_size, cls",
+     lambda n: any(k >= {"size", "page_size", "layer_num", "global_page_size", "cls"}
+                   for k in _keywords(n, "_make_kv_pool"))),
+    ("deepseek_v4", DSV4_POOL, "DeepSeekV4TokenToKVPool.get_extra_key_buffer",
+     "reads a C4 layer through its pool's get_key_buffer(compress_layer_id)",
+     lambda n: bool(_calls(n, "get_key_buffer"))),
+    ("deepseek_v4", DSV4_COMPRESSOR, "CompressorBackendMixin.forward_unified",
+     "stores C4 records into get_extra_key_buffer at locations from _translate_loc_to_hisparse_device",
+     lambda n: bool(_calls(n, "get_extra_key_buffer")) and bool(_calls(n, "_translate_loc_to_hisparse_device"))),
+    ("deepseek_v4", DSV4_INDEXER, "C4IndexerBackendMixin.forward_c4_indexer",
+     "decode swaps in by keyword with layer_id=compress_layer_id; prefill translates through c4_kv_pool",
+     lambda n: any(k >= {"layer_id", "compressed_seq_lens"} for k in _keywords(n, "swap_in_selected_pages"))
+     and bool(_calls(n, "translate_loc_to_hisparse_device"))),
+    ("deepseek_v4", "srt/mem_cache/allocator/swa.py", "SWATokenToKVPoolAllocator.__init__",
+     "keeps the paged allocator of full-attention tokens (the logical ceiling) in full_attn_allocator",
+     lambda n: _assigns(n, "full_attn_allocator")),
     ("*", COORDINATOR, "HiSparseCoordinator.map_last_loc_to_buffer",
      "backs the previous token up through _eager_backup_previous_token before the forward",
      lambda n: bool(_calls(n, "_eager_backup_previous_token"))),
@@ -129,7 +180,7 @@ CONTRACTS = (
      "allocates the device buffer, then preloads short requests through _preload_to_device_buffer",
      lambda n: bool(_calls(n, "alloc_device_buffer")) and bool(_calls(n, "_preload_to_device_buffer"))),
 )
-PENDING_HARDWARE = ("sm80_vmm_map_unmap", "fused_route_self_check", "steady_graph_sets_capture",
+PENDING_HARDWARE = ("sm80_vmm_map_unmap", "fused_route_self_check", "c4_page_transfer", "steady_graph_sets_capture",
                     "tp8_level_broadcast", "pd_decode_admission_fill", "serving_tpot_throughput_goodput",
                     "vllm_hybrid_hisparse_comparison", "nsys_transition_timeline")
 
@@ -267,7 +318,8 @@ class Runtime:
         self.cfg, self.mode = cfg, cfg.mode
         self.memory = state["memory"]
         a = coordinator.token_to_kv_pool_allocator
-        self.logical = Ceiling(a.logical_attn_allocator, torch)
+        logical = a.logical_attn_allocator          # DeepSeek-V4: an SWA allocator; only its full side is capped
+        self.logical = Ceiling(getattr(logical, "full_attn_allocator", logical), torch)
         self.hot = Ceiling(a.hisparse_attn_allocator, torch)
         self.group = coordinator.tp_group                  # the coordinator's CPU (Gloo) TP group
         self.rank = dist.get_rank(group=self.group)
@@ -344,13 +396,14 @@ class Runtime:
         chunk = getattr(scheduler, "chunked_prefill_size", None) or 0
         decode_node = getattr(scheduler, "disagg_decode_prealloc_queue", None) is not None
         prefill = 0 if decode_node or not waiting else len(waiting[0].origin_input_ids)
+        prefill = min(prefill, chunk) if chunk > 0 else prefill
         return ep.Observation(
             step=self.steps, level=self.level, tokens=self.logical.tokens(),
             tokens_used=self.logical.used_tokens(), tokens_peak=self.logical.peak_tokens(),
             hot_rows=self.hot.tokens(), hot_used=self.hot.used_tokens(), hot_peak=self.hot.peak_tokens(),
             running=len(reqs), mean_context=sum(lengths) / len(lengths) if lengths else 1.0,
             waiting=len(queued), waiting_tokens=sum(len(r.origin_input_ids) for r in queued[:256]),
-            step_ms=step_ms, busy=busy, prefill_rows=min(prefill, chunk) if chunk > 0 else prefill)
+            step_ms=step_ms, busy=busy, prefill_rows=-(-prefill // self.c.compress_ratio))
 
     def _broadcast(self, payload):
         if self.dist.get_world_size(group=self.group) == 1:
@@ -660,29 +713,45 @@ class Runtime:
 # ---- VMM buffers of the HiSparse device pool ---------------------------------------------------------------
 class Factory:
     """Builds the HiSparse device pool's per-layer buffers as VMM reservations while the stock constructor runs.
-    Stock code keeps seeing its usual ``[size + page, ...]`` hot views; ``seal`` creates a chunk pool of exactly
-    the bytes those stock buffers would have allocated."""
+    Stock code keeps seeing its usual hot buffers (``[size + page, ...]`` token rows, or the C4 page buffer);
+    ``seal`` creates a chunk pool of exactly the bytes those stock buffers would have allocated. ``max_tokens``
+    and ``page_tokens`` are logical tokens, ``hot_rows`` hot-allocator locations."""
 
-    def __init__(self, state, torch, *, size, ratio, page, layers, chunk_bytes):
+    def __init__(self, state, torch, *, max_tokens, hot_rows, page_tokens, layers, chunk_bytes):
         self.state, self.torch, self.layers = state, torch, tuple(layers)
-        self.size, self.page, self.ratio = size, page, ratio
-        layout = em.Layout([], chunk_bytes=chunk_bytes, max_tokens=size * ratio, hot_rows=size, page_tokens=page)
+        layout = em.Layout([], chunk_bytes=chunk_bytes, max_tokens=max_tokens, hot_rows=hot_rows,
+                           page_tokens=page_tokens)
         backend = state.get("backend") or (em.CudaVmmBackend(torch) if torch.cuda.is_available()
                                            else em.CpuBackend(torch))
         self.memory = em.ElasticMemory(layout, backend, torch=torch)
-        self.stock_bytes, self.views = 0, {}
+        self.stock_bytes, self.views, self.made = 0, {}, 0
 
-    def buffer(self, part, layer, row_shape, dtype):
-        """Hot view (rows 0..size+page-1) of a new combined buffer; the resident and full views are recorded."""
+    @classmethod
+    def tokens(cls, state, torch, *, size, ratio, page, layers):
+        """Token-row pools (MiniMax main KV, DSA latent): ``size`` hot rows, ``size * ratio`` logical tokens."""
+        factory = cls(state, torch, max_tokens=size * ratio, hot_rows=size, page_tokens=page, layers=layers,
+                      chunk_bytes=state["chunk_bytes"])
+        factory.size, factory.page = size, page
+        return factory
+
+    def buffer(self, part, layer, row_shape, dtype, *, stock_rows=None, pad_rows=None, tokens_per_row=1,
+               locs_per_row=1):
+        """Hot view (the stock buffer's ``stock_rows`` rows, ``size + page`` by default) of a new combined buffer;
+        the resident and full views and the resident region's first location are recorded."""
         t = self.torch
+        stock_rows = self.size + self.page if stock_rows is None else stock_rows
         row_bytes = int(t.Size(row_shape).numel()) * t._utils._element_size(dtype)
-        spec = em.BufferSpec(f"{part}{layer}", row_bytes, em.SWITCHABLE, layer=layer, pad_rows=self.page,
-                             shape=tuple(row_shape), dtype=str(dtype).replace("torch.", ""))
+        spec = em.BufferSpec(f"{part}{layer}", row_bytes, em.SWITCHABLE, layer=layer,
+                             pad_rows=self.page if pad_rows is None else pad_rows, tokens_per_row=tokens_per_row,
+                             locs_per_row=locs_per_row, shape=tuple(row_shape), dtype=str(dtype).replace("torch.", ""))
         buf = self.memory.add(spec)
+        if buf.hot_offset < stock_rows:
+            raise RuntimeError(f"{spec.name}: the hot region is smaller than the stock buffer")
         full = self.memory.view(spec.name)
-        self.views[(layer, part)] = dict(full=full, hot=full[:self.size + self.page],
-                                         resident=full[buf.hot_offset:], hot_offset=buf.hot_offset)
-        self.stock_bytes += (self.size + self.page) * row_bytes
+        self.views[(layer, part)] = dict(full=full, hot=full[:stock_rows], resident=full[buf.hot_offset:],
+                                         hot_offset=buf.hot_offset * locs_per_row)
+        self.stock_bytes += stock_rows * row_bytes
+        self.made += 1
         return self.views[(layer, part)]["hot"]
 
     def seal(self):
@@ -749,8 +818,8 @@ def _minimax_pool(state, torch):
         eligible = tuple(layer for layer in a["sparse_layer_ids"] if a["start_layer"] <= layer < a["end_layer"])
         if eligible != tuple(range(eligible[0], eligible[0] + len(eligible))):
             raise RuntimeError("the coordinator indexes sparse layers contiguously; this stage's are not")
-        state["factory"] = Factory(state, torch, size=a["size"], ratio=a["host_to_device_ratio"],
-                                   page=a["page_size"], layers=eligible, chunk_bytes=state["chunk_bytes"])
+        state["factory"] = Factory.tokens(state, torch, size=a["size"], ratio=a["host_to_device_ratio"],
+                                          page=a["page_size"], layers=eligible)
         try:
             originals["__init__"](self, *args, **kwargs)
         finally:
@@ -860,8 +929,8 @@ def _dsa_pool(state, torch):
         if a["dtype"] != torch.bfloat16 or a["kv_cache_dim"] != a["kv_lora_rank"] + a["qk_rope_head_dim"]:
             raise RuntimeError("elastic DSA layers need an unquantized BF16 latent cache (--kv-cache-dtype bfloat16)")
         layers = tuple(range(a["layer_num"]))
-        state["factory"] = Factory(state, torch, size=a["size"], ratio=a["host_to_device_ratio"],
-                                   page=a["page_size"], layers=layers, chunk_bytes=state["chunk_bytes"])
+        state["factory"] = Factory.tokens(state, torch, size=a["size"], ratio=a["host_to_device_ratio"],
+                                          page=a["page_size"], layers=layers)
         try:
             originals["__init__"](self, *args, **kwargs)
         finally:
@@ -924,6 +993,115 @@ def _dsa_backend(state, torch):
         originals[name] = _patch(state, backend_cls, name, wrap(name, decode))
 
 
+# ---- DeepSeek-V4-Flash: C4 layers --------------------------------------------------------------------------
+def _dsv4_pool(state, torch):
+    """The HiSparse C4 pool's per-layer page buffers get combined buffers (a C4 page of 64 records is one row,
+    covering 256 logical tokens); SWA, C128, indexer and compressor-state pools stay stock."""
+    module = importlib.import_module("sglang.srt.mem_cache.deepseek_v4_memory_pool")
+    token_pool_cls, single_cls, c4_cls = (module.DeepSeekV4TokenToKVPool, module.DeepSeekV4SingleKVPool,
+                                          module.HiSparseC4DevicePool)
+    records = ekv.C4Layers.PAGE
+    originals = {}
+
+    def make_kv_pool(self, **kwargs):
+        if kwargs.get("cls") is not c4_cls:
+            return originals["_make_kv_pool"](self, **kwargs)
+        if self._unified_kv or self.uniform_fp8:
+            raise RuntimeError("elastic C4 layers need the paged V4 layout (no unified KV, no trtllm uniform FP8)")
+        layers = tuple(i for i in range(self._stage_start, self._stage_end) if self.compression_ratios[i] == 4)
+        page = kwargs["global_page_size"]
+        if len(layers) != kwargs["layer_num"] or kwargs["page_size"] != records or page != 4 * records:
+            raise RuntimeError("the pinned pool built its C4 HiSparse pool differently than expected")
+        stock_pages = module._num_dsv4_physical_kv_pages(kwargs["size"], records, page)
+        factory = Factory(state, torch, max_tokens=self.c4_logical_size * 4 // page * page,
+                          hot_rows=(stock_pages - 1) * records, page_tokens=page, layers=layers,
+                          chunk_bytes=state["chunk_bytes"])
+        factory.stock_pages, state["factory"] = stock_pages, factory
+        try:
+            pool = originals["_make_kv_pool"](self, **kwargs)
+        finally:
+            state.pop("factory")
+        if factory.made != len(layers):
+            raise RuntimeError("the C4 pool did not build its buffers through create_buffer")
+        state.update(memory=factory.memory, views=factory.views, eligible=layers, pool=pool,
+                     physical_chunks=factory.seal(), stock_bytes=factory.stock_bytes)
+        return pool
+
+    def create_buffer(self, *, num_pages):
+        factory = state.get("factory")
+        if factory is None or not isinstance(self, c4_cls):
+            return originals["create_buffer"](self, num_pages=num_pages)
+        originals["create_buffer"](self, num_pages=0)     # sets kv_cache_total_dim and bytes_per_page_padded
+        if num_pages != factory.stock_pages:
+            raise RuntimeError("the C4 pool sized its pages differently than expected")
+        return factory.buffer("c4", factory.layers[factory.made], (self.bytes_per_page_padded,), self.store_dtype,
+                              stock_rows=num_pages, pad_rows=1, tokens_per_row=4 * records, locs_per_row=records)
+
+    def get_key_buffer(self, layer_id):
+        if self is not state.get("pool"):
+            return originals["get_key_buffer"](self, layer_id)
+        view = _view(state["eligible"][layer_id], "c4")
+        return view.view(self.dtype) if self.store_dtype != self.dtype else view
+
+    def translate(name):
+        def hook(self, compressed_indices):
+            """Inside a C4 layer's forward: resident rows are the records, smooth decode stores use route rows;
+            elsewhere (allocator, staging) the stock mapping."""
+            rt = _runtime()
+            layer = None if rt is None else rt.layer
+            if self is not state.get("pool") or layer not in state.get("eligible", ()):
+                return originals[name](self, compressed_indices)
+            if rt.mode == "smooth" and rt.decoding and layer in rt.cfg.managed:
+                rows = rt.kv.store_rows(rt.kv.index[layer], compressed_indices,
+                                        self.full_to_hisparse_device_index_mapping[compressed_indices])
+            elif rt.layer_mode(layer) == ekv.RESIDENT:
+                rows = compressed_indices
+            else:
+                return originals[name](self, compressed_indices)
+            return rows.to(torch.int32) if name == "translate_loc_to_hisparse_device" else rows
+        return hook
+
+    def store(name):
+        def hook(self, layer_id, loc, *args, **kwargs):
+            if self is not state.get("pool"):
+                return originals[name](self, layer_id, loc, *args, **kwargs)
+            layer = state["eligible"][layer_id]
+            target = _store_target(layer, loc, self.full_to_hisparse_device_index_mapping)
+            if target is None:
+                return originals[name](self, layer_id, loc, *args, **kwargs)
+            rows, view = target
+            saved, self.kv_buffer[layer_id] = self.kv_buffer[layer_id], state["views"][(layer, "c4")][view]
+            try:
+                return getattr(single_cls, name)(self, layer_id, rows, *args, **kwargs)
+            finally:
+                self.kv_buffer[layer_id] = saved
+        return hook
+
+    for owner, name, hook in ((token_pool_cls, "_make_kv_pool", make_kv_pool),
+                              (single_cls, "create_buffer", create_buffer),
+                              (single_cls, "get_key_buffer", get_key_buffer),
+                              *((c4_cls, name, translate(name)) for name in ("translate_loc_to_hisparse_device",
+                                                                              "_translate_loc_to_hisparse_device")),
+                              *((c4_cls, name, store(name)) for name in ("set_key_buffer", "set_key_buffer_fused"))):
+        originals[name] = _patch(state, owner, name, hook)
+
+
+def _dsv4_backend(state, torch):
+    """Layer context of every C4 layer's forward (compressor stores, indexer page tables and swap-in all run
+    inside it; none of them carries the model layer), plus the smooth decode context; installed at bind."""
+    layer_cls = importlib.import_module("sglang.srt.models.deepseek_v4").MQALayer
+
+    def forward(self, x, positions, forward_batch, *args, **kwargs):
+        rt = _runtime()
+        if rt is None or self.layer_id not in state["eligible"]:
+            return original(self, x, positions, forward_batch, *args, **kwargs)
+        decode = rt.mode == "smooth" and forward_batch.forward_mode.is_decode()
+        with rt.layer_context(self.layer_id), (rt.decode_context() if decode else nullcontext()):
+            return original(self, x, positions, forward_batch, *args, **kwargs)
+
+    original = _patch(state, layer_cls, "forward", forward)
+
+
 ANCHOR_COPY_BLOCKS = 32     # grid of a smooth anchor's own planned copy (on the critical path, unlike followers')
 
 
@@ -938,34 +1116,37 @@ def _planned_copy(module, c, kv, i, num_reqs, blocks):
                                   is_dsv4_layout=c.is_dsv4_hisparse, skip_io=c.skip_io)
 
 
-def _dsa_coordinator(state, torch, module):
-    """DSA decode swap-in by layer mode. Steady: a resident layer reads its logical rows; a resident anchor whose
-    shared-index followers are offloaded still runs its kernel with ``skip_io`` (slot table and miss plan, no
-    bytes of its own). Smooth: masked selection plus merge, except anchors and followers of shared-index groups,
-    which keep the full plan and gate their bytes on the route table (``_planned_copy``)."""
+def _swap_coordinator(state, torch, module):
+    """Page-selection swap-in (DSA, DeepSeek-V4 C4) by layer mode. ``layer_id`` is the pool index: the model layer
+    for DSA (one stage, start 0), the C4 pool index for DeepSeek-V4, whose indexer passes every argument by
+    keyword (hence the stock parameter names). Steady: a resident layer reads its logical rows; a resident anchor
+    whose shared-index followers are offloaded still runs its kernel with ``skip_io`` (slot table and miss plan,
+    no bytes of its own). Smooth: masked selection plus merge, except anchors and followers of shared-index
+    groups, which keep the full plan and gate their bytes on the route table (``_planned_copy``)."""
     cls, originals = module.HiSparseCoordinator, {}
 
-    def smooth(rt, layer):
-        return rt.mode == "smooth" and rt.decoding and layer in rt.cfg.managed
+    def smooth(rt, i):
+        return rt.mode == "smooth" and rt.decoding and rt.kv.layers[i] in rt.cfg.managed
 
-    def resident(rt, layer):
-        return rt.layer_mode(layer) == ekv.RESIDENT
+    def resident(rt, i):
+        return rt.layer_mode(rt.kv.layers[i]) == ekv.RESIDENT
 
-    def group_of(c, layer):
-        return c._prefetch_groups.get(layer) if c.enable_prefetch else None
+    def group_of(c, i):
+        return c._prefetch_groups.get(i) if c.enable_prefetch else None
 
-    def follower(c, layer):
-        return c.enable_prefetch and c._is_shared_index_layer[layer]
+    def follower(c, i):
+        return c.enable_prefetch and c._is_shared_index_layer[i]
 
-    def swap_pages(self, req_pool_indices, seq_lens, top_k, layer_id):
+    def swap_pages(self, req_pool_indices, compressed_seq_lens, top_k_result, layer_id):
         rt = _runtime()
         stock = originals["swap_in_selected_pages"]
+        seq_lens, top_k = compressed_seq_lens, top_k_result
         if rt is None or top_k.ndim != 2:
             return stock(self, req_pool_indices, seq_lens, top_k, layer_id)
-        kv, i = rt.kv, rt.kv.index[layer_id]
-        group = group_of(self, layer_id)
-        if smooth(rt, layer_id):
-            if group or follower(self, layer_id):
+        kv, i = rt.kv, layer_id
+        group = group_of(self, i)
+        if smooth(rt, i):
+            if group or follower(self, i):
                 hot = stock(self, req_pool_indices, seq_lens, top_k, layer_id)
                 if group:
                     _planned_copy(module, self, kv, i, req_pool_indices.size(0), ANCHOR_COPY_BLOCKS)
@@ -974,14 +1155,14 @@ def _dsa_coordinator(state, torch, module):
                 masked, rows, reads = kv.smooth_select(i, req_pool_indices, seq_lens, top_k)
                 hot = stock(self, req_pool_indices, seq_lens, masked, layer_id)
             return kv.merge(hot, rows, reads)
-        if not resident(rt, layer_id):
+        if not resident(rt, i):
             return stock(self, req_pool_indices, seq_lens, top_k, layer_id)
         # A smooth graph is captured once, so a pinned anchor of switchable followers always plans for them.
-        feeds = group and any(f in rt.cfg.managed if rt.mode == "smooth" and rt.decoding else not resident(rt, f)
-                              for f in group)
+        feeds = group and any(kv.layers[f] in rt.cfg.managed if rt.mode == "smooth" and rt.decoding
+                              else not resident(rt, f) for f in group)
         if feeds:
             stock(self, req_pool_indices, seq_lens, top_k, layer_id)
-        return kv.resident_page_table(req_pool_indices, top_k)
+        return kv.resident_page_table(req_pool_indices, top_k, seq_lens)
 
     def run_swap(self, req_pool_indices, compressed_seq_lens, top_k_result, layer_id, record_plan=False):
         rt = _runtime()
@@ -998,7 +1179,7 @@ def _dsa_coordinator(state, torch, module):
     def copy_only(self, num_reqs, skip_layer):
         rt = _runtime()
         if rt is not None and smooth(rt, skip_layer):
-            return _planned_copy(module, self, rt.kv, rt.kv.index[skip_layer], num_reqs, self._prefetch_copy_blocks)
+            return _planned_copy(module, self, rt.kv, skip_layer, num_reqs, self._prefetch_copy_blocks)
         if rt is not None and resident(rt, skip_layer):
             return None             # a resident follower reads its own logical rows
         return originals["_run_copy_only_kernel"](self, num_reqs, skip_layer)
@@ -1066,7 +1247,7 @@ def _coordinator(state, torch, dist):
         if rt is not None:          # staged prompts are complete in host; direct ones arrived there
             staged = getattr(req, "hisparse_staging", False)
             rt.kv.admitted(req.kv.req_pool_idx,
-                           req.extend_end if staged else self.host_token_len(req.kv.kv_allocated_len))
+                           self.host_token_len(req.extend_end if staged else req.kv.kv_allocated_len))
 
     def admit_request_direct(self, req):
         """PD decode: stock admission (offloaded layers start all-miss, or preloaded when short), then the
@@ -1133,6 +1314,9 @@ def _model_errors(state, c, cfg):
         errors.append("the MiniMax binding needs the M3 HiSparse coordinator over the elastic main pool")
     if cfg.model == "dsa" and (c.is_m3_hisparse or c.is_dsv4_hisparse or c.mem_pool_device is not pool):
         errors.append("the DSA binding needs the HiSparse DSA coordinator over the elastic pool")
+    if cfg.model == "deepseek_v4" and (not c.is_dsv4_hisparse or c.mem_pool_device is not pool
+                                       or c.compress_ratio != 4):
+        errors.append("the DeepSeek-V4 binding needs the C4 HiSparse coordinator over the elastic C4 pool")
     if c.spec_swap.enabled or c.skip_io:
         errors.append("speculative decoding and the skip-IO probe are unsupported")
     if c.req_device_buffer_tokens.shape[0] != len(state["eligible"]):
@@ -1168,15 +1352,15 @@ def _bind(state, c, *, torch, dist, module):
     if errors:
         raise RuntimeError("elastic HiSparse incompatible: " + "; ".join(errors))
     eligible = state["eligible"]
-    first = eligible[0]
-    followers = [layer for layer in eligible if c.enable_prefetch and c._is_shared_index_layer[layer - first]]
+    followers = [layer for i, layer in enumerate(eligible) if c.enable_prefetch and c._is_shared_index_layer[i]]
     cost = ep.CostModel(ep.load_profile(cfg, REPO_ROOT))
     bins = [int(k) for k in cost.p["miss_rate"]] or [32768]
     bound = cfg.resolve(eligible, followers=followers,
                         miss_rate=lambda layer: sum(cost.miss_rate(layer, b) for b in bins) / len(bins))
     owner = {skip: anchor for anchor, skips in c._prefetch_groups.items() for skip in skips} \
         if c.enable_prefetch else {}
-    views, parts = state["views"], ("k", "v") if cfg.model == "minimax_m3" else ("kv",)
+    views = state["views"]
+    parts = dict(minimax_m3=("k", "v"), dsa=("kv",), deepseek_v4=("c4",))[cfg.model]
     offsets = [views[(layer, parts[0])]["hot_offset"] for layer in eligible]
     if any(views[(layer, part)]["hot_offset"] != offsets[i] for i, layer in enumerate(eligible) for part in parts):
         raise RuntimeError("K and V rows of a layer differ in size; one hot offset per layer is required")
@@ -1189,11 +1373,11 @@ def _bind(state, c, *, torch, dist, module):
         raise RuntimeError("TP ranks disagree on the elastic layers or the chunk pool")
 
     def make_kv(rt):
+        full = [views[(layer, parts[0])]["full"] for layer in eligible]
         if cfg.model == "minimax_m3":
-            rows = ekv.MHALayers(torch, [views[(layer, "k")]["full"] for layer in eligible],
-                                 [views[(layer, "v")]["full"] for layer in eligible], c.mem_pool_host)
+            rows = ekv.MHALayers(torch, full, [views[(layer, "v")]["full"] for layer in eligible], c.mem_pool_host)
         else:
-            rows = ekv.MLALayers(torch, [views[(layer, "kv")]["full"] for layer in eligible], c.mem_pool_host)
+            rows = (ekv.MLALayers if cfg.model == "dsa" else ekv.C4Layers)(torch, full, c.mem_pool_host)
         return ekv.ElasticKV(rows, c, layers=eligible, managed=bound.managed, hot_offset=offsets,
                              offloaded=bound.offloaded(rt.level), torch=torch, device=torch.device(c.device),
                              ratio=c.compress_ratio, owner=owner, through=bound.feature("write_through"))
@@ -1215,10 +1399,7 @@ def _bind(state, c, *, torch, dist, module):
             raise RuntimeError("the fused smooth route disagrees with its torch statement on this device; "
                                "set features.fused_route to false")
         rt.kv.fused = elastic_route
-    if cfg.model == "minimax_m3":
-        _minimax_backend(state, torch)
-    else:
-        _dsa_backend(state, torch)
+    dict(minimax_m3=_minimax_backend, dsa=_dsa_backend, deepseek_v4=_dsv4_backend)[cfg.model](state, torch)
     emit(_bound_receipt(state, c, rt), rt.rank)
 
 
@@ -1334,9 +1515,6 @@ def install(config, config_sha256):
         if _STATE["digest"] != config_sha256:
             raise RuntimeError("the elastic configuration is frozen for this worker")
         return True
-    if config.model == "deepseek_v4":
-        raise NotImplementedError("elastic DeepSeek-V4 C4 layers are not wired yet; use the issue #11 "
-                                  "dynamic_offload adapter for DeepSeek-V4 (see docs/implementation)")
     import torch
     import torch.distributed as dist
     import sglang
@@ -1349,10 +1527,10 @@ def install(config, config_sha256):
                  chunk_bytes=config.memory["chunk_mib"] << 20)
     _STATE = state
     try:
-        (_minimax_pool if config.model == "minimax_m3" else _dsa_pool)(state, torch)
+        dict(minimax_m3=_minimax_pool, dsa=_dsa_pool, deepseek_v4=_dsv4_pool)[config.model](state, torch)
         module = _coordinator(state, torch, dist)
-        if config.model == "dsa":
-            _dsa_coordinator(state, torch, module)
+        if config.model != "minimax_m3":
+            _swap_coordinator(state, torch, module)
         _scheduler(state)
         _graphs(state)
         _trigger(state)
@@ -1375,23 +1553,34 @@ def uninstall():
     return True
 
 # ---- CPU dry run --------------------------------------------------------------------------------------------
-# Planning geometry per model (one TP rank); a worker re-derives every value from its real pools.
+# Planning geometry per model (one TP rank); a worker re-derives every value from its real pools. DeepSeek-V4
+# counts C4 records (``device_tokens``, ``hot_slots``, ``page``) and its rows are page-padded C4 pages.
 PRESETS = {
     "minimax_m3": dict(eligible="0-59", device_tokens=396_544, ratio=2, hot_slots=4096, slots=129, page=128,
                        row_bytes=256, buffers=2, followers=""),
     "dsa": dict(eligible="0-77", device_tokens=196_608, ratio=2, hot_slots=2048, slots=129, page=64,
                 row_bytes=1152, buffers=1, followers=""),
+    "deepseek_v4": dict(eligible="2-42:2", device_tokens=131_072, ratio=2, hot_slots=1024, slots=129, page=64,
+                        row_bytes=37_440, buffers=1, followers=""),
 }
 
 
 def plan_layout(config, *, eligible, device_tokens, ratio, hot_slots, slots, page, row_bytes, buffers, **_):
     """The Layout and chunk pool a worker with this geometry would build (``Factory`` without a device)."""
-    layout = em.Layout([], chunk_bytes=config.memory["chunk_mib"] << 20, max_tokens=device_tokens * ratio,
-                       hot_rows=device_tokens, page_tokens=page)
-    specs = [em.BufferSpec(f"{part}{layer}", row_bytes, em.SWITCHABLE, layer=layer, pad_rows=page)
-             for layer in eligible for part in ("k", "v")[:buffers]]
-    layout.specs = tuple(specs)
-    chunks = len(specs) * (device_tokens + page) * row_bytes // layout.chunk
+    chunk = config.memory["chunk_mib"] << 20
+    if config.model == "deepseek_v4":       # a row is a page of records; a logical page is 4 * page tokens
+        stock = -(-(device_tokens + 4 * page) // page)                 # _num_dsv4_physical_kv_pages
+        layout = em.Layout([], chunk_bytes=chunk, max_tokens=4 * device_tokens * ratio,
+                           hot_rows=(stock - 1) * page, page_tokens=4 * page)
+        shape = dict(pad_rows=1, tokens_per_row=4 * page, locs_per_row=page)
+    else:
+        stock = device_tokens + page
+        layout = em.Layout([], chunk_bytes=chunk, max_tokens=device_tokens * ratio, hot_rows=device_tokens,
+                           page_tokens=page)
+        shape = dict(pad_rows=page)
+    layout.specs = tuple(em.BufferSpec(f"{part}{layer}", row_bytes, em.SWITCHABLE, layer=layer, **shape)
+                         for layer in eligible for part in ("k", "v")[:buffers])
+    chunks = len(layout.specs) * stock * row_bytes // chunk
     return layout, ep.Geometry(layout, chunks, hot_slots + page, slots - 1, hot_min=hot_slots + page)
 
 
