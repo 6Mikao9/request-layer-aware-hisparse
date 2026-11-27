@@ -28,6 +28,7 @@ import importlib
 import json
 from pathlib import Path
 import sys
+import types
 
 from . import dynamic_offload as do
 from . import study_config as sc
@@ -230,6 +231,18 @@ class MHARows:
     def h2d(self, index, host_rows, dst):
         self._host(index, host_rows, dst, False)
 
+    def plan(self, indices, bases):
+        """Host copies of the listed layers from rows ``base + src`` of their planes, issued per layer as the
+        pinned HiSparse MHA backup does."""
+        return list(indices), self.torch.tensor(bases, dtype=self.torch.int64, device=self.k.device)[:, None]
+
+    def d2h_plan(self, plan, src, host_rows):
+        indices, bases = plan
+        if indices:
+            rows = bases + src
+            for j, index in enumerate(indices):
+                self.d2h(index, rows[j], host_rows)
+
 
 class PagedRows:
     """DeepSeek-V4 C4 rows: one K-only slab of 64-row pages [pages, 37440] uint8, value 576 B at slot * 576 and
@@ -238,6 +251,7 @@ class PagedRows:
 
     def __init__(self, torch, k, host):
         self.torch, self.k, self.host = torch, k, host
+        self.slab_ptr = torch.tensor([k.data_ptr()], dtype=torch.uint64, device=k.device)
 
     def _parts(self, buffer):
         pages = buffer.view(-1, buffer.shape[-1])
@@ -248,9 +262,9 @@ class PagedRows:
     def _copy(self, source, src, target, dst, index=None, to_host=None):
         if self.k.is_cuda:
             from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
-            slab = self.torch.tensor([self.k.data_ptr()], dtype=self.torch.uint64, device=self.k.device)
             host = None if index is None else self.host.data_ptrs[index:index + 1]
-            ptrs = (slab, slab) if index is None else (slab, host) if to_host else (host, slab)
+            ptrs = (self.slab_ptr, self.slab_ptr) if index is None else \
+                (self.slab_ptr, host) if to_host else (host, self.slab_ptr)
             transfer_cache_dsv4_mla(*ptrs, src, dst)
             return
         for part_s, part_t in zip(self._parts(source), self._parts(target)):
@@ -264,6 +278,31 @@ class PagedRows:
 
     def h2d(self, index, host_rows, dst):
         self._copy(self.host.kv_buffer[index], host_rows, self.k, dst, index, False)
+
+    def plan(self, indices, bases):
+        """One copy for all listed layers, as the pinned C4 backup issues it: each layer's device pointer starts
+        at its (page-aligned) plane row ``base`` and every layer shares the row and host indices."""
+        t, page_bytes = self.torch, self.k.stride(0) * self.k.element_size()
+        if any(base % self.PAGE for base in bases):
+            raise ValueError("C4 plane rows must start on a page")
+        src = t.tensor([self.k.data_ptr() + base // self.PAGE * page_bytes for base in bases], dtype=t.uint64,
+                       device=self.k.device)
+        dst = None
+        if self.k.is_cuda:
+            layers = t.tensor(indices, dtype=t.int64, device=self.host.data_ptrs.device)
+            dst = self.host.data_ptrs.view(t.int64)[layers].view(t.uint64)
+        return list(indices), list(bases), src, dst
+
+    def d2h_plan(self, plan, src, host_rows):
+        indices, bases, src_ptrs, dst_ptrs = plan
+        if not indices:
+            return
+        if self.k.is_cuda:
+            from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
+            transfer_cache_dsv4_mla(src_ptrs, dst_ptrs, src.long(), host_rows.long())
+            return
+        for index, base in zip(indices, bases):
+            self.d2h(index, src + base, host_rows)
 class SlabState:
     """Routes, per-slot record counts and the switch executor of one rank's slab.
 
@@ -277,8 +316,8 @@ class SlabState:
         self.host_shadow, self.ratio, self.torch, self.device = host_shadow, ratio, torch, device
         self.routes = do.initial_routes(layout, lists[active])
         self.route = torch.tensor(self.routes.descriptor(layout), dtype=torch.int32, device=device)
-        self.tails = self.route[:, 2].long()
-        self.home, self.coordinator, self.busy = {}, None, lambda: None
+        self.home, self.coordinator, self.busy, self._plans = {}, None, lambda: None, None
+        self.copy_plans()
 
     def layer_index(self, layer):
         return self.geometry.index(layer)
@@ -317,21 +356,33 @@ class SlabState:
     def _stream(self, stream):
         return self.torch.cuda.stream(stream) if self.device.type == "cuda" else nullcontext()
 
-    def home_rows(self, layer, slots, records, logical, buffer):
-        """Absolute home rows of each (slot, record) of ``layer``; -1 where an offloaded record has no hot slot."""
-        base, _ = self.plane(layer)
-        if not self.offloaded(layer):
-            return logical + base
-        return self.torch.where(records < self.geometry.hot_slots, buffer + base, -1)
+    def copy_plans(self):
+        """Host-copy plans of the current routes, built at bind and publication (off the decode path): the layers
+        whose decode records go to host, with their tail views, and the prefill staging of each mode."""
+        key = (self.routes, self.host_shadow)
+        if self._plans is None or self._plans[0] != key:
+            g, rows = self.geometry, self.rows
+            offloaded = [i for i, layer in enumerate(g.layers) if self.offloaded(layer)]
+            kept = [i for i in range(len(g.layers)) if i not in offloaded] if self.host_shadow else []
+            base = [self.plane(layer)[0] for layer in g.layers]
+            self._plans = key, types.SimpleNamespace(
+                flush=rows.plan(offloaded + kept, [self.layout.tail_view(g.layers[i]) for i in offloaded + kept]),
+                stage_offloaded=rows.plan(offloaded, [base[i] for i in offloaded]),
+                stage_resident=rows.plan(kept, [base[i] for i in kept]))
+        return self._plans[1]
 
     def flush(self, slots, records, host_rows):
         """Copy each slot's record ``records[i]`` from its tail row to its home rows and host, on the decode
-        backup stream like the pinned eager backup; the next forward waits for it."""
-        t, c, cuda = self.torch, self.coordinator, self.device.type == "cuda"
-        slots_t, records_t, host_t = self._long(slots), self._long(records), self._long(host_rows)
+        backup stream like the pinned eager backup; the next forward waits for it. Fixed work per step and no host
+        synchronization: one pinned index upload, one tail-to-home copy for all layers, and the host copies of the
+        pinned backup (per layer for MiniMax, one launch for C4)."""
+        t, c, g, cuda = self.torch, self.coordinator, self.geometry, self.device.type == "cuda"
+        plans = self.copy_plans()
+        index = t.tensor([slots, records], dtype=t.int64, pin_memory=cuda).to(self.device, non_blocking=True)
+        slots_t, records_t, host_t = index[0], index[1], self._long(host_rows)
         req_to_token = c.req_to_token_pool.req_to_token
         logical = req_to_token[slots_t, (records_t + 1) * self.ratio - 1].long() // self.ratio
-        buffer = c.req_to_device_buffer[slots_t, records_t.clamp(max=self.geometry.hot_slots)].long()
+        buffer = c.req_to_device_buffer[slots_t, records_t.clamp(max=g.hot_slots)].long()
         if cuda:
             c.wait_for_pending_backup()
             schedule = t.cuda.current_stream()
@@ -340,18 +391,17 @@ class SlabState:
                 c.decode_backup_stream.wait_stream(schedule)
                 if c.decode_producer_stream is not None:
                     c.decode_backup_stream.wait_stream(c.decode_producer_stream)
-            src, dst = [], []
-            for layer in self.geometry.layers:
-                index, tail = self.layer_index(layer), slots_t + self.layout.tail_view(layer)
-                home = self.home_rows(layer, slots_t, records_t, logical, buffer)
-                src.append(tail[home >= 0])
-                dst.append(home[home >= 0])
-                if self.offloaded(layer) or self.host_shadow:
-                    self.rows.d2h(index, tail, host_t)
-            self.rows.d2d(t.cat(src), t.cat(dst))
+            route = self.route.long()
+            tails = route[:, 2:3] + slots_t                     # [|U|, n]
+            # Home rows: a resident layer's logical row, an offloaded record's hot slot; an offloaded record past
+            # the hot slots has none, so its tail row is copied onto itself.
+            hot = t.where(records_t < g.hot_slots, buffer + route[:, 1:2], tails)
+            home = t.where(route[:, 0:1] == do.OFFLOADED, hot, logical + route[:, 1:2])
+            self.rows.d2d(tails.flatten(), home.flatten())
+            self.rows.d2h_plan(plans.flush, slots_t, host_t)
             if cuda:
                 c._backup_done_event.record()
-                for tensor in (slots_t, records_t, host_t, logical, buffer):
+                for tensor in (index, host_t, logical, buffer, route, tails, hot, home):
                     tensor.record_stream(c.decode_backup_stream)
         if cuda:
             c._has_pending_backup = True
@@ -361,12 +411,9 @@ class SlabState:
     def stage(self, logical, device_rows, host_rows):
         """Prefill backup through the routes: offloaded layers from their hot rows, resident ones (host_shadow)
         from their logical rows."""
-        for layer in self.geometry.layers:
-            base, _ = self.plane(layer)
-            if self.offloaded(layer):
-                self.rows.d2h(self.layer_index(layer), device_rows + base, host_rows)
-            elif self.host_shadow:
-                self.rows.d2h(self.layer_index(layer), logical + base, host_rows)
+        plans = self.copy_plans()
+        self.rows.d2h_plan(plans.stage_offloaded, device_rows, host_rows)
+        self.rows.d2h_plan(plans.stage_resident, logical, host_rows)
 
     # SwitchProtocol executor
     def quiesce(self):
@@ -439,6 +486,7 @@ class SlabState:
 
     def publish(self, routes):
         self.routes = routes
+        self.copy_plans()
 
     def signature(self):
         return dict(layout=self.layout.digest, lists={k: list(v) for k, v in self.lists.items()},
@@ -610,9 +658,11 @@ class Placement:
         return offset // row_bytes >= self.layout.k * self.layout.geometry.hot_rows
 
     def receipt_bytes(self, nbytes):
-        out = dict(slab_hot_or_s=nbytes(self.main.k_buffer) + nbytes(getattr(self.main, "v_buffer", [])),
-                   direct_resident=0 if self.resident_pool is None else
-                   nbytes(self.resident_pool.k_buffer) + nbytes(getattr(self.resident_pool, "v_buffer", [])))
+        def pool(p):          # MHA pools hold k_buffer and v_buffer, C4 pools kv_buffer
+            names = ("k_buffer", "v_buffer", "kv_buffer")
+            return 0 if p is None else sum(nbytes(getattr(p, name, [])) for name in names)
+
+        out = dict(slab_hot_or_s=pool(self.main), direct_resident=pool(self.resident_pool))
         if self.state is not None:
             rows = self.state.rows
             out["slab_hot_or_s"] = nbytes(rows.k) + (nbytes(rows.v) if rows.buffers == 2 else 0)
@@ -903,9 +953,11 @@ def receipt(c, p, signature, *, torch):
                          *getattr(host, "kv_buffer", [])])
     tables = dict(tokens=nbytes(c.req_device_buffer_tokens), locs=nbytes(c.req_device_buffer_token_locs),
                   lru=nbytes(c.lru_slots))
+    allocator = c.token_to_kv_pool_allocator
     return dict(event="hisparse_dynamic_offload_bound", tp_size=c.tp_world_size, config_file_sha256=st["digest"],
                 config_sha256=st["config"].digest, resolved_config=st["config"].as_dict(),
                 capabilities=sc.capabilities(st["config"]), signature=signature, cell_size=st.get("charge"),
+                logical_kv=dict(tokens=allocator.size_full, hot_rows=getattr(allocator, "_size_hisparse", None)),
                 ledger=None if p.layout is None else do.ledger(p.layout),
                 bytes=dict(p.receipt_bytes(nbytes), host_pinned=host_bytes, native_tables=tables),
                 device_memory_at_bind=memory,

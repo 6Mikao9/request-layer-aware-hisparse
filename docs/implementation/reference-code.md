@@ -18,6 +18,7 @@
 | [runtime/shared_lru_plan.py](../../runtime/shared_lru_plan.py)、[runtime/cuda_shared_lru_correctness.py](../../runtime/cuda_shared_lru_correctness.py) | 每臂配置与 AB/BA 配对计划；需显式开启的 A100 正确性门（逐次对照 `KernelMirror`，覆盖 eager 与 Graph）。 |
 | [runtime/dynamic_offload.py](../../runtime/dynamic_offload.py)、[runtime/dynamic_offload_device.py](../../runtime/dynamic_offload_device.py) | 逐层动态卸载：slab 布局、路由表、切换计划和 TP 切换协议；MiniMax-M3 与 DeepSeek-V4 的 SGLang 接线、启动与切换收据和 dry-run。 |
 | [runtime/generated_route/hisparse_route.cuh](../../runtime/generated_route/hisparse_route.cuh)、[runtime/cuda_dynamic_offload_correctness.py](../../runtime/cuda_dynamic_offload_correctness.py)、[benchmarks/run_dynamic_offload_a100.sh](../../benchmarks/run_dynamic_offload_a100.sh) | 由固定 `hisparse.cuh` 派生的路由换入核，需显式开启的 A100 正确性门（eager 与 Graph），以及 A100 配方。 |
+| [benchmarks/dynamic_offload_report.py](../../benchmarks/dynamic_offload_report.py)、[benchmarks/nsys_layer_timeline.py](../../benchmarks/nsys_layer_timeline.py)、[benchmarks/plot_layer_timeline.py](../../benchmarks/plot_layer_timeline.py) | 配方输出的汇总：输出一致性、合格配对与 95% 区间、各卡峰值、切换收据，Nsight 每步瓶颈 rank 与每层拆分及成对图。 |
 
 下列 scoped 命令在只包含公开白名单的目录里运行通过。参考套件用 Python 3.12 + CPU PyTorch。命令不下载权重、不需要真实服务、CUDA 设备或任何服务器地址。Windows 如不支持 Linux 特定能力，精确说明跳过项。贡献者把新 CPU 测试加到自己的验收入口。
 

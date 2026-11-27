@@ -11,7 +11,9 @@ Requires the pinned SGLang image, an idle A100 (sm_80) and the repository root o
 * ``production``: MiniMax-M3 (H 4096, 16 blocks of 128 tokens, BF16 rows) and DeepSeek-V4 C4 (H 1024, top-512,
   page-padded 584-byte records) per-request geometry with short and long requests. Each step runs the kernel and the
   statement on identical copies; a switch between steps moves both layers through the real executor and the next
-  step replays the graph captured before it.
+  step replays the graph captured before it. For MiniMax the pinned decode consumer then reads the routed rows: its
+  output must lie within the reader probe's tolerance (atol 0.002, rtol 0.02) of an FP32 attention over host truth,
+  and for the resident-mode layer equal the frozen direct reader bit for bit.
 
     python -m runtime.cuda_dynamic_offload_correctness --allow-cuda-test --output /tmp/dynamic-gate.json
 """
@@ -254,12 +256,71 @@ def choose(rng, model, seq):
     if rng.random() < 0.5:
         blocks[rng.randrange(1, spec["width"] - 1)] = -1
     return blocks, [None if b < 0 else b * spec["block"] + o for b in blocks for o in range(spec["block"])]
-def production(torch, model, seed=5, kernel=None):
-    """Kernel from one captured graph per layer against the statement, before and after a switch of both layers."""
+
+
+def consumer_statement(q, k_cache, v_cache, req_to_token, seq_lens, slot_ids, block_size, topk_idx,
+                       hisparse_slots=None, **_):
+    """CPU statement of the pinned MiniMax decode consumer ``flash_decode_with_gqa_share_sparse`` (one KV head):
+    each row attends over its valid blocks below seq_len, read at ``hisparse_slots`` or at req_to_token rows."""
+    out = q.new_zeros(q.shape)
+    for b in range(q.shape[0]):
+        rows = []
+        for t, block in enumerate(topk_idx[0, b].tolist()):
+            for o in range(block_size if block >= 0 else 0):
+                if block * block_size + o < int(seq_lens[b]):
+                    rows.append(int(hisparse_slots[0, b, t * block_size + o]) if hisparse_slots is not None
+                                else int(req_to_token[int(slot_ids[b]), block * block_size + o]))
+        if rows:
+            out[b] = attend(q[b], k_cache[rows, 0], v_cache[rows, 0]).to(q.dtype)
+    return out
+
+
+def attend(q, k, v):
+    return ((q.float() @ k.float().T) * q.shape[-1] ** -0.5).softmax(-1) @ v.float()
+
+
+def attention_check(torch, s, c, index, truth, slots, picks, got, rpi, seq, consumer, gen):
+    """MiniMax: the pinned consumer reading the routed slab rows against an FP32 reference over host truth
+    (tolerance of the issue #3 reader probe), and, for a resident-mode layer, bit-equal to the frozen direct reader
+    over a stock plane holding every token at its logical row."""
+    t, spec, rows = torch, SPECS["minimax_m3"], s.rows
+    q = t.randn((len(slots) + 1, 8, rows.k.shape[-1]), generator=gen).to(t.bfloat16).to(DEVICE)
+    topk = t.tensor([p for p, _ in picks] + [[-1] * spec["width"]], dtype=t.int32, device=DEVICE)[None]
+    kwargs = dict(q=q, sink=None, req_to_token=c.req_to_token_pool.req_to_token, seq_lens=seq.to(t.int32),
+                  slot_ids=rpi, block_size=spec["block"], topk_idx=topk, page_size=spec["page"])
+    out = consumer(k_cache=rows.k, v_cache=rows.v, hisparse_slots=got[None], **kwargs)
+    errors, problems = [], []
+    for b, (x, (_, expanded)) in enumerate(zip(slots, picks)):
+        host = [truth[x]["host"][p] for p in expanded if p is not None and p < truth[x]["n"]]
+        want = attend(q[b].cpu(), rows.host.k_buffer[index][host, 0], rows.host.v_buffer[index][host, 0])
+        errors.append(float((out[b].float().cpu() - want).abs().max()))
+        if not t.allclose(out[b].float().cpu(), want, atol=0.002, rtol=0.02):
+            problems.append(f"slot {x}: attention exceeds the FP32 tolerance")
+    if not s.offloaded(s.geometry.layers[index]):
+        size = c.req_to_token_pool.req_to_token.max().item() + 1
+        direct = [t.zeros((size, 1, rows.k.shape[-1]), dtype=rows.k.dtype, device=DEVICE) for _ in range(2)]
+        for x in slots:
+            n, logical = truth[x]["n"], truth[x]["logical"]
+            for plane, host in zip(direct, (rows.host.k_buffer[index], rows.host.v_buffer[index])):
+                plane[logical:logical + n] = host[truth[x]["host"][:n]].to(DEVICE)
+        frozen = consumer(k_cache=direct[0], v_cache=direct[1], hisparse_slots=None, **kwargs)
+        if not t.equal(out[:len(slots)].cpu(), frozen[:len(slots)].cpu()):
+            problems.append("resident layer differs from the frozen direct reader")
+    return errors, problems
+def production(torch, model, seed=5, kernel=None, consumer=None):
+    """Kernel from one captured graph per layer against the statement, before and after a switch of both layers;
+    MiniMax also checks the pinned decode consumer over the routed rows (``attention_check``)."""
     spec = SPECS[model]
     (sa, ca, truth), (sb, cb, _) = build(torch, model, seed), build(torch, model, seed)
     graph = kernel or GraphSwap(torch, spec["width"], spec["block"])
-    rng, problems, compared = random.Random(seed + 1), [], 0
+    if consumer is None and model == "minimax_m3":
+        if DEVICE == "cuda":
+            from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import \
+                flash_decode_with_gqa_share_sparse as consumer
+        else:
+            consumer = consumer_statement
+    rng, problems, compared, errors = random.Random(seed + 1), [], 0, []
+    gen = torch.Generator().manual_seed(seed + 2)
     slots = sorted(truth)
     for step in range(2):
         if step:                                   # switch, then this step's flush and decode store
@@ -306,10 +367,14 @@ def production(torch, model, seed=5, kernel=None):
                     problems.append(f"step {step} layer {layer} slot {x}: a slot does not hold its token")
             if got[len(slots):].ne(-1).any():
                 problems.append(f"step {step} layer {layer}: padded row is not -1")
+            if consumer is not None:
+                found, issues = attention_check(torch, sa, ca, index, truth, slots, picks, got, rpi, seq, consumer, gen)
+                errors += found
+                problems += [f"step {step} layer {layer}: {issue}" for issue in issues]
     return dict(model=model, records=list(spec["records"]), hot_slots=spec["hot"], compared_rows=compared,
                 graph_replays=getattr(graph, "replays", None), graphs=len(getattr(graph, "graphs", ())),
-                final_routes=sa.route.tolist(),
-                problems=problems[:20], passed=not problems)
+                final_routes=sa.route.tolist(), attention_checks=len(errors),
+                fp32_max_abs_error=max(errors) if errors else None, problems=problems[:20], passed=not problems)
 
 
 def main():

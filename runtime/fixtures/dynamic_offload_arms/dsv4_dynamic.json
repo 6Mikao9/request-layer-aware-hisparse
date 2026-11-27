@@ -1,1 +1,1 @@
-{"schema": "hisparse-study-config-v1", "placement": {"mode": "fixed_layers", "offload_layers": [4, 28, 30, 36, 42], "alternate_offload_layers": [[14, 16, 24, 34, 40]]}, "features": {"route_indirect": true, "dynamic_offload": true}}
+{"schema": "hisparse-study-config-v1", "placement": {"mode": "fixed_layers", "offload_layers": [14, 16, 24, 34, 40], "alternate_offload_layers": [[4, 28, 30, 36, 42]]}, "features": {"route_indirect": true, "dynamic_offload": true}}

@@ -1,4 +1,5 @@
 """CPU tests of the layer offload adapter: torch slab state against the pure model, page-padded rows, dry runs."""
+import collections
 import contextlib
 import hashlib
 import io
@@ -253,6 +254,54 @@ class DeviceStateTests(unittest.TestCase):
         expect = [[(1064 + 3) // 4, (1064 + 11) // 4, -1], [(1192 + 23) // 4, (1192 + 7) // 4, -1], [-1, -1, -1]]
         self.assertEqual(out.tolist(), expect)
 
+    def test_flush_work_is_fixed_and_sync_free(self):
+        """The decode flush issues the same index ops for 5 and 40 switchable layers, never a boolean-mask
+        selection (a host sync on CUDA), one index upload, and the pinned backup's host copies: per layer for
+        MiniMax rows, one launch for C4 pages."""
+        from torch.profiler import ProfilerActivity, profile
+
+        def flush(paged, layers):
+            page = 64 if paged else PAGE
+            g = do.Geometry(layers=tuple(range(layers)), hot_rows=page * 8, resident_rows=page * 16, hot_slots=8,
+                            slots=5, page=page, page_bytes=37440 if paged else page * 16, buffers=1 if paged else 2)
+            layout = do.SlabLayout(g, layers // 2)
+            host = types.SimpleNamespace(kv_buffer=[torch.zeros((2, 37440), dtype=torch.uint8)] * layers,
+                                         k_buffer=[torch.zeros((64, 1, 4))] * layers,
+                                         v_buffer=[torch.zeros((64, 1, 4))] * layers)
+            rows = dev.PagedRows(torch, torch.zeros((layout.rows // 64, 37440), dtype=torch.uint8), host) if paged \
+                else dev.MHARows(torch, torch.zeros((layout.rows, 1, 4)), torch.zeros((layout.rows, 1, 4)), host)
+            s = dev.SlabState(layout, {"0": tuple(range(layers // 2))}, rows, active="0", host_shadow=False,
+                              ratio=4 if paged else 1, torch=torch, device=torch.device("cpu"))
+            s.coordinator = types.SimpleNamespace(
+                req_to_token_pool=types.SimpleNamespace(req_to_token=torch.arange(5 * 64, dtype=torch.int32)
+                                                        .view(5, 64) % (page * 15)),
+                req_to_device_buffer=torch.arange(5 * 12).view(5, 12) % (page * 7),
+                decode_backup_stream=None, decode_producer_stream=None)
+            launches = collections.Counter()
+            rows.d2d = lambda *a: launches.update(["d2d"])
+            if paged:                                          # one transfer_cache_dsv4_mla launch per plan
+                rows.d2h_plan = lambda plan, *a: launches.update(["host"] if plan[0] else [])
+            else:                                              # one transfer_kv_per_layer launch per layer
+                rows._host = lambda *a: launches.update(["host"])
+            with profile(activities=[ProfilerActivity.CPU]) as prof:
+                s.flush([1, 2, 3, 4], [0, 3, 7, 9], torch.tensor([0, 1, 0, 1]))
+            views = {"aten::select", "aten::slice", "aten::view", "aten::unsqueeze", "aten::as_strided",
+                     "aten::expand", "aten::flatten", "aten::reshape", "aten::alias"}     # no CUDA launch
+            top = [e.name for e in prof.events() if e.name.startswith("aten::") and e.name not in views
+                   and (e.cpu_parent is None or not e.cpu_parent.name.startswith("aten::"))]
+            masks = sum(e.name in ("aten::nonzero", "aten::masked_select") for e in prof.events())
+            return len(top), masks, dict(launches), s
+
+        for paged in (False, True):
+            with self.subTest(paged=paged):
+                (few, few_masks, _, _), (many, many_masks, launches, s) = flush(paged, 5), flush(paged, 40)
+                self.assertEqual((few, few_masks, many_masks), (many, 0, 0))
+                self.assertEqual(launches, dict(d2d=1, host=1 if paged else 20))
+        indices, bases, src, _ = s.copy_plans().flush         # C4 pointers start at the tail view's page
+        self.assertEqual(src.tolist(), [s.rows.k[base // 64].data_ptr() for base in bases])
+        with self.assertRaisesRegex(ValueError, "page"):
+            s.rows.plan([0], [3])
+
     def test_a100_gate_harness_on_cpu(self):
         """The gate's own drivers with the statement in place of the kernel: history with a rollback, and both
         models' production geometry through a switch (the A100 run then only swaps in the kernel)."""
@@ -284,6 +333,11 @@ class DeviceStateTests(unittest.TestCase):
                 self.assertTrue(result["passed"], result["problems"])
                 self.assertGreater(result["compared_rows"], 8000)
                 self.assertEqual(result["final_routes"][0][0], do.RESIDENT)    # layer 2 left S in the switch
+                if model == "minimax_m3":                   # consumer over routed rows vs FP32 and frozen reader
+                    self.assertEqual(result["attention_checks"], 2 * 2 * 4)
+                    self.assertLess(result["fp32_max_abs_error"], 0.002)
+                else:
+                    self.assertIsNone(result["fp32_max_abs_error"])
         finally:
             gate.DEVICE, gate.cuda_rank = previous, original
 
@@ -301,8 +355,8 @@ class AdapterTests(unittest.TestCase):
         geo = dict(dev.PRESETS["minimax_m3"], eligible=dev.parse_layers("0-59"))
         mm = sc.parse(json.loads((ROOT / "fixtures" / "dynamic_offload_arms" / "minimax_dynamic.json").read_text()))
         lists, slab, resident, layout = dev.plan_geometry(mm, "minimax_m3", **geo)
-        self.assertEqual((len(lists["0"]), len(slab), len(resident), layout.k), (40, 50, 10, 40))
-        self.assertEqual(layout.rows, 40 * 396_672 + 10 * (2 * 396_544 + 128) + 50 * 256)
+        self.assertEqual((len(lists["0"]), len(slab), len(resident), layout.k), (40, 51, 9, 40))
+        self.assertEqual(layout.rows, 40 * 396_672 + 11 * (2 * 396_544 + 128) + 51 * 256)
         ledger = do.ledger(layout)["device"]
         self.assertEqual(ledger["dynamic"]["hot"] + ledger["dynamic"]["resident"],
                          ledger["frozen"]["hot"] + ledger["frozen"]["resident"])
