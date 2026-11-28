@@ -195,7 +195,7 @@ class SwitchedMirrorsMatchThePlainStatement(unittest.TestCase):
                                               mirror.row_bits), [])
 
     def test_switch_registry_and_exclusive_pairs(self):
-        self.assertEqual(set(s.RESOLVER_FEATURES), set(sc.FEATURES))
+        self.assertEqual(set(s.RESOLVER_FEATURES), set(sc.ARENA_FEATURES))
         self.assertEqual(s.EXCLUSIVE_FEATURES, sc.EXCLUSIVE_FEATURES)
         self.assertEqual(len(SWITCH_SETS), 18)
         plan = s.plan_arena(base.SHARED, (0, 1), 8, 4)
@@ -207,7 +207,7 @@ class SwitchedMirrorsMatchThePlainStatement(unittest.TestCase):
         plan = s.plan_arena(base.SHARED, (0, 1), 8, 4)
         with self.assertRaises(ValueError):
             s.KernelMirror(plan, plane_rows=64, features=("hash_lookup",))
-        self.assertEqual(set(s.RESOLVER_FEATURES), set(sc.FEATURES))
+        self.assertEqual(set(s.RESOLVER_FEATURES), set(sc.ARENA_FEATURES))
 
 
 # -- thread-level statements of the CUDA index arithmetic ------------------------------------

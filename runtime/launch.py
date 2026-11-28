@@ -36,6 +36,8 @@ class LaunchPlan:
     request_config_sha256: str | None = None
     study_config_path: str | None = None
     study_config_sha256: str | None = None
+    elastic_config_path: str | None = None
+    elastic_config_sha256: str | None = None
 
 
 def strict_object(pairs):
@@ -153,12 +155,69 @@ def check_study_execution(argv):
             raise ValueError("Shared-arena decode must be eager or full CUDA Graph")
 
 
-def check_plan(plan, policy, request_config=None, study_config=None):
+def check_offload_execution(argv, study_config):
+    """Fixed offload sets share the arena's single-stream rules; route_indirect also needs eager prefill, whose
+    stores and reads are routed in Python at call time."""
+    check_study_execution(argv)
+    if not study_config.feature("route_indirect"):
+        return
+    if "--enable-mixed-chunk" in argv:
+        raise ValueError("features.route_indirect routes decode stores to tail rows; mixed chunks would send decode "
+                         "tokens through the prefill path")
+    raw_graph = flag_value(argv, "--cuda-graph-config")
+    prefill = parse_object(raw_graph).get("prefill", {}) if raw_graph is not None else None
+    if "--disable-prefill-cuda-graph" not in argv and (type(prefill) is not dict
+                                                       or prefill.get("backend") != "disabled"):
+        raise ValueError("features.route_indirect requires eager prefill: pass --disable-prefill-cuda-graph or a "
+                         "--cuda-graph-config prefill backend 'disabled'")
+
+
+def check_elastic_execution(argv, model):
+    """Elastic per-layer HiSparse (issue #13): single-stream decode, eager prefill (its stores follow the layer
+    modes of the moment), BF16 KV for MiniMax and DSA (DeepSeek-V4 keeps its V4 C4 pages); PD decode nodes are
+    allowed, prefill nodes run stock SGLang."""
+    flags = {arg.partition("=")[0] for arg in argv}
+    forbidden = {"--config", "--enable-two-batch-overlap", "--enable-single-batch-overlap", "--enable-pdmux",
+                 "--enable-mixed-chunk"}
+    if not {"--disable-overlap-schedule", "--disable-radix-cache"}.issubset(argv) or flags & forbidden:
+        raise ValueError("Elastic layers require --disable-overlap-schedule, --disable-radix-cache and no "
+                         "config, overlap, PD multiplexing or mixed-chunk overrides")
+    if (flag_value(argv, "--disaggregation-mode") not in (None, "null", "decode")
+            or flag_value(argv, "--speculative-algorithm") not in (None, "NONE")):
+        raise ValueError("Elastic layers run on a normal or PD decode node without speculation")
+    if model != "deepseek_v4" and flag_value(argv, "--kv-cache-dtype") not in (None, "auto", "bf16", "bfloat16"):
+        raise ValueError("Elastic MiniMax and DSA layers store unquantized BF16 KV")
+    raw_graph = flag_value(argv, "--cuda-graph-config")
+    graph = parse_object(raw_graph) if raw_graph is not None else {}
+    decode, prefill = graph.get("decode", {}), graph.get("prefill", {})
+    if type(decode) is not dict or decode.get("backend", "full") not in ("full", "disabled"):
+        raise ValueError("Elastic decode must be eager or full CUDA Graph")
+    if "--disable-prefill-cuda-graph" not in argv and (type(prefill) is not dict
+                                                       or prefill.get("backend") != "disabled"):
+        raise ValueError("Elastic layers require eager prefill: pass --disable-prefill-cuda-graph or a "
+                         "--cuda-graph-config prefill backend 'disabled'")
+
+
+def check_plan(plan, policy, request_config=None, study_config=None, elastic_config=None):
     if type(plan.tp_size) is not int or plan.tp_size not in (4, 8):
         raise ValueError("The launcher requires explicit TP4 or TP8")
     if type(plan.sm80_bf16_projections) is not bool:
         raise ValueError("Invalid SM80 projection selection")
     validate_capacity(plan.hmax, plan.hmax, plan.top_k, 1)
+    if (plan.elastic_config_path is None) != (plan.elastic_config_sha256 is None):
+        raise ValueError("Incomplete frozen elastic configuration identity")
+    if plan.elastic_config_path is not None:
+        from .elastic_config import ElasticConfig
+        if (not isinstance(elastic_config, ElasticConfig) or policy is not None or request_config is not None
+                or study_config is not None
+                or any(value is not None for value in (plan.policy_path, plan.request_config_path,
+                    plan.study_config_path, plan.shadow_identity_directory, plan.selection_oracle_directory,
+                    plan.split_copy_config))
+                or plan.six_layer_timing or plan.six_layer_state):
+            raise ValueError("--hisparse-elastic-config is separate from every other overlay and diagnostic")
+        return None
+    if elastic_config is not None:
+        raise ValueError("Unexpected elastic configuration without a frozen file")
     if (plan.study_config_path is None) != (plan.study_config_sha256 is None):
         raise ValueError("Incomplete frozen study configuration identity")
     if plan.study_config_path is not None:
@@ -236,6 +295,8 @@ def resolve(argv):
     policy_options.add_argument("--request-type-config", type=Path)
     policy_options.add_argument("--hisparse-study-config", type=Path, metavar="PATH",
                                 help="hisparse-study-config-v1 arm (all-default selects stock HiSparse)")
+    policy_options.add_argument("--hisparse-elastic-config", type=Path, metavar="PATH",
+                                help="hisparse-elastic-v1: pressure-driven per-layer offload (issue #13)")
     parser.add_argument("--sm80-bf16-projections", action="store_true")
     diagnostics = parser.add_mutually_exclusive_group()
     diagnostics.add_argument("--shadow-identity", type=Path, metavar="DIRECTORY")
@@ -280,6 +341,15 @@ def resolve(argv):
             study_config, study_digest = read_study_config(study_path)
             if study_config.uses_arena:
                 check_study_execution(sglang_argv)
+            elif study_config.uses_fixed_layers:
+                check_offload_execution(sglang_argv, study_config)
+        elastic_path = (str(options.hisparse_elastic_config.expanduser().resolve(strict=True))
+                        if options.hisparse_elastic_config else None)
+        elastic_config, elastic_digest = None, None
+        if elastic_path is not None:
+            from .elastic_config import read as read_elastic_config
+            elastic_config, elastic_digest = read_elastic_config(elastic_path)
+            check_elastic_execution(sglang_argv, elastic_config.model)
         if options.six_layer_timing:
             required = {"--disable-cuda-graph", "--disable-prefill-cuda-graph",
                         "--disable-overlap-schedule", "--disable-radix-cache"}
@@ -308,8 +378,8 @@ def resolve(argv):
                           str(diagnostic) if options.shadow_identity is not None else None,
                           str(diagnostic) if options.selection_oracle is not None else None,
                           split_config, options.six_layer_timing, options.six_layer_state,
-                          request_path, request_digest, study_path, study_digest)
-        check_plan(plan, policy, request_config, study_config)
+                          request_path, request_digest, study_path, study_digest, elastic_path, elastic_digest)
+        check_plan(plan, policy, request_config, study_config, elastic_config)
     except (OSError, TypeError, ValueError) as error:
         parser.error(str(error))
     return plan, sglang_argv, options.dry_run
@@ -327,17 +397,27 @@ def install_for_process(plan):
     if plan.study_config_path is not None:
         from .study_config import read as read_study_config
         study_config = read_study_config(plan.study_config_path, plan.study_config_sha256)[0]
-    split_config = check_plan(plan, policy, request_config, study_config)
+    elastic_config = None
+    if plan.elastic_config_path is not None:
+        from .elastic_config import read as read_elastic_config
+        elastic_config = read_elastic_config(plan.elastic_config_path, plan.elastic_config_sha256)[0]
+    split_config = check_plan(plan, policy, request_config, study_config, elastic_config)
     if plan.sm80_bf16_projections:
         source = Path(__file__).with_name("compat") / "minimax_sm80.py"
         if sha256(source.read_bytes()).hexdigest() != SM80_SHA256:
             raise RuntimeError("Vendored SM80 adapter SHA-256 differs")
 
-    if request_config is not None:
+    if elastic_config is not None:
+        from .elastic_device import install
+        install(elastic_config, plan.elastic_config_sha256)
+    elif request_config is not None:
         from .request_hook import install
         install(**request_config.install_kwargs())
     elif study_config is not None and study_config.uses_arena:
         from .shared_lru_device import install
+        install(study_config, plan.study_config_sha256)
+    elif study_config is not None and study_config.uses_fixed_layers:
+        from .dynamic_offload_device import install
         install(study_config, plan.study_config_sha256)
     elif plan.shadow_identity_directory is not None:
         from .shadow import install
@@ -377,6 +457,8 @@ def main(argv=None):
         mode = 'request_type_layer_overlay'
     elif plan.study_config_path is not None:
         mode = "hisparse_study_config"
+    elif plan.elastic_config_path is not None:
+        mode = "hisparse_elastic"
     elif plan.shadow_identity_directory is not None:
         mode = "shadow_identity"
     elif plan.selection_oracle_directory is not None:
@@ -389,6 +471,10 @@ def main(argv=None):
         study = read_study_config(plan.study_config_path, plan.study_config_sha256)[0]
         summary |= {"study_config_canonical_sha256": study.digest, "study_resolved_config": study.as_dict(),
                     "study_capabilities": capabilities(study)}
+    if plan.elastic_config_path is not None:
+        from .elastic_config import read as read_elastic_config
+        elastic = read_elastic_config(plan.elastic_config_path, plan.elastic_config_sha256)[0]
+        summary |= {"elastic_config_canonical_sha256": elastic.digest, "elastic_config": elastic.as_dict()}
     print(json.dumps(summary, sort_keys=True), flush=True)
     if dry_run:
         return 0

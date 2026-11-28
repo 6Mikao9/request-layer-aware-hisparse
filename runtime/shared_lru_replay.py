@@ -238,6 +238,9 @@ def main(argv=None):
         fixture, fixture_digest = read_fixture(args.fixture)
         config, config_digest = sc.read(args.config)
         reasons = sc.unsupported_reasons(config)
+        if config.placement.mode != "native":
+            reasons.append("the replay models native placement; fixed offload sets are checked by "
+                           "runtime.test_dynamic_offload")
         if reasons:
             raise ValueError("; ".join(reasons))
     except (OSError, ValueError) as error:

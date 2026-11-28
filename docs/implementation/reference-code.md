@@ -16,6 +16,9 @@
 | [runtime/shared_lru.py](../../runtime/shared_lru.py)、[runtime/shared_lru_replay.py](../../runtime/shared_lru_replay.py) | 全层共享热池的 CPU 参考（代次、租约、LRU/FIFO、静态配额、软保底、旁路）、原生逐层 LRU 对照、与 CUDA 核逐步一致的 `KernelMirror` 和固定夹具回放。 |
 | [runtime/shared_lru_kernel.cuh](../../runtime/shared_lru_kernel.cuh)、[runtime/shared_lru_device.py](../../runtime/shared_lru_device.py) | 共享热池的 SM80 解析/回填核与 SGLang 接线：连续主 KV 平面、协调器生命周期、消费者视图、启动收据和不加载模型的 dry-run。 |
 | [runtime/shared_lru_plan.py](../../runtime/shared_lru_plan.py)、[runtime/cuda_shared_lru_correctness.py](../../runtime/cuda_shared_lru_correctness.py) | 每臂配置与 AB/BA 配对计划；需显式开启的 A100 正确性门（逐次对照 `KernelMirror`，覆盖 eager 与 Graph）。 |
+| [runtime/dynamic_offload.py](../../runtime/dynamic_offload.py)、[runtime/dynamic_offload_device.py](../../runtime/dynamic_offload_device.py) | 逐层动态卸载：slab 布局、路由表、切换计划和 TP 切换协议；MiniMax-M3 与 DeepSeek-V4 的 SGLang 接线、启动与切换收据和 dry-run。 |
+| [runtime/generated_route/hisparse_route.cuh](../../runtime/generated_route/hisparse_route.cuh)、[runtime/cuda_dynamic_offload_correctness.py](../../runtime/cuda_dynamic_offload_correctness.py)、[benchmarks/run_dynamic_offload_a100.sh](../../benchmarks/run_dynamic_offload_a100.sh) | 由固定 `hisparse.cuh` 派生的路由换入核，需显式开启的 A100 正确性门（eager 与 Graph），以及 A100 配方。 |
+| [benchmarks/dynamic_offload_report.py](../../benchmarks/dynamic_offload_report.py)、[benchmarks/nsys_layer_timeline.py](../../benchmarks/nsys_layer_timeline.py)、[benchmarks/plot_layer_timeline.py](../../benchmarks/plot_layer_timeline.py) | 配方输出的汇总：输出一致性、合格配对与 95% 区间、各卡峰值、切换收据，Nsight 每步瓶颈 rank 与每层拆分及成对图。 |
 
 下列 scoped 命令在只包含公开白名单的目录里运行通过。参考套件用 Python 3.12 + CPU PyTorch。命令不下载权重、不需要真实服务、CUDA 设备或任何服务器地址。Windows 如不支持 Linux 特定能力，精确说明跳过项。贡献者把新 CPU 测试加到自己的验收入口。
 
@@ -148,6 +151,10 @@ dry-run 输出每个层的精确启动参数，包括模板参数、整型参数
 5. Nsight Systems 带 `--cuda-graph-trace=node` 采集，由 `benchmarks.nsys_graph_summary` 汇总图节点、流内次序，以及图提交返回到首个 GPU 节点的排队时间。
 
 整模服务按计划里新增的配对运行：每个开关单独、三者合并、isolated 与 shared 同为 indexed、以及 stock 对 shared_lru_indexed。这一步以及全部 GPU 数据都属于 `pending_hardware`。
+
+### 逐层动态卸载（[dynamic-offload](dynamic-offload.md)）
+
+设计、开关、显存账本、CPU 命令和 A100 配方见该文档。GPU 结果全部属于 `pending_hardware`。
 
 ## 后续实机可复用的最小 CUDA 测试
 

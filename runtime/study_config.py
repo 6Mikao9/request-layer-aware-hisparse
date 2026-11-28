@@ -40,12 +40,23 @@ DIAGNOSTICS = ("none", "counters", "nsys")
 #   rebuild at the domain's first plane, at most once per decode step.
 # compact_owner: owner tags shrink from int32 (generation << 16 | plane) to one
 #   byte per row; slot reuse relies on init_slot rewriting every tag in stream order.
-FEATURES = ("owner_summary", "touched_bitmap", "hit_index", "incremental_lru", "compact_owner")
+ARENA_FEATURES = ("owner_summary", "touched_bitmap", "hit_index", "incremental_lru", "compact_owner")
+# The next three belong to a fixed offload set over the stock hot pool (issue #11, dynamic-offload.md):
+# route_indirect: the switchable layers (the union of the registered offload lists) live in one slab per K
+#   and V with absolute rows; a GPU route table gives each layer its plane, the decode store writes the
+#   newest token to a fixed tail row, and one route-aware swap kernel per layer serves either mode, so a
+#   captured CUDA Graph stays valid across switches. Off: every layer keeps its stock pool and path.
+# dynamic_offload: the scheduler may move between the registered lists at runtime, agreed on every TP rank
+#   and rolled back as a group on failure.
+# host_shadow: resident switchable layers keep their host history current, so a switch skips the
+#   device-to-host copy of the layers that become offloaded.
+PLACEMENT_FEATURES = ("route_indirect", "dynamic_offload", "host_shadow")
+FEATURES = ARENA_FEATURES + PLACEMENT_FEATURES
 # Pairs that implement the same phase two ways; one ablation measures one of them.
 EXCLUSIVE_FEATURES = (("owner_summary", "hit_index"), ("touched_bitmap", "incremental_lru"))
 
 _TOP = {"schema", "placement", "hot_pool", "features", "diagnostics"}
-_PLACEMENT = {"mode", "selection", "offload_layers", "seed", "calibration"}
+_PLACEMENT = {"mode", "selection", "offload_layers", "alternate_offload_layers", "seed", "calibration"}
 _HOT_POOL = {"mode", "scope", "layout", "eviction", "admission", "bypass_layers",
              "quota", "quota_rows", "floor_rows"}
 
@@ -130,9 +141,12 @@ class Placement:
     offload_layers: tuple = ()
     seed: int | None = None
     calibration: tuple | None = None  # (training_sha256, list_sha256)
+    alternates: tuple = ()            # further offload lists of the same size; list i + 1 is alternates[i]
 
     def as_dict(self):
         out = dict(mode=self.mode, selection=self.selection, offload_layers=list(self.offload_layers))
+        if self.alternates:
+            out["alternate_offload_layers"] = [list(layers) for layers in self.alternates]
         if self.seed is not None:
             out["seed"] = self.seed
         if self.calibration is not None:
@@ -192,6 +206,16 @@ class StudyConfig:
     def uses_arena(self):
         return self.hot_pool.layout == "arena"
 
+    @property
+    def uses_fixed_layers(self):
+        """Listed layers are host-backed with the stock hot pool; the other eligible layers keep full GPU KV."""
+        return self.placement.mode == "fixed_layers"
+
+    @property
+    def offload_lists(self):
+        """Registered offload lists by index; list 0 (``offload_layers``) is active at startup."""
+        return (self.placement.offload_layers, *self.placement.alternates)
+
     def feature(self, name):
         """Resolved value of a registered engineering switch (absent means off)."""
         if name not in FEATURES:
@@ -229,7 +253,18 @@ def parse(data):
             raise ValueError("placement.calibration needs exactly training_sha256 and list_sha256")
         calibration = (_digest(calibration["training_sha256"], "placement.calibration.training_sha256"),
                        _digest(calibration["list_sha256"], "placement.calibration.list_sha256"))
-    placement = Placement(mode, selection, offload, seed, calibration)
+    alternates = raw.get("alternate_offload_layers")
+    if alternates is not None:
+        if mode != "fixed_layers" or type(alternates) is not list or not alternates:
+            raise ValueError("placement.alternate_offload_layers is a non-empty array of offload lists for "
+                             "placement.mode=fixed_layers")
+        alternates = tuple(_layers(item, f"placement.alternate_offload_layers[{index}]")
+                           for index, item in enumerate(alternates))
+        if any(len(item) != len(offload) for item in alternates):
+            raise ValueError("every alternate offload list has as many layers as placement.offload_layers")
+        if len(set((offload, *alternates))) != len(alternates) + 1:
+            raise ValueError("placement.alternate_offload_layers repeats a registered offload list")
+    placement = Placement(mode, selection, offload, seed, calibration, alternates or ())
 
     raw = _section(data, "hot_pool", _HOT_POOL)
     pool_mode = _choice(raw, "mode", POOL_MODES, "hot_pool")
@@ -267,7 +302,7 @@ def parse(data):
             raise ValueError(f"Unknown feature switch {name!r}; this build registers {list(FEATURES)}")
         if type(enabled) is not bool:
             raise ValueError(f"features.{name} must be a boolean")
-        if enabled and layout != "arena":
+        if enabled and name in ARENA_FEATURES and layout != "arena":
             raise ValueError(f"features.{name} changes the arena resolver; hot_pool.layout=native runs the "
                              "stock kernel unmodified")
     features = tuple(sorted((name, True) for name, enabled in raw.items() if enabled))
@@ -275,6 +310,20 @@ def parse(data):
         if set(pair) <= {name for name, _ in features}:
             raise ValueError(f"features.{pair[0]} and features.{pair[1]} implement the same resolver phase; "
                              "enable at most one")
+    enabled = {name for name, _ in features}
+    if enabled & set(PLACEMENT_FEATURES) and (mode != "fixed_layers" or layout != "native"):
+        raise ValueError("features.route_indirect, dynamic_offload and host_shadow apply to placement.mode="
+                         "fixed_layers with hot_pool.layout=native")
+    if "dynamic_offload" in enabled and "route_indirect" not in enabled:
+        raise ValueError("features.dynamic_offload needs features.route_indirect: a captured CUDA Graph can only "
+                         "switch through the route table")
+    if "dynamic_offload" in enabled and not placement.alternates:
+        raise ValueError("features.dynamic_offload needs placement.alternate_offload_layers to switch to")
+    if "host_shadow" in enabled and "dynamic_offload" not in enabled:
+        raise ValueError("features.host_shadow only shortens switches; it needs features.dynamic_offload")
+    if placement.alternates and "route_indirect" not in enabled:
+        raise ValueError("placement.alternate_offload_layers needs features.route_indirect, whose slab covers "
+                         "every registered list")
 
     raw = _section(data, "diagnostics", {"mode"})
     diagnostics = _choice(raw, "mode", DIAGNOSTICS, "diagnostics")
@@ -293,12 +342,37 @@ def read(path, expected_sha256=None):
 def unsupported_reasons(config):
     """Arms this build cannot execute. The launcher refuses them before workers start."""
     reasons = []
-    if config.placement.mode != "native":
-        reasons.append(f"placement.mode={config.placement.mode} is owned by the layer-eviction/combined "
-                       "efforts and is not implemented in this build")
+    if config.placement.mode == "full_resident":
+        reasons.append("placement.mode=full_resident is the all-resident control; serve it with the pinned SGLang "
+                       "without --enable-hisparse")
+    if config.uses_fixed_layers and config.uses_arena:
+        reasons.append("a fixed offload set over the shared arena is owned by the combined effort and is not "
+                       "implemented in this build")
     if config.hot_pool.layout == "native" and config.diagnostics != "none":
         reasons.append("diagnostics counters/nsys instrument the arena resolver; stock layout runs unmodified")
     return reasons
+
+
+def _placement_capabilities(config):
+    indirect, dynamic = config.feature("route_indirect"), config.feature("dynamic_offload")
+    lists = config.offload_lists
+    switchable = sorted(set().union(*lists)) if indirect else list(lists[0])
+    return dict(
+        runtime="dynamic_layer_offload" if dynamic else "fixed_layers_route_indirect" if indirect else
+        "fixed_layers_stock_paths",
+        experimental_gpu_state=True,
+        placement=dict(offload_lists=[list(layers) for layers in lists], startup_list=0,
+                       switchable_layers=switchable),
+        offloaded_path=("route-aware swap rlh_dynamic_offload::route (CUDA C++, sm_80) over the slab" if indirect
+                        else "stock swap on the offload set's own HiSparse planes"),
+        resident_path=("switchable layers: the same kernel writes base + req_to_token rows as HiSparse slots; "
+                       "others: the stock consumer reads req_to_token rows" if indirect
+                       else "the stock consumer reads req_to_token rows of the full GPU main KV"),
+        host_backing="every switchable layer (host_shadow keeps resident ones current)" if indirect
+        else "offloaded layers only",
+        switching=("TP-agreed runtime switch between registered lists, group rollback" if dynamic else None),
+        features={name: config.feature(name) for name in PLACEMENT_FEATURES},
+    )
 
 
 def capabilities(config):
@@ -321,7 +395,7 @@ def capabilities(config):
             recency_update = "per-row owner/token/hash lookup, per-1024-row compaction, bitonic sort"
         owner_tags = ("compact_owner: uint8 plane per row, 254 taken, 255 free" if config.feature("compact_owner")
                       else "int32 generation << 16 | plane, -1 free, -2 taken")
-    return dict(
+    caps = dict(
         runtime="stock_hisparse" if not arena else "shared_lru_arena",
         experimental_gpu_state=arena,
         resolver=None if not arena else "rlh_shared_lru::resolve (CUDA C++, sm_80)",
@@ -332,9 +406,14 @@ def capabilities(config):
         admission=pool.admission,
         diagnostics=config.diagnostics,
         registered_features=list(FEATURES),
-        features={name: config.feature(name) for name in FEATURES} if arena else {},
+        features={name: config.feature(name) for name in ARENA_FEATURES} if arena else {},
         hit_search=hit_search,
         recency_update=recency_update,
         owner_tags=owner_tags,
         unsupported=unsupported_reasons(config),
     )
+    if config.uses_fixed_layers and not arena:
+        caps.update(_placement_capabilities(config))
+        caps["consumer_base"] = ("one slab of the switchable layers' planes and tail rows" if
+                                 config.feature("route_indirect") else "per-layer main KV plane")
+    return caps

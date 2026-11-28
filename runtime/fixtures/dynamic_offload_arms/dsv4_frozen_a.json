@@ -1,0 +1,1 @@
+{"schema": "hisparse-study-config-v1", "placement": {"mode": "fixed_layers", "offload_layers": [4, 28, 30, 36, 42]}}

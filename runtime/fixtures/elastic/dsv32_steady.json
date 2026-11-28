@@ -1,0 +1,22 @@
+{
+ "schema": "hisparse-elastic-v1",
+ "model": "dsa",
+ "mode": "steady",
+ "layers": {
+  "eviction_order": "by_miss_rate",
+  "granularity": 8,
+  "always_offload": [],
+  "pinned_resident": [0]
+ },
+ "profile": {
+  "bytes_per_miss": 1152,
+  "selected_rows": 2048
+ },
+ "controller": {
+  "interval_steps": 16,
+  "dwell_steps": 2048
+ },
+ "memory": {
+  "precapture_levels": [0, 1, 2, 3]
+ }
+}

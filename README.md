@@ -4,7 +4,7 @@
 
 ## 实现任务
 
-编码助手可在普通 CPU 环境完成 PR，从[开发和实机环境](docs/implementation/agent-environment.md)、[配置与逐项消融](docs/implementation/ablation-contract.md)、[参考代码和测试](docs/implementation/reference-code.md)开始。三个实现规格为[逐层驱逐](docs/implementation/layer-eviction.md)、[全层共享 LRU](docs/implementation/shared-lru.md)和[两者联用](docs/implementation/combined.md)。[主 KV 重叠与模型适配](docs/implementation/model-adapters.md)给出各模型的路径和独立开关。
+编码助手可在普通 CPU 环境完成 PR，从[开发和实机环境](docs/implementation/agent-environment.md)、[配置与逐项消融](docs/implementation/ablation-contract.md)、[参考代码和测试](docs/implementation/reference-code.md)开始。三个实现规格为[逐层驱逐](docs/implementation/layer-eviction.md)、[全层共享 LRU](docs/implementation/shared-lru.md)和[两者联用](docs/implementation/combined.md)。[逐层动态卸载](docs/implementation/dynamic-offload.md)（issue #11）在预注册的卸载名单之间运行期切换，与共享 LRU 无关。[按压力逐层弹性卸载](docs/implementation/elastic-layer-offload.md)（issue #13）按显存和排队压力逐组卸载、回填层，分 steady 与 smooth 两版，支持 TPOT SLO 和 PD decode 节点。[主 KV 重叠与模型适配](docs/implementation/model-adapters.md)给出各模型的路径和独立开关。
 
 ## 11 月 24 日实测更新
 

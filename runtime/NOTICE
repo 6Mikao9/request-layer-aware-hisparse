@@ -25,6 +25,17 @@ re-creates the stock MHATokenToKVPool._create_buffers_normal allocation context
 contiguous allocation. Arena tables, cross-layer victim selection and the
 consumer view are new; their pinned inputs are in shared_lru_dependency_sha256.
 
+The optional layer offload route kernel (generated_route/hisparse_route.cuh,
+written by build_route_overlay.py) is the pinned kvcacheio/hisparse.cuh with
+textual edits: a RESIDENT_RATIO template parameter and route-table arguments,
+a resident mode that writes the plane base plus the logical row and returns,
+and the newest token resolved to the layer's tail row in the resident, short
+and long paths; the remaining offloaded logic is unchanged. dynamic_offload_device.py
+re-creates the stock MHATokenToKVPool._create_buffers_normal allocation
+context for the slab. Their pinned inputs are in
+dynamic_offload_dependency_sha256 and the generated digest in
+dynamic_offload_generated_sha256.
+
 The optional runtime/compat/minimax_sm80.py is the unchanged experimental BF16
 projection adapter used by the existing SM80 launcher, SHA256
 207df72e8294982f5153a236043871f38a26b37338c543d9c8322fd56d0c2bf0.
